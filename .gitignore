@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local QA and generated artifacts
+qa/
+output/
+tmp/
+
+# Logs and runtime files
+*.log
+*.pid
+*.pid.lock
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Test coverage
+coverage/

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.comets.creator-pay.8772</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-u</string>
+    <string>/Users/mac/comets-creator-pay-8772/serve-spa.py</string>
+    <string>--directory</string>
+    <string>/Users/mac/comets-creator-pay-8772/site</string>
+    <string>--host</string>
+    <string>192.168.88.188</string>
+    <string>--port</string>
+    <string>8772</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/mac/comets-creator-pay-8772/logs/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mac/comets-creator-pay-8772/logs/stderr.log</string>
+</dict>
+</plist>
