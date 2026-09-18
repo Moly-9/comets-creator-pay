@@ -1,10 +1,24 @@
 import type {
   Contract,
   Invoice,
+  InvoicePayoutSnapshot,
   PayoutAccount,
   RequestProject,
   UserProfile,
 } from "./types";
+
+const primaryInvoicePayoutSnapshot: InvoicePayoutSnapshot = {
+  provider: "Airwallex",
+  currency: "EUR",
+  accountName: "Lea Martin",
+  accountNumber: "FR7630006000011234567890189",
+  bankName: "BNP Paribas",
+  bankAddress: "16 Boulevard des Italiens, 75009 Paris, France",
+  swiftCode: "BNPAFRPP",
+  iban: "FR7630006000011234567890189",
+  remittanceInformation: "",
+  capturedAt: "2026-07-27T14:30:00.000Z",
+};
 
 const progress = (
   status: Invoice["status"],
@@ -82,6 +96,8 @@ const standardContractFile = {
   documentUrl: "/26-kol-standard-terms-template.pdf",
   pageCount: 16,
   obligations: standardKolObligations,
+  feeBearer: "Advertiser",
+  paymentChannel: "Airwallex",
 };
 
 export const contracts: Contract[] = [
@@ -225,6 +241,7 @@ export const invoices: Invoice[] = [
     paymentStatus: "WAITING_PAYMENT",
     paymentExpectedAt: "审核通过后 3-5 个工作日",
     payoutAccountId: "payout-awx-fr-primary",
+    payoutSnapshot: primaryInvoicePayoutSnapshot,
   },
   {
     invoiceId: "invoice-creator-001-external-002",
@@ -245,6 +262,31 @@ export const invoices: Invoice[] = [
     paymentExpectedAt: "收款资料复核通过后重新排队",
     paymentFailureReason: "收款银行账号未通过渠道校验，请修改错误字段或选择其他已验证账户。",
     payoutAccountId: "payout-awx-fr-primary",
+    payoutSnapshot: primaryInvoicePayoutSnapshot,
+    document: {
+      id: "file-external-002-v1",
+      name: "INV-20260728-00001.pdf",
+      mimeType: "application/pdf",
+      size: 174238,
+      previewUrl: "/INV-20260723-001-Alex-Ruiz.pdf",
+    },
+    extractedData: {
+      invoiceFrom: "Léa Martin",
+      billTo: "COMETS INTERNATIONAL LIMITED",
+      invoiceDate: "2026-07-28",
+      currency: "USD",
+      total: "2100",
+      paymentDetails: {
+        account_name: "Lea Martin",
+        account_number: "FR7630006000011234567890189",
+        bank_name: "BNP Paribas",
+        bank_address: "16 Boulevard des Italiens, 75009 Paris, France",
+        swift_code: "BNPAFRPP",
+        iban: "FR7630006000011234567890189",
+      },
+      invoiceFromMatchesProfile: true,
+      billToMatchesComets: true,
+    },
     paymentIssue: {
       version: 1,
       code: "INVALID_ACCOUNT_NUMBER",
@@ -322,6 +364,10 @@ export const invoices: Invoice[] = [
     paymentStatus: "PAID",
     paymentCompletedAt: "2026-07-16T14:32:00.000Z",
     payoutAccountId: "payout-awx-fr-primary",
+    payoutSnapshot: {
+      ...primaryInvoicePayoutSnapshot,
+      capturedAt: "2026-06-25T00:00:00.000Z",
+    },
   },
 ];
 
@@ -446,6 +492,12 @@ export const initialProfile: UserProfile = {
     screenshots: [
       { id: "FILE-001", name: "youtube-studio-leaplayfr.png", mimeType: "image/png", size: 884000 },
     ],
+    evidenceByProfileUrl: {
+      "https://youtube.com/@LeaPlayFR": [
+        { id: "FILE-001", name: "youtube-studio-leaplayfr.png", mimeType: "image/png", size: 884000 },
+      ],
+      "https://instagram.com/leaplayfr": [],
+    },
   },
   payout: primaryPayoutAccount,
   payoutAccounts: [
@@ -454,5 +506,5 @@ export const initialProfile: UserProfile = {
     paypalPayoutAccount,
   ],
   defaultPayoutAccountId: primaryPayoutAccount.id,
-  payoutAccountsVersion: 2,
+  payoutAccountsVersion: 3,
 };

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { contracts, initialProfile, invoices, requests } from "./data";
 import {
+  ADMIN_STORE_KEY,
   ADMIN_DEMO_CREDENTIALS,
   CREATOR_DEMO_CREDENTIALS,
   MockAdminStore,
@@ -14,12 +15,17 @@ import {
 import { contractStatusLabel } from "./contract-status";
 import {
   buildLinkedRequestProjects,
+  canVisitOnboardingStep,
+  clearOnboardingDraft,
   filterInvoiceList,
   normalizeProjectMatchKey,
+  onboardingDraftStorageKey,
+  readOnboardingDraft,
   shouldShowInvoicePreSigningControls,
   syncRequestWithInvoices,
   validateRegistration,
   validateSocialVerification,
+  writeOnboardingDraft,
 } from "./App";
 import {
   buildCreatorNotifications,
@@ -30,6 +36,7 @@ import {
 } from "./creator-workflow";
 import {
   buildAirwallexMockSchema,
+  buildAirwallexMockTransferMethods,
   buildProfileSupplementalFields,
   compareInvoicePaymentDetails,
   createInvoiceId,
@@ -45,12 +52,106 @@ import {
   sanitizeEnglishAccountName,
   summarizeAmountsByCurrency,
   sortInvoices,
+  sortAirwallexTransferMethods,
   validateAirwallexSchemaValues,
   validateRequiredProfileFields,
 } from "./services";
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("onboarding navigation and draft persistence", () => {
+  it("only enables completed or currently available onboarding steps", () => {
+    expect(canVisitOnboardingStep(1, false, 1)).toBe(true);
+    expect(canVisitOnboardingStep(2, false, 1)).toBe(false);
+    expect(canVisitOnboardingStep(2, true, 2)).toBe(true);
+    expect(canVisitOnboardingStep(3, true, 2)).toBe(false);
+    expect(canVisitOnboardingStep(3, true, 3)).toBe(true);
+  });
+
+  it("isolates drafts by creator and never persists a password property", () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {
+      sessionStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+      },
+    });
+    const draft = {
+      userId: "CREATOR-DRAFT",
+      maxVisitedStep: 3 as const,
+      registrationEmail: "creator@example.com",
+      social: {
+        profileUrls: ["https://youtube.com/@creator"],
+        files: [],
+        verification: "verified" as const,
+      },
+      updatedAt: "2026-09-18T00:00:00.000Z",
+    };
+
+    writeOnboardingDraft({ ...draft, password: "Secret123" } as typeof draft & {
+      password: string;
+    });
+
+    expect(readOnboardingDraft("CREATOR-DRAFT")).toMatchObject(draft);
+    expect(readOnboardingDraft("CREATOR-OTHER")).toBeNull();
+    expect(storage.get(onboardingDraftStorageKey("CREATOR-DRAFT"))).not.toContain(
+      "Secret123",
+    );
+    clearOnboardingDraft("CREATOR-DRAFT");
+    expect(readOnboardingDraft("CREATOR-DRAFT")).toBeNull();
+  });
+});
+
+describe("Airwallex transfer method pricing", () => {
+  it("recommends local transfer for a matching local currency", () => {
+    const methods = buildAirwallexMockTransferMethods({
+      bankCountryCode: "FR",
+      accountCurrency: "EUR",
+      entityType: "PERSONAL",
+    });
+    expect(methods[0]).toMatchObject({
+      value: "LOCAL",
+      recommended: true,
+    });
+  });
+
+  it("recommends SWIFT when its scenario fee is lower", () => {
+    const methods = buildAirwallexMockTransferMethods({
+      bankCountryCode: "FR",
+      accountCurrency: "USD",
+      entityType: "COMPANY",
+    });
+    expect(methods[0]).toMatchObject({
+      value: "SWIFT",
+      recommended: true,
+    });
+  });
+
+  it("uses local transfer as the stable tie breaker", () => {
+    const methods = sortAirwallexTransferMethods([
+      {
+        value: "SWIFT",
+        label: "SWIFT",
+        available: true,
+        estimatedFeeAmount: 5,
+        feeCurrency: "EUR",
+        recommended: false,
+      },
+      {
+        value: "LOCAL",
+        label: "Local",
+        available: true,
+        estimatedFeeAmount: 5,
+        feeCurrency: "EUR",
+        recommended: false,
+      },
+    ]);
+    expect(methods.map((method) => method.value)).toEqual(["LOCAL", "SWIFT"]);
+    expect(methods[0].recommended).toBe(true);
+  });
 });
 
 describe("administrator list pagination", () => {
@@ -303,6 +404,17 @@ describe("external business data adapter contract", () => {
     expect(
       aggregate.contracts.every((item) => creatorIds.has(item.creator.id)),
     ).toBe(true);
+    expect(
+      aggregate.contracts.filter(
+        (item) => item.record.status === "PENDING_SIGNATURE",
+      ),
+    ).toHaveLength(5);
+    expect(
+      aggregate.contracts.filter((item) => item.record.status === "ACTIVE"),
+    ).toHaveLength(7);
+    expect(
+      aggregate.contracts.filter((item) => item.record.status === "EXPIRED"),
+    ).toHaveLength(6);
   });
 
   it("seeds contract-linked Invoices for every creator in user management", () => {
@@ -422,6 +534,199 @@ describe("external business data adapter contract", () => {
         .listSyncIssues()
         .some((issue) => issue.creatorId === "CREATOR-NOT-FOUND"),
     ).toBe(true);
+  });
+
+  it("rejects an unknown contract lifecycle without overwriting the record", () => {
+    const store = new MockAdminStore(false);
+    const before = store
+      .getUserDetail("CREATOR-002")
+      .contracts.find((item) => item.id === "CON-260703-CD-01");
+    const result = store.upsertExternalEvent({
+      eventId: "evt-contract-invalid-lifecycle",
+      creatorId: "CREATOR-002",
+      externalRecordId: "CON-260703-CD-01",
+      resourceType: "CONTRACT",
+      version: 2,
+      occurredAt: "2026-09-18T12:00:00+08:00",
+      payload: {
+        projectName: "不应覆盖的合同",
+        status: "PAYMENT_PROCESSING",
+      },
+    });
+
+    expect(result).toEqual({
+      accepted: false,
+      duplicate: false,
+      reason: "INVALID_CONTRACT_STATUS",
+    });
+    expect(
+      store
+        .getUserDetail("CREATOR-002")
+        .contracts.find((item) => item.id === "CON-260703-CD-01"),
+    ).toEqual(before);
+    expect(
+      store
+        .listSyncIssues()
+        .some((issue) => issue.eventId === "evt-contract-invalid-lifecycle"),
+    ).toBe(true);
+  });
+
+  it("migrates v2 contract states while preserving registered users and sessions", () => {
+    const storage = new Map<string, string>();
+    storage.set(
+      ADMIN_STORE_KEY,
+      JSON.stringify({
+        version: 2,
+        users: [
+          {
+            id: "CREATOR-099",
+            name: "Stored Creator",
+            email: "stored.creator@example.com",
+            role: "CREATOR",
+            status: "ACTIVE",
+            invitationStatus: "NOT_REQUIRED",
+            verificationStatus: "VERIFIED",
+            onboardingComplete: true,
+            createdAt: "2026-09-01 10:00",
+            lastLoginAt: "2026-09-18 09:00",
+            lastActiveAt: "刚刚",
+          },
+        ],
+        credentials: { "CREATOR-099": "Stored2026" },
+        profiles: {},
+        sessions: [
+          {
+            userId: "CREATOR-099",
+            email: "stored.creator@example.com",
+            onboardingComplete: true,
+            role: "CREATOR",
+            permissions: [],
+            sessionId: "stored-session",
+            verificationStatus: "VERIFIED",
+            createdAt: "2026-09-18 09:00",
+          },
+        ],
+        externalRecords: [
+          {
+            creatorId: "CREATOR-099",
+            externalRecordId: "CON-STORED-001",
+            resourceType: "CONTRACT",
+            version: 1,
+            occurredAt: "2026-09-01 10:00",
+            payload: {
+              projectId: "PRJ-STORED-001",
+              projectName: "Stored Project",
+              brand: "Stored Brand",
+              amount: "USD 900",
+              status: "已付款",
+            },
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+      },
+    });
+
+    const store = new MockAdminStore(true);
+
+    expect(store.listUsers().map((user) => user.id)).toContain("CREATOR-099");
+    expect(store.restoreSession("stored-session")?.userId).toBe("CREATOR-099");
+    expect(store.getUserDetail("CREATOR-099").contracts[0].status).toBe("ACTIVE");
+    expect(JSON.parse(storage.get(ADMIN_STORE_KEY) || "{}").version).toBe(3);
+  });
+
+  it("replaces legacy lifecycle values on known seed contracts during v2 migration", () => {
+    const storage = new Map<string, string>();
+    storage.set(
+      ADMIN_STORE_KEY,
+      JSON.stringify({
+        version: 2,
+        externalRecords: [
+          {
+            creatorId: "CREATOR-002",
+            externalRecordId: "CON-260703-CD-01",
+            resourceType: "CONTRACT",
+            version: 1,
+            occurredAt: "2026-07-03 10:00",
+            payload: {
+              projectId: "PRJ-260703-LP-SKIN",
+              projectName: "Lumière 夏季护肤合作",
+              brand: "Lumière Paris",
+              amount: "EUR 3,600",
+              effectiveDate: "2025-01-01",
+              servicePeriod: "2025-01-01 至 2025-01-02",
+              status: "未请款",
+            },
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+      },
+    });
+
+    const store = new MockAdminStore(true);
+    const contract = store
+      .getUserDetail("CREATOR-002")
+      .contracts.find((item) => item.id === "CON-260703-CD-01");
+
+    expect(contract).toMatchObject({
+      status: "ACTIVE",
+      effectiveDate: "2026-07-03",
+      servicePeriod: "2026-07-03 至 2026-10-15",
+    });
+  });
+
+  it("keeps a v3 externally synchronized seed-contract lifecycle after reload", () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+      },
+    });
+
+    const store = new MockAdminStore(true);
+    expect(
+      store.upsertExternalEvent({
+        eventId: "evt-contract-lifecycle-persistence",
+        creatorId: "CREATOR-002",
+        externalRecordId: "CON-260703-CD-01",
+        resourceType: "CONTRACT",
+        version: 2,
+        occurredAt: "2026-09-18T12:30:00+08:00",
+        payload: {
+          orderId: "IO-260703-LP-SKIN",
+          projectId: "PRJ-260703-LP-SKIN",
+          projectName: "Lumière 夏季护肤合作",
+          campaignName: "Lumière 夏季护肤合作",
+          brand: "Lumière Paris",
+          amount: "EUR 3,600",
+          effectiveDate: "2026-07-03",
+          servicePeriod: "2026-07-03 至 2026-09-01",
+          status: "EXPIRED",
+          updatedAt: "2026-09-18",
+        },
+      }),
+    ).toEqual({ accepted: true, duplicate: false });
+
+    const reloadedStore = new MockAdminStore(true);
+    const contract = reloadedStore
+      .getUserDetail("CREATOR-002")
+      .contracts.find((item) => item.id === "CON-260703-CD-01");
+
+    expect(contract).toMatchObject({
+      status: "EXPIRED",
+      servicePeriod: "2026-07-03 至 2026-09-01",
+      updatedAt: "2026-09-18",
+    });
   });
 
   it("projects accepted external records into the creator detail view", () => {
@@ -622,12 +927,13 @@ describe("linked request projects", () => {
 
   it("excludes contracts that have not created an Invoice", () => {
     const result = buildLinkedRequestProjects(requests, contracts, invoices);
-    const unrequestedContracts = contracts.filter((contract) =>
-      !invoices.some((invoice) => invoice.projectId === contract.projectId),
+    const contractsWithoutInvoice = contracts.filter(
+      (contract) =>
+        !invoices.some((invoice) => invoice.projectId === contract.projectId),
     );
 
-    expect(unrequestedContracts).toHaveLength(3);
-    expect(unrequestedContracts.every((contract) =>
+    expect(contractsWithoutInvoice).toHaveLength(3);
+    expect(contractsWithoutInvoice.every((contract) =>
       !invoices.some((invoice) => invoice.projectId === contract.projectId)
       && !result.some((item) => item.contract.id === contract.id)
     )).toBe(true);
@@ -716,9 +1022,34 @@ describe("contract lifecycle data", () => {
     expect(new Set(contracts.map((contract) => contract.id)).size).toBe(8);
   });
 
-  it("does not rewrite contract lifecycle from its one-to-one Invoice", () => {
-    const linked = buildLinkedRequestProjects(requests, contracts, invoices);
-    expect(linked.every((item) => item.contract.status === contracts.find((contract) => contract.id === item.contract.id)?.status)).toBe(true);
+  it("does not rewrite lifecycle when an Invoice status changes", () => {
+    const before = buildLinkedRequestProjects(requests, contracts, invoices);
+    const changedInvoices = invoices.map((invoice) => ({
+      ...invoice,
+      status: invoice.status === "PAID" ? "PAYMENT_FAILED" as const : "PAID" as const,
+    }));
+    const after = buildLinkedRequestProjects(requests, contracts, changedInvoices);
+    const lifecycleSnapshot = (items: typeof before) =>
+      items
+        .map((item) => [item.contract.id, item.contract.status])
+        .sort(([left], [right]) => left.localeCompare(right));
+
+    expect(lifecycleSnapshot(after)).toEqual(lifecycleSnapshot(before));
+  });
+
+  it("keeps seeded lifecycle dates consistent with the 2026-09-18 snapshot", () => {
+    const snapshotDate = "2026-09-18";
+    for (const contract of contracts) {
+      const [, endDate = ""] = contract.servicePeriod.split(" 至 ");
+      if (contract.status === "PENDING_SIGNATURE") {
+        expect(contract.effectiveDate > snapshotDate).toBe(true);
+      } else if (contract.status === "ACTIVE") {
+        expect(contract.effectiveDate <= snapshotDate).toBe(true);
+        expect(endDate >= snapshotDate).toBe(true);
+      } else {
+        expect(endDate < snapshotDate).toBe(true);
+      }
+    }
   });
 
   it("keeps Invoice, request project, and contract ownership one-to-one", () => {
@@ -746,14 +1077,14 @@ describe("contract lifecycle data", () => {
     }
   });
 
-  it("matches each linked contract to an Invoice by exact project name and brand", () => {
+  it("matches each contract to an Invoice by exact project name and brand", () => {
     for (const contract of contracts) {
       const matches = invoices.filter(
         (invoice) =>
           invoice.projectName === contract.projectName &&
           invoice.brand === contract.brand,
       );
-      if (!matches.length) {
+      if (!invoices.some((invoice) => invoice.projectId === contract.projectId)) {
         expect(matches).toHaveLength(0);
       } else {
         expect(matches).toHaveLength(1);
@@ -829,7 +1160,7 @@ describe("invoice ordering", () => {
     expect(notifications.map((item) => item.title)).toEqual(
       expect.arrayContaining([
         "Invoice INV-20260727-00001 等待签署",
-        "Invoice INV-20260718-00001 等待上传",
+        "Invoice INV-20260718-00001 待上传",
         "Invoice INV-20260728-00001 付款失败，请修正收款信息",
         "Invoice INV-20260625-00001 已完成付款",
       ]),
@@ -944,7 +1275,8 @@ describe("invoice ordering", () => {
     const result = await adapter.payments.submitAccountCorrection(
       "INV-20260728-00001",
       {
-        payoutAccountId: "payout-awx-jp-backup",
+        fieldKey: "account_number",
+        correctedValue: "FR7630006000011234567890197",
         submittedBy: "CREATOR-001",
       },
     );
@@ -971,7 +1303,7 @@ describe("invoice ordering", () => {
     expect(result.data.operationHistory?.at(-1)?.type).toBe("INTERNAL_SIGNED");
     await expect(
       adapter.invoices.signInternalInvoice("invoice-creator-001-internal-001", signature),
-    ).rejects.toThrow("只有待签署的内部 Invoice 可以签署");
+    ).rejects.toThrow("只有待签署的 Comets内部合同可以签署");
   });
 
   it("persists creator feedback and moves the internal Invoice into feedback processing", async () => {
@@ -988,6 +1320,83 @@ describe("invoice ordering", () => {
       submittedBy: "CREATOR-001",
     });
     expect(result.data.operationHistory?.at(-1)?.type).toBe("FEEDBACK_SUBMITTED");
+  });
+
+  it("rejects payout-account switching for a Comets internal contract", async () => {
+    const adapter = new MockApiAdapter();
+    await expect(
+      adapter.invoices.selectPayoutAccount(
+        "invoice-creator-001-internal-001",
+        "payout-awx-fr-primary",
+      ),
+    ).rejects.toThrow("收款信息由支付管理端同步");
+  });
+
+  it("keeps external Invoice account selection available in an editable state", async () => {
+    const adapter = new MockApiAdapter();
+    const current = (await adapter.profile.get()).data;
+    const replacement = {
+      ...structuredClone(current.payout),
+      id: "payout-awx-replacement",
+      name: "Replacement account",
+      accountNumber: "FR7630006000011234567890197",
+      schemaValues: {
+        ...current.payout.schemaValues,
+        account_number: "FR7630006000011234567890197",
+        iban: "FR7630006000011234567890197",
+      },
+    };
+    await adapter.profile.save({
+      ...current,
+      payout: replacement,
+      payoutAccounts: [replacement],
+      defaultPayoutAccountId: replacement.id,
+    });
+
+    const selected = await adapter.invoices.selectPayoutAccount(
+      "invoice-creator-001-external-003",
+      replacement.id,
+    );
+
+    expect(selected.data.payoutAccountId).toBe(replacement.id);
+    expect(selected.data.payoutSnapshot?.accountNumber).toBe(
+      "FR7630006000011234567890197",
+    );
+  });
+
+  it("migrates a legacy removed account into an immutable Invoice snapshot", async () => {
+    const legacyProfile = structuredClone(initialProfile);
+    legacyProfile.payoutAccountsVersion = 2;
+    const legacyInvoice = {
+      ...structuredClone(invoices[0]),
+      payoutAccountId: "payout-awx-jp-backup",
+      payoutSnapshot: undefined,
+    };
+    const storage = new Map<string, string>([
+      ["comets-creator-profile-v2", JSON.stringify(legacyProfile)],
+      ["comets-creator-invoices-v2", JSON.stringify([legacyInvoice])],
+    ]);
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+      },
+    });
+
+    const adapter = new MockApiAdapter();
+    const migratedInvoice = (await adapter.invoices.get(
+      "invoice-creator-001-internal-001",
+    )).data!;
+    const migratedProfile = (await adapter.profile.get()).data;
+
+    expect(migratedProfile.payoutAccounts.filter(
+      (account) => account.channel === "AIRWALLEX",
+    )).toHaveLength(1);
+    expect(migratedInvoice.payoutSnapshot).toMatchObject({
+      bankName: "MUFG Bank",
+      accountNumber: "0008921",
+    });
   });
 
   it("uploads and confirms an external Invoice through explicit commands", async () => {
@@ -1163,6 +1572,7 @@ describe("request and invoice consistency", () => {
     );
     const synced = syncRequestWithInvoices(request, resubmitted);
     expect(synced.status).toBe("APPROVED");
+    expect(synced.contractStatus).toBe(request.contractStatus);
     expect(synced.issues).toHaveLength(0);
     expect(synced.progress[1].state).toBe("complete");
     expect(synced.progress[2].state).toBe("complete");

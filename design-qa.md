@@ -1,5 +1,49 @@
 # COMETS Creator Pay Design QA
 
+## Iteration 83: Creator Home, Collection Naming, and Contract Lifecycle
+
+- Source visual truth: the pre-change creator `/` and `/contracts` pages captured in the Codex in-app browser at a `963 x 907` browser viewport, together with the approved implementation plan. The browser capture API did not expose a filesystem export path for these baseline images.
+- Browser-rendered implementation evidence: final in-app browser captures of creator `/` and `/contracts` at the same `963 x 907` viewport; additional responsive captures at `1366 x 768`, `768 x 1024`, and `375 x 812`; and administrator `/admin/contracts` captures at `1366 x 768` and `375 x 812`. The capture API did not expose local screenshot paths.
+- Density normalization: every baseline and implementation capture used the same browser-native 1x density. Comparisons were made at matching route, account role, interaction state, and viewport before reviewing the additional breakpoints.
+- State: authenticated Léa Martin creator workspace for the homepage, contract list, and pending-signature contract detail; authenticated administrator workspace for the all-creator contract list. The remote Mac environment was not updated.
+- Full-view comparison evidence: the established COMETS shell, navigation anatomy, greeting, action cards, amount strip, dense collection list, contract toolbar, list density, borders, radii, shadows, and typography remain unchanged. The creator navigation now reads `首页`, the homepage module reads `收款`, and its identifier/status/progress/search copy uses `收款`. Contract overview anatomy expands from three to four balanced metrics and uses the existing restrained pastel operational palette.
+- Focused-region comparison: a separate crop was not required because every changed visual surface—sidebar label, homepage module heading and table labels, four contract summary metrics, filter tabs, status badges, and three-step detail track—was fully legible in the matched full-view captures.
+- Data and interaction evidence: creator contract metrics render `8 / 2 / 3 / 3`; administrator metrics render `18 / 5 / 7 / 6`; the creator `待签署` filter returns exactly two contracts; the detail track renders `待签署 → 执行中 → 已过期`; and linked collection rows retain the contract lifecycle while Invoice status drives collection progress.
+- Responsive evidence: the creator homepage, creator contract list, creator contract detail, and administrator contract list all reported `documentElement.scrollWidth === documentElement.clientWidth` at the tested desktop, iPad, and phone viewports. Desktop keeps the four-metric row; narrower widths collapse to two and then one column without clipping.
+- Browser console: a fresh final browser tab reported zero warning and error entries.
+- Automated verification: TypeScript passed; Vitest `108 / 108` passed; Vite production build and Sites packaging passed; Sites worker tests `4 / 4` passed; `git diff --check` passed.
+- Environment: local test environment only. `192.168.88.188:8772` was not updated.
+
+- Required fidelity surfaces:
+  - Fonts and typography: existing family, optical weights, sizes, line heights, truncation, and hierarchy are unchanged; the new Chinese labels fit every desktop and mobile control without wrapping or collision.
+  - Spacing and layout rhythm: creator and administrator shells retain their established content widths and vertical rhythm; the fourth contract metric follows the current grid anatomy and collapses cleanly at responsive breakpoints.
+  - Colors and visual tokens: the new lifecycle uses existing lilac, blue, and neutral semantic treatments; no unrelated palette change was introduced.
+  - Image quality and asset fidelity: existing COMETS brand assets and Lucide interface icons remain unchanged and sharp; no placeholder or custom-drawn asset was introduced.
+  - Copy and content: creator-facing request language consistently uses `收款`, administrator `请款项目` language remains unchanged, and contractual `请款内容` copy remains intact.
+
+- Comparison history: the matched baseline/final review found no actionable P0/P1/P2 visual mismatch. Responsive checks confirmed that the additional contract metric and new labels do not cause overflow or hidden controls.
+- No actionable P0/P1/P2 findings remain.
+
+final result: passed
+
+### Iteration 84: External Invoice Collection and Payment Timeline MVP
+
+- Source of truth: the external Invoice task, OCR correction, review, payout comparison, and payment-recovery requirements supplied on 2026-09-19.
+- Desktop verification: Invoice list and external Invoice detail were checked at the default local browser viewport. The list renders seven Invoice-centric columns without project or brand fields; the detail retains the established 60/40 document/inspection workspace.
+- Mobile verification: the payment-failure external Invoice detail was checked at `390 × 844`. Summary cards, failure notice, document reader, horizontally scrollable detail tabs, full payout information, and action controls stack without page-level horizontal overflow (`scrollWidth 375`, viewport width `390`).
+- Task and upload behavior: only system-issued Invoice tasks expose upload. The modal shows the system Invoice number, full eligible payout-account identifier, supported formats, 5 MB limit, drag/drop selection, preview, version intent, and current-page recognition progress.
+- Inspection behavior: external OCR fields are editable only in allowed states, creator corrections preserve the original recognition snapshot, and confirmation remains disabled until the acknowledgement is checked and every field/account blocker passes.
+- Sensitive-data behavior: the current creator sees complete payout values only in their own detail/account comparison. Administrator reuse remains masked, while tasks and notifications omit bank values.
+- Timeline behavior: collection/review history and payment progress remain on the same Invoice. Payment-failure recovery shows `审核通过 → 待付款 → 付款处理中 → 付款失败 → 等待修改收款信息 → 收款资料已提交复核 → 等待重新付款 → 付款处理中 → 已付款` without payment execution identifiers.
+- Browser console: desktop and mobile checks reported zero warnings and zero errors.
+- Automated verification: TypeScript passed; Vitest `149/149` passed; Vite production/Sites build passed; Sites worker tests `4/4` passed; `git diff --check` passed.
+- Remaining warning: Vite reports the existing main JavaScript chunk is larger than 500 kB after minification; it does not block the prototype build.
+- Environment: local test environment only. Neither `192.168.88.188:8771` nor `192.168.88.188:8772` was connected, modified, restarted, or deployed.
+
+- No actionable P0/P1/P2 findings remain.
+
+final result: passed
+
 ## Iteration 81: Payment Correction Resubmission Review
 
 - Visual source: `/var/folders/rf/2q5dyfp52bl2053nt7fy31yr0000gn/T/codex-clipboard-1f5d190d-b226-45d2-aa51-3697acf821f5.png` at `1755 x 815`.

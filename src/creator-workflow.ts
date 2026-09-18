@@ -12,6 +12,8 @@ import type {
   PaymentFailureRecoveryStatus,
   PaymentStatus,
 } from "./types";
+import type { ExternalInvoiceReviewEvent } from "./invoices/external/types";
+import { recognitionFieldsFromExtracted } from "./invoices/external/workflow";
 
 const legacyInternalStatus = (
   status: InvoiceStatus,
@@ -101,6 +103,10 @@ export const migrateInvoice = (source: Invoice): Invoice => {
   );
   const invoiceNumber = invoiceNumberOf(invoice);
   const invoiceId = invoiceInternalIdOf(invoice);
+  const migratedEventAt = /^\d{4}-\d{2}-\d{2}/.test(invoice.updatedAt)
+    ? invoice.updatedAt
+    : `${invoice.issuedAt}T12:00:00.000Z`;
+  const [expectedCurrency = "", expectedAmount = ""] = invoice.amount.split(/\s+/, 2);
   const operationHistory: InvoiceOperationEvent[] = invoice.operationHistory?.length
     ? invoice.operationHistory
     : (invoice.processHistory || []).map((event) => ({
@@ -112,12 +118,90 @@ export const migrateInvoice = (source: Invoice): Invoice => {
         reason: event.reason,
       }));
 
+  const fileVersions = invoice.fileVersions || (invoice.document ? [{
+    ...invoice.document,
+    version: 1,
+    uploadedAt: invoice.issuedAt,
+    demoHash: `demo-${invoice.document.id}`,
+  }] : []);
+  const sourceFileVersions = invoice.sourceFileVersions || fileVersions.map((file) => ({
+    ...file,
+    fileVersionId: file.id,
+    fileName: file.name,
+    fileHash: file.demoHash,
+    uploadedBy: invoice.creatorId || "CREATOR-001",
+    supersedesFileVersionId: file.supersedesFileId,
+  }));
+  const recognitionSnapshots = invoice.recognitionSnapshots || (
+    invoice.extractedData && sourceFileVersions.length
+      ? [{
+          recognitionId: `recognition:migrated:${invoiceId}`,
+          fileVersionId: sourceFileVersions.at(-1)!.fileVersionId,
+          engineVersion: "mock-ocr-migration-v1",
+          recognizedAt: sourceFileVersions.at(-1)!.uploadedAt,
+          fields: recognitionFieldsFromExtracted(invoiceNumber, invoice.extractedData),
+          extractedData: structuredClone(invoice.extractedData),
+        }]
+      : []
+  );
+  const migratedExternalHistory: ExternalInvoiceReviewEvent[] = kind !== "EXTERNAL" ? [] : [
+    {
+      eventId: `history:migrated:${invoiceId}:task`,
+      action: "TASK_PUBLISHED",
+      actor: "系统",
+      occurredAt: invoice.createdAt || `${invoice.issuedAt}T00:00:00.000Z`,
+      toStatus: "WAITING_UPLOAD",
+    },
+    ...(sourceFileVersions.length ? [{
+      eventId: `history:migrated:${invoiceId}:upload`,
+      action: "FILE_UPLOADED" as const,
+      actor: invoice.creatorId || "CREATOR-001",
+      occurredAt: sourceFileVersions.at(-1)!.uploadedAt,
+      fromStatus: "WAITING_UPLOAD" as const,
+      toStatus: "RECOGNIZING" as const,
+    }] : []),
+    ...(recognitionSnapshots.length ? [{
+      eventId: `history:migrated:${invoiceId}:recognition`,
+      action: "RECOGNITION_SUCCEEDED" as const,
+      actor: "Mock OCR",
+      occurredAt: recognitionSnapshots.at(-1)!.recognizedAt,
+      fromStatus: "RECOGNIZING" as const,
+      toStatus: "WAITING_CONFIRMATION" as const,
+    }] : []),
+    ...(["WAITING_MEDIA_REVIEW", "APPROVED"].includes(documentState.status) ? [{
+      eventId: `history:migrated:${invoiceId}:submitted`,
+      action: "SUBMITTED" as const,
+      actor: invoice.creatorId || "CREATOR-001",
+      occurredAt: migratedEventAt,
+      fromStatus: "WAITING_CONFIRMATION" as const,
+      toStatus: "WAITING_MEDIA_REVIEW" as const,
+    }] : []),
+    ...(documentState.status === "APPROVED" ? [{
+      eventId: `history:migrated:${invoiceId}:approved`,
+      action: "APPROVED" as const,
+      actor: "管理端审核",
+      occurredAt: migratedEventAt,
+      fromStatus: "WAITING_MEDIA_REVIEW" as const,
+      toStatus: "APPROVED" as const,
+    }] : []),
+    ...(documentState.status === "APPROVED" ? [{
+      eventId: `history:migrated:${invoiceId}:payment`,
+      action: "PAYMENT_STATUS_CHANGED" as const,
+      actor: "付款系统",
+      occurredAt: invoice.paidAt || invoice.paymentCompletedAt || migratedEventAt,
+      fromStatus: "APPROVED" as const,
+      toStatus: "APPROVED" as const,
+      reason: paymentStatus === "FAILED" ? invoice.paymentFailureReason || invoice.paymentIssue?.message : `付款状态：${paymentStatus}`,
+    }] : []),
+  ];
+
   return {
     ...invoice,
     id: invoiceNumber,
     invoiceId,
     invoiceNumber,
     invoiceType: kind,
+    creatorId: invoice.creatorId || "CREATOR-001",
     documentState,
     paymentStatus,
     paymentRecoveryStatus,
@@ -125,12 +209,26 @@ export const migrateInvoice = (source: Invoice): Invoice => {
       invoice.paymentFailureReason
       || invoice.paymentIssue?.message
       || (paymentStatus === "FAILED" ? invoice.rejectedReason : undefined),
-    fileVersions: invoice.fileVersions || (invoice.document ? [{
-      ...invoice.document,
-      version: 1,
-      uploadedAt: invoice.issuedAt,
-      demoHash: `demo-${invoice.document.id}`,
-    }] : []),
+    fileVersions,
+    sourceFileVersions,
+    recognitionSnapshots,
+    confirmedSnapshots: invoice.confirmedSnapshots || [],
+    reviewHistory: (invoice.reviewHistory?.length ? invoice.reviewHistory : migratedExternalHistory).map((event) => ({
+      ...event,
+      occurredAt: Number.isNaN(new Date(event.occurredAt).getTime()) ? migratedEventAt : event.occurredAt,
+    })),
+    expectedValues: invoice.expectedValues || {
+      amount: expectedAmount.replace(/,/g, ""),
+      currency: expectedCurrency,
+      billTo: "COMETS INTERNATIONAL LIMITED",
+      creatorLegalName: invoice.extractedData?.invoiceFrom || "Léa Martin",
+    },
+    version: invoice.version || 1,
+    createdAt: invoice.createdAt || `${invoice.issuedAt}T00:00:00.000Z`,
+    returnReason: invoice.returnReason || invoice.rejectedReason,
+    expectedPaymentAt: invoice.expectedPaymentAt || invoice.paymentExpectedAt,
+    paidAt: invoice.paidAt || invoice.paymentCompletedAt,
+    processedClientRequestIds: invoice.processedClientRequestIds || [],
     feedbackRecords: invoice.feedbackRecords || [],
     operationHistory,
     status: legacyStatusForInvoice(documentState, paymentStatus),
@@ -154,6 +252,7 @@ export const EXTERNAL_COLLECTION_META: Record<
   ExternalInvoiceCollectionStatus,
   { label: string; tone: string }
 > = {
+  DRAFT: { label: "待发布", tone: "neutral" },
   WAITING_UPLOAD: { label: "待上传", tone: "amber" },
   RECOGNIZING: { label: "识别中", tone: "purple" },
   WAITING_CONFIRMATION: { label: "待确认", tone: "amber" },
@@ -162,6 +261,7 @@ export const EXTERNAL_COLLECTION_META: Record<
   RETURNED_FOR_REUPLOAD: { label: "待重新上传", tone: "danger" },
   APPROVED: { label: "已通过审核", tone: "success" },
   RECOGNITION_FAILED: { label: "识别失败", tone: "danger" },
+  CANCELLED: { label: "已取消", tone: "neutral" },
 };
 
 export const PAYMENT_STATUS_META: Record<
@@ -185,9 +285,29 @@ export const invoicePaymentMeta = (invoice: Invoice) => (
   PAYMENT_STATUS_META[migrateInvoice(invoice).paymentStatus!]
 );
 
+export const invoicePrimaryStatusMeta = (invoice: Invoice) => {
+  const migrated = migrateInvoice(invoice);
+  if (migrated.documentState!.status !== "APPROVED") {
+    return invoiceReviewMeta(migrated);
+  }
+  return invoicePaymentMeta(migrated);
+};
+
 export const invoiceReviewFilterValue = (invoice: Invoice) => {
   const documentState = migrateInvoice(invoice).documentState!;
   return `${documentState.kind}:${documentState.status}`;
+};
+
+export const invoiceMatchesStatusFilters = (
+  invoice: Invoice,
+  reviewFilter: string | "ALL",
+  paymentFilter: PaymentStatus | "ALL",
+) => {
+  const migrated = migrateInvoice(invoice);
+  return (
+    (reviewFilter === "ALL" || invoiceReviewFilterValue(migrated) === reviewFilter)
+    && (paymentFilter === "ALL" || migrated.paymentStatus === paymentFilter)
+  );
 };
 
 const taskForInvoice = (invoiceSource: Invoice): CreatorTask => {
@@ -330,7 +450,7 @@ const notification = ({
   const number = invoiceNumberOf(invoice);
   return {
     id: `notification:${type}:${resourceId}`,
-    userId: "CREATOR-001",
+    userId: invoice.creatorId || "CREATOR-001",
     type,
     title,
     message,
@@ -405,7 +525,7 @@ export const buildCreatorNotifications = (
     if (state.kind === "EXTERNAL" && state.status === "WAITING_UPLOAD") return [notification({
       type: "EXTERNAL_INVOICE_UPLOAD_REQUIRED",
       invoice,
-      title: `Invoice ${number} 等待上传`,
+      title: `Invoice ${number} 待上传`,
       message: "请从当前 Invoice 任务上传文件。",
       tone: "amber",
     })];
@@ -416,7 +536,14 @@ export const buildCreatorNotifications = (
       message: invoice.rejectedReason || "请修改识别结果后重新确认。",
       tone: "danger",
     })];
-    if (state.kind === "EXTERNAL" && ["RETURNED_FOR_REUPLOAD", "RECOGNITION_FAILED"].includes(state.status)) return [notification({
+    if (state.kind === "EXTERNAL" && state.status === "RECOGNITION_FAILED") return [notification({
+      type: "EXTERNAL_INVOICE_REUPLOAD_REQUIRED",
+      invoice,
+      title: `Invoice ${number} 识别失败，请重新上传`,
+      message: invoice.returnReason || invoice.rejectedReason || "请重新识别，或上传更清晰的文件版本。",
+      tone: "danger",
+    })];
+    if (state.kind === "EXTERNAL" && state.status === "RETURNED_FOR_REUPLOAD") return [notification({
       type: "EXTERNAL_INVOICE_REUPLOAD_REQUIRED",
       invoice,
       title: `Invoice ${number} 需要重新上传`,
@@ -432,6 +559,13 @@ export const buildCreatorNotifications = (
       title: `Invoice ${number} 已提交审核`,
       message: "可在详情中查看最新处理进度。",
       tone: "purple",
+    })];
+    if (state.status === "APPROVED" && invoice.paymentStatus === "WAITING_PAYMENT") return [notification({
+      type: "INVOICE_APPROVED",
+      invoice,
+      title: `Invoice ${number} 已审核通过，等待付款`,
+      message: "Invoice 审核已完成，可在详情中查看付款进度。",
+      tone: "success",
     })];
     return [];
   });

@@ -1,3 +1,12 @@
+import type {
+  ExternalInvoiceCollectionStatus,
+  ExternalInvoiceConfirmedSnapshot,
+  ExternalInvoiceExpectedValues,
+  ExternalInvoiceFileVersion,
+  ExternalInvoiceRecognitionSnapshot,
+  ExternalInvoiceReviewEvent,
+} from "./invoices/external/types";
+
 export type ProgressState = "complete" | "current" | "pending" | "blocked";
 
 export type UserRole = "ADMIN" | "CREATOR";
@@ -57,15 +66,7 @@ export type InternalInvoiceReviewStatus =
   | "CHANGES_REQUIRED"
   | "APPROVED";
 
-export type ExternalInvoiceCollectionStatus =
-  | "WAITING_UPLOAD"
-  | "RECOGNIZING"
-  | "WAITING_CONFIRMATION"
-  | "WAITING_MEDIA_REVIEW"
-  | "RETURNED_FOR_CORRECTION"
-  | "RETURNED_FOR_REUPLOAD"
-  | "APPROVED"
-  | "RECOGNITION_FAILED";
+export type { ExternalInvoiceCollectionStatus } from "./invoices/external/types";
 
 export type PaymentStatus =
   | "WAITING_PAYMENT"
@@ -189,6 +190,8 @@ export interface PaymentAccountCorrectionInput {
   fieldKey?: string;
   correctedValue?: string;
   submittedBy: string;
+  expectedVersion?: number;
+  clientRequestId?: string;
 }
 
 export interface ApiResult<T> {
@@ -212,6 +215,21 @@ export interface SocialAccount {
   verificationStatus: VerificationStatus;
   screenshot?: FileRef;
   screenshots: FileRef[];
+  /** Screenshot evidence keyed by the exact social profile URL. */
+  evidenceByProfileUrl?: Record<string, FileRef[]>;
+}
+
+export interface InvoicePayoutSnapshot {
+  provider: PayoutAccount["provider"];
+  currency: string;
+  accountName: string;
+  accountNumber: string;
+  bankName: string;
+  bankAddress: string;
+  swiftCode: string;
+  iban: string;
+  remittanceInformation: string;
+  capturedAt: string;
 }
 
 export interface PayoutAccount {
@@ -256,6 +274,21 @@ export interface AirwallexSchemaCondition {
   accountCurrency: string;
   entityType: "PERSONAL" | "COMPANY";
   transferMethod: "LOCAL" | "SWIFT";
+}
+
+export interface AirwallexTransferMethodCondition {
+  bankCountryCode: string;
+  accountCurrency: string;
+  entityType: "PERSONAL" | "COMPANY";
+}
+
+export interface AirwallexTransferMethodOption {
+  value: AirwallexSchemaCondition["transferMethod"];
+  label: string;
+  available: boolean;
+  estimatedFeeAmount: number;
+  feeCurrency: string;
+  recommended: boolean;
 }
 
 export interface AirwallexSchemaOption {
@@ -321,7 +354,26 @@ export interface UserProfile {
   payout: PayoutAccount;
   payoutAccounts: PayoutAccount[];
   defaultPayoutAccountId: string;
-  payoutAccountsVersion?: 2;
+  payoutAccountsVersion?: 2 | 3;
+}
+
+export interface OnboardingDraft {
+  userId: string;
+  maxVisitedStep: 1 | 2 | 3;
+  registrationEmail?: string;
+  social?: {
+    profileUrls: string[];
+    files: FileRef[];
+    verification: "idle" | "verifying" | "verified";
+  };
+  profile?: {
+    form: UserProfile;
+    channel: "AIRWALLEX" | "PAYPAL" | "PAYERMAX";
+    condition: AirwallexSchemaCondition;
+    schemaValues: Record<string, string>;
+    agreed: boolean;
+  };
+  updatedAt: string;
 }
 
 export interface ContractObligation {
@@ -364,6 +416,8 @@ export interface Contract {
     signedAt: string;
     acknowledgement: string;
   };
+  feeBearer?: string;
+  paymentChannel?: string;
   history?: Array<{
     id: string;
     action: "SIGNED";
@@ -377,6 +431,7 @@ export interface Invoice {
   invoiceId?: string;
   /** User-visible identifier used in all creator-facing copy and search. */
   invoiceNumber?: string;
+  creatorId?: string;
   id: string;
   projectId: string;
   projectName: string;
@@ -388,6 +443,8 @@ export interface Invoice {
   updatedAt: string;
   invoiceType?: InvoiceType;
   payoutAccountId?: string;
+  /** Immutable payment information captured when the Invoice was synchronized. */
+  payoutSnapshot?: InvoicePayoutSnapshot;
   document?: FileRef;
   extractedData?: InvoiceExtractedData;
   processHistory?: InvoiceProcessEvent[];
@@ -414,6 +471,17 @@ export interface Invoice {
   fileVersions?: InvoiceFileVersion[];
   feedbackRecords?: InvoiceFeedbackRecord[];
   operationHistory?: InvoiceOperationEvent[];
+  expectedValues?: ExternalInvoiceExpectedValues;
+  sourceFileVersions?: ExternalInvoiceFileVersion[];
+  recognitionSnapshots?: ExternalInvoiceRecognitionSnapshot[];
+  confirmedSnapshots?: ExternalInvoiceConfirmedSnapshot[];
+  reviewHistory?: ExternalInvoiceReviewEvent[];
+  version?: number;
+  createdAt?: string;
+  returnReason?: string;
+  expectedPaymentAt?: string;
+  paidAt?: string;
+  processedClientRequestIds?: string[];
 }
 
 export type CreatorTaskGroup = "TODO" | "PROCESSING" | "COMPLETED";
@@ -449,6 +517,7 @@ export type CreatorNotificationType =
   | "EXTERNAL_INVOICE_CORRECTION_REQUIRED"
   | "EXTERNAL_INVOICE_REUPLOAD_REQUIRED"
   | "INVOICE_SUBMITTED"
+  | "INVOICE_APPROVED"
   | "PAYMENT_FAILED"
   | "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED"
   | "PAYMENT_PAID";

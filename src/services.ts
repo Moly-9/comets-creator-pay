@@ -25,6 +25,27 @@ import {
   migrateInvoice,
   migrateInvoices,
 } from "./creator-workflow";
+import {
+  createInvoicePayoutSnapshot,
+  ensureInvoicePayoutSnapshot,
+  getSocialAccountName,
+} from "./creator-display";
+import {
+  assertCreatorOwnsInvoice,
+  assertExpectedVersion,
+  recognitionFieldsFromExtracted,
+  validateExternalInvoiceConfirmation,
+} from "./invoices/external/workflow";
+import type {
+  ConfirmExternalInvoiceCommand,
+  CorrectExternalInvoiceRecognitionCommand,
+  ExternalInvoiceCommandBase,
+  ExternalInvoiceReviewEvent,
+  ResubmitExternalInvoiceCommand,
+  RetryExternalInvoiceRecognitionCommand,
+  SelectExternalInvoicePayoutAccountCommand,
+  UploadExternalInvoiceFileCommand,
+} from "./invoices/external/types";
 import type {
   AccountStatus,
   AdminBusinessData,
@@ -34,6 +55,8 @@ import type {
   AirwallexFormSchema,
   AirwallexSchemaCondition,
   AirwallexSchemaField,
+  AirwallexTransferMethodCondition,
+  AirwallexTransferMethodOption,
   ApiResult,
   AuditEvent,
   Contract,
@@ -41,6 +64,7 @@ import type {
   CreatorTask,
   CorrectionRequest,
   ExternalInvoiceUploadInput,
+  ExternalInvoiceCollectionStatus,
   ExternalBusinessEvent,
   ExternalSyncIssue,
   Invoice,
@@ -116,18 +140,7 @@ export const sanitizeEnglishAccountName = (value: string) =>
     .replace(/ {2,}/g, " ")
     .replace(/^ +/, "");
 
-export const getSocialAccountName = (profileUrl: string, fallback: string) => {
-  try {
-    const parsedUrl = new URL(profileUrl);
-    const pathSegments = parsedUrl.pathname.split("/").filter(Boolean);
-    const accountName = decodeURIComponent(pathSegments.at(-1) || "").trim();
-
-    if (!accountName) return fallback;
-    return accountName.startsWith("@") ? accountName : `@${accountName}`;
-  } catch {
-    return fallback;
-  }
-};
+export { getSocialAccountName };
 
 export const isEnglishAccountName = (value: string) =>
   new RegExp(ENGLISH_ACCOUNT_NAME_PATTERN).test(value.trim());
@@ -442,6 +455,15 @@ export interface InvoiceService {
   ): Promise<ApiResult<Invoice>>;
   resubmitExternal(input: ExternalInvoiceUploadInput): Promise<ApiResult<Invoice>>;
   selectPayoutAccount(id: string, payoutAccountId: string): Promise<ApiResult<Invoice>>;
+  listExternalInvoices(creatorId: string): Promise<ApiResult<Invoice[]>>;
+  getExternalInvoice(invoiceId: string, creatorId: string): Promise<ApiResult<Invoice | undefined>>;
+  uploadExternalInvoiceFile(input: UploadExternalInvoiceFileCommand): Promise<ApiResult<Invoice>>;
+  retryExternalInvoiceRecognition(input: RetryExternalInvoiceRecognitionCommand): Promise<ApiResult<Invoice>>;
+  correctExternalInvoiceRecognition(input: CorrectExternalInvoiceRecognitionCommand): Promise<ApiResult<Invoice>>;
+  selectExternalInvoicePayoutAccount(input: SelectExternalInvoicePayoutAccountCommand): Promise<ApiResult<Invoice>>;
+  confirmExternalInvoice(input: ConfirmExternalInvoiceCommand): Promise<ApiResult<Invoice>>;
+  resubmitExternalInvoice(input: ResubmitExternalInvoiceCommand): Promise<ApiResult<Invoice>>;
+  listExternalInvoiceHistory(invoiceId: string, creatorId: string): Promise<ApiResult<ExternalInvoiceReviewEvent[]>>;
 }
 
 export interface TaskService {
@@ -456,6 +478,9 @@ export interface PaymentService {
 }
 
 export interface PayoutService {
+  listTransferMethods(
+    condition: AirwallexTransferMethodCondition,
+  ): Promise<ApiResult<AirwallexTransferMethodOption[]>>;
   getFormSchema(
     condition: AirwallexSchemaCondition,
   ): Promise<ApiResult<AirwallexFormSchema>>;
@@ -683,6 +708,65 @@ export const filterRequests = (
       `${item.id}${item.projectName}${item.brand}`.toLowerCase().includes(normalized);
     return statusMatches && queryMatches;
   });
+};
+
+const LOCAL_CURRENCY_BY_COUNTRY: Record<string, string> = {
+  FR: "EUR",
+  JP: "JPY",
+  US: "USD",
+  GB: "GBP",
+  AU: "AUD",
+  SG: "SGD",
+  HK: "HKD",
+};
+
+export const sortAirwallexTransferMethods = (
+  methods: AirwallexTransferMethodOption[],
+) => {
+  const available = methods
+    .filter((method) => method.available)
+    .sort((left, right) => {
+      const feeDifference =
+        left.estimatedFeeAmount - right.estimatedFeeAmount;
+      if (feeDifference !== 0) return feeDifference;
+      if (left.value === right.value) return 0;
+      return left.value === "LOCAL" ? -1 : 1;
+    });
+  const unavailable = methods
+    .filter((method) => !method.available)
+    .sort((left, right) => left.label.localeCompare(right.label));
+
+  return [...available, ...unavailable].map((method, index) => ({
+    ...method,
+    recommended: index === 0 && method.available,
+  }));
+};
+
+export const buildAirwallexMockTransferMethods = (
+  condition: AirwallexTransferMethodCondition,
+): AirwallexTransferMethodOption[] => {
+  const localCurrency = LOCAL_CURRENCY_BY_COUNTRY[condition.bankCountryCode];
+  const usesLocalCurrency = localCurrency === condition.accountCurrency;
+  const entitySurcharge = condition.entityType === "COMPANY" ? 0.5 : 0;
+
+  return sortAirwallexTransferMethods([
+    {
+      value: "LOCAL",
+      label: "本地转账 / Local transfer",
+      available: Boolean(localCurrency),
+      estimatedFeeAmount: (usesLocalCurrency ? 1 : 10) + entitySurcharge,
+      feeCurrency: condition.accountCurrency,
+      recommended: false,
+    },
+    {
+      value: "SWIFT",
+      label: "国际电汇 / SWIFT",
+      available: true,
+      estimatedFeeAmount: (usesLocalCurrency ? 7.5 : 6) + entitySurcharge,
+      feeCurrency: condition.accountCurrency,
+      recommended: false,
+    },
+  ]);
 };
 
 export const buildAirwallexMockSchema = (
@@ -973,7 +1057,7 @@ export const buildProfileSupplementalFields = (
           type: "SELECT" as const,
           options: [
             { label: "支票账户 / Checking", value: "CHECKING" },
-            { label: "付款账户 / Payment", value: "PAYMENT" },
+            { label: "收款账户 / Payment", value: "PAYMENT" },
             { label: "储蓄账户 / Savings", value: "SAVINGS" },
           ],
         }]
@@ -1126,34 +1210,50 @@ export class MockApiAdapter implements Services {
   }
 
   private migratePayoutAccounts(profile: UserProfile) {
-    const normalized = normalizePayoutProfile(profile);
-    if (
-      typeof window === "undefined" ||
-      normalized.id !== PRIMARY_CREATOR_ID ||
-      profile.payoutAccountsVersion === 2
-    ) {
-      return normalized;
+    return normalizePayoutProfile(profile);
+  }
+
+  private readInvoiceSnapshotAccounts() {
+    if (typeof window === "undefined") {
+      return structuredClone(initialProfile.payoutAccounts);
     }
-    if (normalized.payoutAccounts.length > 1) return normalized;
-    const extraAccounts = initialProfile.payoutAccounts.filter(
-      (seedAccount) =>
-        seedAccount.id !== initialProfile.defaultPayoutAccountId &&
-        !normalized.payoutAccounts.some(
-          (account) => account.id === seedAccount.id,
-        ),
-    );
-    return syncPayoutAccounts(
-      normalized,
-      [...normalized.payoutAccounts, ...structuredClone(extraAccounts)],
-      normalized.defaultPayoutAccountId,
-    );
+    try {
+      const stored = window.localStorage.getItem(PROFILE_STORAGE_KEY);
+      const profile = stored
+        ? JSON.parse(stored) as UserProfile
+        : initialProfile;
+      return structuredClone(
+        profile.payoutAccounts?.length
+          ? profile.payoutAccounts
+          : [profile.payout],
+      );
+    } catch {
+      return structuredClone(initialProfile.payoutAccounts);
+    }
+  }
+
+  private attachPayoutSnapshots(items: Invoice[]) {
+    const accounts = this.readInvoiceSnapshotAccounts();
+    return items.map((invoice) => ensureInvoicePayoutSnapshot(invoice, accounts));
+  }
+
+  private prepareInvoiceData(items: Invoice[]) {
+    const prepared = sortInvoices(this.attachPayoutSnapshots(items));
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(prepared));
+    }
+    return prepared;
   }
 
   private readInvoices() {
-    if (typeof window === "undefined") return sortInvoices(migrateInvoices(structuredClone(seedInvoices)));
+    if (typeof window === "undefined") {
+      return this.prepareInvoiceData(migrateInvoices(structuredClone(seedInvoices)));
+    }
     try {
       const stored = window.localStorage.getItem(INVOICE_STORAGE_KEY);
-      if (!stored) return sortInvoices(migrateInvoices(structuredClone(seedInvoices)));
+      if (!stored) {
+        return this.prepareInvoiceData(migrateInvoices(structuredClone(seedInvoices)));
+      }
 
       const legacyIdMap: Record<string, string> = {
         "INV-260727-S": "INV-20260727-00001",
@@ -1168,21 +1268,32 @@ export class MockApiAdapter implements Services {
       }));
       const storedById = new Map(storedInvoices.map((invoice) => [invoice.id, invoice]));
       const mergedSeedInvoices = seedInvoices.map(
-        (invoice) => ({
-          ...structuredClone(invoice),
-          ...storedById.get(invoice.id),
-          projectId: invoice.projectId,
-          projectName: invoice.projectName,
-          brand: invoice.brand,
-          channel: "Airwallex" as const,
-        }),
+        (invoice) => {
+          const storedInvoice = storedById.get(invoice.id);
+          const payoutAccountChanged = Boolean(
+            storedInvoice
+            && storedInvoice.payoutAccountId !== invoice.payoutAccountId,
+          );
+          return {
+            ...structuredClone(invoice),
+            ...storedInvoice,
+            payoutSnapshot: storedInvoice?.payoutSnapshot
+              || (payoutAccountChanged ? undefined : invoice.payoutSnapshot),
+            projectId: invoice.projectId,
+            projectName: invoice.projectName,
+            brand: invoice.brand,
+            channel: "Airwallex" as const,
+          };
+        },
       );
       const customInvoices = storedInvoices.filter(
         (invoice) => !seedInvoices.some((seed) => seed.id === invoice.id),
       ).map((invoice) => ({ ...invoice, channel: "Airwallex" as const }));
-      return sortInvoices([...mergedSeedInvoices, ...customInvoices].map(migrateLegacyInvoiceState));
+      return this.prepareInvoiceData(
+        [...mergedSeedInvoices, ...customInvoices].map(migrateLegacyInvoiceState),
+      );
     } catch {
-      return sortInvoices(migrateInvoices(structuredClone(seedInvoices)));
+      return this.prepareInvoiceData(migrateInvoices(structuredClone(seedInvoices)));
     }
   }
 
@@ -1277,6 +1388,62 @@ export class MockApiAdapter implements Services {
     return occurredAt;
   }
 
+  private externalCommandInvoice(input: ExternalInvoiceCommandBase) {
+    const invoice = this.findInvoice(input.invoiceId);
+    if (!invoice) throw new Error("Invoice 不存在");
+    if (invoice.documentState?.kind !== "EXTERNAL") {
+      throw new Error("当前 Invoice 不是外部 Invoice");
+    }
+    assertCreatorOwnsInvoice(invoice, input.creatorId);
+    if (invoice.processedClientRequestIds?.includes(input.clientRequestId)) {
+      return { invoice, duplicate: true };
+    }
+    assertExpectedVersion(invoice, input.expectedVersion);
+    return { invoice, duplicate: false };
+  }
+
+  private finishExternalCommand(
+    invoice: Invoice,
+    clientRequestId: string,
+    event: Omit<ExternalInvoiceReviewEvent, "eventId" | "occurredAt">,
+  ) {
+    const occurredAt = new Date().toISOString();
+    invoice.version = (invoice.version || 1) + 1;
+    invoice.updatedAt = occurredAt;
+    invoice.processedClientRequestIds = [
+      ...(invoice.processedClientRequestIds || []),
+      clientRequestId,
+    ];
+    invoice.reviewHistory = [
+      ...(invoice.reviewHistory || []),
+      {
+        ...event,
+        eventId: `review:${invoiceInternalIdOf(invoice)}:${invoice.version}:${event.action}`,
+        occurredAt,
+      },
+    ];
+    invoice.status = legacyStatusForInvoice(invoice.documentState!, invoice.paymentStatus!);
+    this.persistInvoices();
+    return structuredClone(invoice);
+  }
+
+  private mockRecognizedData(invoice: Invoice) {
+    const expected = invoice.expectedValues!;
+    const account = this.profileData.payoutAccounts.find(
+      (candidate) => candidate.id === invoice.payoutAccountId,
+    );
+    return {
+      invoiceFrom: expected.creatorLegalName,
+      billTo: expected.billTo,
+      invoiceDate: new Date().toISOString().slice(0, 10),
+      currency: expected.currency,
+      total: expected.amount,
+      paymentDetails: account ? payoutAccountPaymentDetails(account) : {},
+      invoiceFromMatchesProfile: true,
+      billToMatchesComets: true,
+    } satisfies InvoiceExtractedData;
+  }
+
   private uploadExternalFile(
     input: ExternalInvoiceUploadInput,
     requiredStatus: "WAITING_UPLOAD" | "RETURNED_FOR_REUPLOAD" | "RECOGNITION_FAILED",
@@ -1317,6 +1484,7 @@ export class MockApiAdapter implements Services {
     };
     invoice.documentState = { kind: "EXTERNAL", status: "RECOGNIZING" };
     invoice.payoutAccountId = input.payoutAccountId;
+    invoice.payoutSnapshot = createInvoicePayoutSnapshot(account, uploadedAt);
     invoice.document = structuredClone(input.file);
     invoice.extractedData = structuredClone(input.extractedData);
     invoice.fileVersions = [...(invoice.fileVersions || []), fileVersion];
@@ -1373,7 +1541,9 @@ export class MockApiAdapter implements Services {
   }
 
   private readProfile() {
-    if (typeof window === "undefined") return structuredClone(initialProfile);
+    if (typeof window === "undefined") {
+      return this.migratePayoutAccounts(structuredClone(initialProfile));
+    }
     try {
       const stored = window.localStorage.getItem(PROFILE_STORAGE_KEY);
       const storedProfile = stored
@@ -1402,7 +1572,7 @@ export class MockApiAdapter implements Services {
         profile.defaultPayoutAccountId,
       );
     } catch {
-      return structuredClone(initialProfile);
+      return this.migratePayoutAccounts(structuredClone(initialProfile));
     }
   }
 
@@ -1481,7 +1651,18 @@ export class MockApiAdapter implements Services {
     },
   };
 
-  requests: RequestProjectService = {
+  requests: RequestProjectService & Pick<
+    InvoiceService,
+    | "listExternalInvoices"
+    | "getExternalInvoice"
+    | "uploadExternalInvoiceFile"
+    | "retryExternalInvoiceRecognition"
+    | "correctExternalInvoiceRecognition"
+    | "selectExternalInvoicePayoutAccount"
+    | "confirmExternalInvoice"
+    | "resubmitExternalInvoice"
+    | "listExternalInvoiceHistory"
+  > = {
     list: async (creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
       return {
@@ -1496,6 +1677,243 @@ export class MockApiAdapter implements Services {
       if (creatorId !== PRIMARY_CREATOR_ID) return { data: undefined };
       const item = seedRequests.find((entry) => entry.id === id);
       return { data: item ? structuredClone(item) : undefined };
+    },
+    listExternalInvoices: async (creatorId) => {
+      await wait(80);
+      return {
+        data: creatorId === PRIMARY_CREATOR_ID
+          ? structuredClone(this.invoiceData.filter((item) => item.documentState?.kind === "EXTERNAL"))
+          : [],
+      };
+    },
+    getExternalInvoice: async (invoiceId, creatorId) => {
+      await wait(80);
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice || invoice.documentState?.kind !== "EXTERNAL") return { data: undefined };
+      if ((invoice.creatorId || PRIMARY_CREATOR_ID) !== creatorId) return { data: undefined };
+      return { data: structuredClone(invoice) };
+    },
+    uploadExternalInvoiceFile: async (input) => {
+      await wait(240);
+      const { invoice, duplicate } = this.externalCommandInvoice(input);
+      if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      const state = invoice.documentState!;
+      const allowed = state.kind === "EXTERNAL" && [
+        "WAITING_UPLOAD",
+        "RETURNED_FOR_REUPLOAD",
+        "RECOGNITION_FAILED",
+      ].includes(state.status);
+      if (!allowed) throw new Error("当前状态不允许上传 Invoice 文件");
+      if (!/^(application\/pdf|image\/(png|jpeg))$/.test(input.file.mimeType)) {
+        throw new Error("仅支持 PDF、PNG 或 JPEG 文件");
+      }
+      if (input.file.size <= 0 || input.file.size > 5 * 1024 * 1024) {
+        throw new Error("文件大小必须在 5MB 以内");
+      }
+      const account = this.profileData.payoutAccounts.find((item) => item.id === input.payoutAccountId);
+      if (!account || !isPayoutAccountUsable(account)) throw new Error("请选择已验证且可用的收款账户");
+      const previous = invoice.sourceFileVersions?.at(-1);
+      const version = (previous?.version || 0) + 1;
+      const uploadedAt = new Date().toISOString();
+      const fileVersionId = `file:${invoiceInternalIdOf(invoice)}:v${version}`;
+      invoice.sourceFileVersions = [
+        ...(invoice.sourceFileVersions || []),
+        {
+          ...structuredClone(input.file),
+          id: fileVersionId,
+          fileVersionId,
+          fileName: input.file.name,
+          version,
+          fileHash: `mock-sha256-${input.file.size}-${version}`,
+          uploadedAt,
+          uploadedBy: input.creatorId,
+          supersedesFileVersionId: previous?.fileVersionId,
+        },
+      ];
+      invoice.fileVersions = invoice.sourceFileVersions.map((file) => ({
+        ...file,
+        demoHash: file.fileHash,
+        supersedesFileId: file.supersedesFileVersionId,
+      }));
+      invoice.document = structuredClone(input.file);
+      invoice.payoutAccountId = account.id;
+      invoice.payoutSnapshot = createInvoicePayoutSnapshot(account, uploadedAt);
+      invoice.extractedData = undefined;
+      invoice.confirmedSnapshots = [];
+      const fromStatus = state.status;
+      invoice.documentState = { kind: "EXTERNAL", status: "RECOGNIZING" };
+      const data = this.finishExternalCommand(invoice, input.clientRequestId, {
+        action: "FILE_UPLOADED",
+        actor: input.creatorId,
+        fromStatus,
+        toStatus: "RECOGNIZING",
+      });
+      return { data, message: "文件已上传，正在识别 Invoice 信息" };
+    },
+    retryExternalInvoiceRecognition: async (input) => {
+      await wait(420);
+      const { invoice, duplicate } = this.externalCommandInvoice(input);
+      if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      if (invoice.documentState?.status !== "RECOGNIZING" && invoice.documentState?.status !== "RECOGNITION_FAILED") {
+        throw new Error("当前状态不能执行识别");
+      }
+      const file = invoice.sourceFileVersions?.at(-1);
+      if (!file) throw new Error("请先上传 Invoice 文件");
+      const fromStatus = invoice.documentState.status;
+      if (input.simulateFailure) {
+        invoice.documentState = { kind: "EXTERNAL", status: "RECOGNITION_FAILED" };
+        invoice.returnReason = "Mock OCR 无法识别当前文件，请重新识别或上传清晰文件。";
+        const data = this.finishExternalCommand(invoice, input.clientRequestId, {
+          action: "RECOGNITION_FAILED",
+          actor: "Mock OCR",
+          fromStatus,
+          toStatus: "RECOGNITION_FAILED",
+          reason: invoice.returnReason,
+        });
+        this.refreshCreatorNotifications();
+        return { data, message: "识别失败" };
+      }
+      const extractedData = this.mockRecognizedData(invoice);
+      invoice.extractedData = extractedData;
+      invoice.recognitionSnapshots = [
+        ...(invoice.recognitionSnapshots || []),
+        {
+          recognitionId: `recognition:${invoiceInternalIdOf(invoice)}:${file.version}`,
+          fileVersionId: file.fileVersionId,
+          engineVersion: "mock-ocr-v1",
+          recognizedAt: new Date().toISOString(),
+          fields: recognitionFieldsFromExtracted(invoiceNumberOf(invoice), extractedData),
+          extractedData,
+        },
+      ];
+      invoice.documentState = { kind: "EXTERNAL", status: "WAITING_CONFIRMATION" };
+      invoice.returnReason = undefined;
+      const data = this.finishExternalCommand(invoice, input.clientRequestId, {
+        action: "RECOGNITION_SUCCEEDED",
+        actor: "Mock OCR",
+        fromStatus,
+        toStatus: "WAITING_CONFIRMATION",
+      });
+      // Successful recognition is intentionally silent in NotificationService.
+      return { data, message: "识别完成，请核对结果" };
+    },
+    correctExternalInvoiceRecognition: async (input) => {
+      await wait(160);
+      const { invoice, duplicate } = this.externalCommandInvoice(input);
+      if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      if (!invoice.documentState || invoice.documentState.kind !== "EXTERNAL" || ![
+        "WAITING_CONFIRMATION",
+        "RETURNED_FOR_CORRECTION",
+      ].includes(invoice.documentState.status)) throw new Error("当前状态不允许修改识别结果");
+      const recognition = invoice.recognitionSnapshots?.at(-1);
+      const file = invoice.sourceFileVersions?.at(-1);
+      if (!recognition || !file) throw new Error("缺少识别结果或文件版本");
+      const now = new Date().toISOString();
+      const corrections = Object.entries(input.values).filter(([, value]) => value !== undefined).map(([field, value]) => ({
+        field: field as keyof typeof recognition.fields,
+        recognizedValue: recognition.fields[field as keyof typeof recognition.fields],
+        confirmedValue: String(value ?? ""),
+        correctedBy: input.creatorId,
+        correctedAt: now,
+      }));
+      const values = { ...recognition.fields, ...input.values };
+      invoice.confirmedSnapshots = [
+        ...(invoice.confirmedSnapshots || []),
+        {
+          confirmationId: `confirmation:draft:${invoiceInternalIdOf(invoice)}:${invoice.version! + 1}`,
+          recognitionId: recognition.recognitionId,
+          fileVersionId: file.fileVersionId,
+          values,
+          corrections,
+          payoutAccountId: invoice.payoutAccountId || "",
+          confirmedBy: input.creatorId,
+          confirmedAt: now,
+        },
+      ];
+      invoice.documentState = { kind: "EXTERNAL", status: "WAITING_CONFIRMATION" };
+      invoice.returnReason = undefined;
+      const data = this.finishExternalCommand(invoice, input.clientRequestId, {
+        action: "RECOGNITION_CORRECTED",
+        actor: input.creatorId,
+        fromStatus: "RETURNED_FOR_CORRECTION",
+        toStatus: "WAITING_CONFIRMATION",
+      });
+      return { data, message: "识别结果已修正" };
+    },
+    selectExternalInvoicePayoutAccount: async (input) => {
+      await wait(160);
+      const { invoice, duplicate } = this.externalCommandInvoice(input);
+      if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      if (!["WAITING_UPLOAD", "WAITING_CONFIRMATION", "RETURNED_FOR_CORRECTION", "RETURNED_FOR_REUPLOAD", "RECOGNITION_FAILED"].includes(invoice.documentState!.status)) {
+        throw new Error("当前状态不允许更换收款账户");
+      }
+      const account = this.profileData.payoutAccounts.find((item) => item.id === input.payoutAccountId);
+      if (!account || !isPayoutAccountUsable(account)) throw new Error("请选择已验证且可用的收款账户");
+      if (account.id === invoice.payoutAccountId) throw new Error("请选择与当前不同的收款账户");
+      const fromStatus = invoice.documentState!.status as ExternalInvoiceCollectionStatus;
+      invoice.payoutAccountId = account.id;
+      invoice.payoutSnapshot = createInvoicePayoutSnapshot(account);
+      const data = this.finishExternalCommand(invoice, input.clientRequestId, {
+        action: "PAYOUT_ACCOUNT_SELECTED",
+        actor: input.creatorId,
+        fromStatus,
+        toStatus: fromStatus,
+      });
+      return { data, message: "收款账户已更新" };
+    },
+    confirmExternalInvoice: async (input) => {
+      await wait(180);
+      const { invoice, duplicate } = this.externalCommandInvoice(input);
+      if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      if (input.acknowledgement !== true) throw new Error("请先确认 Invoice 核对声明");
+      if (invoice.documentState?.status !== "WAITING_CONFIRMATION") throw new Error("当前 Invoice 不能提交审核");
+      const account = this.profileData.payoutAccounts.find((item) => item.id === invoice.payoutAccountId);
+      const issues = validateExternalInvoiceConfirmation({ invoice, profile: this.profileData, account });
+      if (issues.length) throw new Error(issues.map((issue) => issue.message).join("；"));
+      const recognition = invoice.recognitionSnapshots!.at(-1)!;
+      const file = invoice.sourceFileVersions!.at(-1)!;
+      const current = invoice.confirmedSnapshots?.at(-1);
+      invoice.confirmedSnapshots = [
+        ...(invoice.confirmedSnapshots || []),
+        {
+          confirmationId: `confirmation:${invoiceInternalIdOf(invoice)}:${invoice.version! + 1}`,
+          recognitionId: recognition.recognitionId,
+          fileVersionId: file.fileVersionId,
+          values: current?.values || recognition.fields,
+          corrections: current?.corrections || [],
+          payoutAccountId: invoice.payoutAccountId!,
+          confirmedBy: input.creatorId,
+          confirmedAt: new Date().toISOString(),
+        },
+      ];
+      invoice.documentState = { kind: "EXTERNAL", status: "WAITING_MEDIA_REVIEW" };
+      const data = this.finishExternalCommand(invoice, input.clientRequestId, {
+        action: "SUBMITTED",
+        actor: input.creatorId,
+        fromStatus: "WAITING_CONFIRMATION",
+        toStatus: "WAITING_MEDIA_REVIEW",
+      });
+      this.refreshCreatorNotifications();
+      return { data, message: "Invoice 已提交审核" };
+    },
+    resubmitExternalInvoice: async (input) => {
+      await wait(180);
+      const corrected = await this.invoices.correctExternalInvoiceRecognition(input);
+      return this.invoices.confirmExternalInvoice({
+        invoiceId: input.invoiceId,
+        creatorId: input.creatorId,
+        expectedVersion: corrected.data.version || input.expectedVersion + 1,
+        clientRequestId: `${input.clientRequestId}:submit`,
+        acknowledgement: true,
+      });
+    },
+    listExternalInvoiceHistory: async (invoiceId, creatorId) => {
+      await wait(60);
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice || invoice.documentState?.kind !== "EXTERNAL" || (invoice.creatorId || PRIMARY_CREATOR_ID) !== creatorId) {
+        return { data: [] };
+      }
+      return { data: structuredClone(invoice.reviewHistory || []) };
     },
   };
 
@@ -1569,6 +1987,15 @@ export class MockApiAdapter implements Services {
       const item = this.findInvoice(id);
       return { data: item ? structuredClone(item) : undefined };
     },
+    listExternalInvoices: (...args) => this.requests.listExternalInvoices(...args),
+    getExternalInvoice: (...args) => this.requests.getExternalInvoice(...args),
+    uploadExternalInvoiceFile: (...args) => this.requests.uploadExternalInvoiceFile(...args),
+    retryExternalInvoiceRecognition: (...args) => this.requests.retryExternalInvoiceRecognition(...args),
+    correctExternalInvoiceRecognition: (...args) => this.requests.correctExternalInvoiceRecognition(...args),
+    selectExternalInvoicePayoutAccount: (...args) => this.requests.selectExternalInvoicePayoutAccount(...args),
+    confirmExternalInvoice: (...args) => this.requests.confirmExternalInvoice(...args),
+    resubmitExternalInvoice: (...args) => this.requests.resubmitExternalInvoice(...args),
+    listExternalInvoiceHistory: (...args) => this.requests.listExternalInvoiceHistory(...args),
     signInternalInvoice: async (invoiceId, signature) => {
       await wait();
       const invoice = this.findInvoice(invoiceId);
@@ -1576,11 +2003,11 @@ export class MockApiAdapter implements Services {
       if (
         invoice.documentState?.kind !== "INTERNAL"
         || invoice.documentState.status !== "WAITING_SIGNATURE"
-      ) throw new Error("只有待签署的内部 Invoice 可以签署");
+      ) throw new Error("只有待签署的 Comets内部invoice可以签署");
       if (invoice.signature) throw new Error("该 Invoice 已完成签署，不能重复操作");
       invoice.signature = structuredClone(signature);
       invoice.documentState = { kind: "INTERNAL", status: "UNDER_REVIEW" };
-      this.recordInvoiceOperation(invoice, "INTERNAL_SIGNED", "内部 Invoice 已签署并提交审核", signature.signerName);
+      this.recordInvoiceOperation(invoice, "INTERNAL_SIGNED", "Comets内部invoice已签署并提交审核", signature.signerName);
       this.persistInvoices();
       return { data: structuredClone(invoice), message: "Invoice 已签署并提交审核" };
     },
@@ -1591,7 +2018,7 @@ export class MockApiAdapter implements Services {
       if (
         invoice.documentState?.kind !== "INTERNAL"
         || invoice.documentState.status !== "WAITING_SIGNATURE"
-      ) throw new Error("只有待签署的内部 Invoice 可以提交信息反馈");
+      ) throw new Error("只有待签署的 Comets内部invoice可以提交信息反馈");
       if (!input.issueType.trim() || !input.details.trim()) {
         throw new Error("问题类型和问题说明不能为空");
       }
@@ -1667,6 +2094,19 @@ export class MockApiAdapter implements Services {
       await wait(180);
       const invoice = this.findInvoice(id);
       if (!invoice) throw new Error("Invoice 不存在");
+      if (invoice.documentState?.kind !== "EXTERNAL") {
+        throw new Error("Comets内部invoice的收款信息由支付管理端同步，不支持修改");
+      }
+      if (![
+        "WAITING_UPLOAD",
+        "RECOGNIZING",
+        "WAITING_CONFIRMATION",
+        "RETURNED_FOR_CORRECTION",
+        "RETURNED_FOR_REUPLOAD",
+        "RECOGNITION_FAILED",
+      ].includes(invoice.documentState.status)) {
+        throw new Error("当前 Invoice 状态不允许更换收款账户");
+      }
       const account = this.profileData.payoutAccounts.find(
         (candidate) => candidate.id === payoutAccountId,
       );
@@ -1677,6 +2117,7 @@ export class MockApiAdapter implements Services {
         throw new Error("请选择与当前不同的收款账户");
       }
       invoice.payoutAccountId = payoutAccountId;
+      invoice.payoutSnapshot = createInvoicePayoutSnapshot(account);
       this.recordInvoiceOperation(invoice, "PAYOUT_ACCOUNT_SELECTED", "已选择新的收款账户", "达人");
       this.persistInvoices();
       return { data: structuredClone(invoice), message: "收款账户已更新" };
@@ -1699,6 +2140,11 @@ export class MockApiAdapter implements Services {
       await wait();
       const invoice = this.findInvoice(invoiceId);
       if (!invoice) throw new Error("Invoice 不存在");
+      assertCreatorOwnsInvoice(invoice, input.submittedBy);
+      if (input.expectedVersion !== undefined) assertExpectedVersion(invoice, input.expectedVersion);
+      if (input.clientRequestId && invoice.processedClientRequestIds?.includes(input.clientRequestId)) {
+        return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      }
       if (invoice.documentState?.status !== "APPROVED" || invoice.paymentStatus !== "FAILED") {
         throw new Error("当前 Invoice 不在付款失败修正流程中");
       }
@@ -1726,6 +2172,7 @@ export class MockApiAdapter implements Services {
           throw new Error("新收款账户必须已通过验证且处于可用状态");
         }
         invoice.payoutAccountId = account.id;
+        invoice.payoutSnapshot = createInvoicePayoutSnapshot(account);
       }
       const occurredAt = new Date().toISOString();
       if (invoice.paymentIssue) invoice.paymentIssue.resolvedAt = occurredAt;
@@ -1736,12 +2183,31 @@ export class MockApiAdapter implements Services {
         "收款资料已提交复核",
         input.submittedBy,
       );
+      invoice.reviewHistory = [
+        ...(invoice.reviewHistory || []),
+        {
+          eventId: `history:${invoiceInternalIdOf(invoice)}:${Date.now()}`,
+          action: "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED",
+          actor: input.submittedBy,
+          occurredAt,
+          fromStatus: "APPROVED",
+          toStatus: "APPROVED",
+        },
+      ];
+      invoice.version = (invoice.version || 1) + 1;
+      if (input.clientRequestId) invoice.processedClientRequestIds = [...(invoice.processedClientRequestIds || []), input.clientRequestId];
       this.persistInvoices();
       return { data: structuredClone(invoice), message: "收款资料已提交复核" };
     },
   };
 
   payout: PayoutService = {
+    listTransferMethods: async (condition) => {
+      await wait(140);
+      return {
+        data: buildAirwallexMockTransferMethods(condition),
+      };
+    },
     getFormSchema: async (condition) => {
       await wait(360);
       return {

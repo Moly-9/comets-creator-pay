@@ -108,8 +108,10 @@ import {
   INTERNAL_REVIEW_META,
   PAYMENT_STATUS_META,
   invoiceInternalIdOf,
+  invoiceMatchesStatusFilters,
   invoiceNumberOf,
   invoicePaymentMeta,
+  invoicePrimaryStatusMeta,
   invoiceReviewFilterValue,
   invoiceReviewMeta,
   invoiceTypeOf,
@@ -117,10 +119,19 @@ import {
   recoveryStatusIsSubmitted,
 } from "./creator-workflow";
 import {
+  contractConfirmationRows,
+  contractPayoutRows,
+  createInvoicePayoutSnapshot,
+  creatorHomepageSocialSummary,
+  creatorInvoiceTypeLabel,
+  getSocialAccountName,
+  normalizeSocialEvidence,
+  payoutSnapshotRows,
+} from "./creator-display";
+import {
   AirwallexBeneficiaryValidationError,
   buildProfileSupplementalFields,
   compareInvoicePaymentDetails,
-  getSocialAccountName,
   isValidEmailAddress,
   normalizeAirwallexSchemaValue,
   reconcileAirwallexSchemaValues,
@@ -134,6 +145,7 @@ import type {
   AdminUserDetail,
   AirwallexFormSchema,
   AirwallexSchemaCondition,
+  AirwallexTransferMethodOption,
   Contract,
   CorrectionRequest,
   CreatorNotification,
@@ -145,7 +157,9 @@ import type {
   InvoiceFeedbackInput,
   InvoiceSignature,
   InvoiceStatus,
+  OnboardingDraft,
   PaymentAccountCorrectionInput,
+  PaymentStatus,
   PayoutAccount,
   RequestProject,
   Session,
@@ -156,7 +170,7 @@ const INVOICE_STATUS: Record<
   InvoiceStatus,
   { label: string; tone: string; description: string }
 > = {
-  PENDING_CONFIRMATION: { label: "待确认", tone: "amber", description: "请核对识别结果与付款账户" },
+  PENDING_CONFIRMATION: { label: "待确认", tone: "amber", description: "请核对识别结果与收款账户" },
   DRAFT_SIGNATURE: { label: "待确认", tone: "amber", description: "请核对内容并完成确认" },
   PENDING_REVIEW: { label: "待审核", tone: "blue", description: "资料已提交，等待审核" },
   CHANGES_REQUIRED: { label: "待修改", tone: "danger", description: "审核未通过，请按原因修改" },
@@ -187,6 +201,27 @@ const PAYMENT_DETAIL_LABELS: Record<string, string> = {
   iban: "IBAN",
 };
 
+const fullPayoutIdentifier = (account: PayoutAccount) =>
+  account.accountNumber
+  || account.schemaValues.account_number
+  || account.schemaValues.iban
+  || account.accountEmail
+  || "待补充";
+
+const creatorPayoutRows = (account: PayoutAccount) => [
+  ["Provider", account.provider],
+  ["Account Holder / Account Name", account.accountHolder || account.schemaValues.account_name],
+  ["Bank Name", account.bankName || account.schemaValues.bank_name],
+  ["Bank Country", account.bankCountry],
+  ["Currency", account.currency],
+  ["Account Number", account.accountNumber || account.schemaValues.account_number],
+  ["IBAN", account.schemaValues.iban],
+  ["SWIFT/BIC", account.swiftCode || account.schemaValues.swift_code],
+  ["Transfer Method", account.transferMethod],
+  ["Beneficiary Type", account.beneficiaryType],
+  ["PayPal Email", account.accountEmail],
+].filter(([, value]) => Boolean(value)) as Array<[string, string]>;
+
 export const shouldShowInvoicePreSigningControls = (status: InvoiceStatus) =>
   status === "DRAFT_SIGNATURE";
 
@@ -195,6 +230,9 @@ const normalizeInvoiceSearch = (value: string) =>
 
 const normalizeInvoiceIdentity = (value: string) =>
   value.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+
+const invoiceClientRequestId = (action: string) =>
+  `${action}:${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`}`;
 
 export const filterInvoiceList = (
   invoices: Invoice[],
@@ -265,6 +303,7 @@ interface AppState {
   confirmExternalInvoice(id: string): Promise<void>;
   correctExternalInvoice(id: string, extractedData: InvoiceExtractedData): Promise<void>;
   resubmitExternalInvoice(input: ExternalInvoiceUploadInput): Promise<Invoice>;
+  retryExternalRecognition(id: string): Promise<void>;
   selectInvoicePayoutAccount(id: string, payoutAccountId: string): Promise<void>;
   submitPaymentAccountCorrection(id: string, input: PaymentAccountCorrectionInput): Promise<void>;
   markNotificationRead(id: string): Promise<void>;
@@ -278,6 +317,49 @@ const useApp = () => {
   const context = useContext(AppContext);
   if (!context) throw new Error("AppContext is missing");
   return context;
+};
+
+const ONBOARDING_DRAFT_STORAGE_PREFIX = "comets-onboarding-draft-v1";
+
+export const onboardingDraftStorageKey = (userId: string) =>
+  `${ONBOARDING_DRAFT_STORAGE_PREFIX}:${userId}`;
+
+export const readOnboardingDraft = (
+  userId: string | undefined,
+): OnboardingDraft | null => {
+  if (!userId || typeof window === "undefined") return null;
+  try {
+    const stored = window.sessionStorage.getItem(
+      onboardingDraftStorageKey(userId),
+    );
+    if (!stored) return null;
+    const parsed = JSON.parse(stored) as OnboardingDraft;
+    return parsed.userId === userId ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+export const writeOnboardingDraft = (draft: OnboardingDraft) => {
+  if (typeof window === "undefined") return;
+  const serializableDraft: OnboardingDraft = {
+    userId: draft.userId,
+    maxVisitedStep: draft.maxVisitedStep,
+    registrationEmail: draft.registrationEmail,
+    social: draft.social,
+    profile: draft.profile,
+    updatedAt: draft.updatedAt,
+  };
+  window.sessionStorage.setItem(
+    onboardingDraftStorageKey(draft.userId),
+    JSON.stringify(serializableDraft),
+  );
+};
+
+export const clearOnboardingDraft = (userId: string | undefined) => {
+  if (!userId || typeof window === "undefined") return;
+  window.sessionStorage.removeItem(onboardingDraftStorageKey(userId));
+  window.sessionStorage.removeItem("comets-social-draft");
 };
 
 const readSession = (): Session | null => {
@@ -432,6 +514,7 @@ function AppProvider({ children }: { children: ReactNode }) {
           session.sessionId,
         );
         persistSession(result.data);
+        clearOnboardingDraft(session.userId);
       }
     },
     saveProfile: async (nextProfile) => {
@@ -463,34 +546,123 @@ function AppProvider({ children }: { children: ReactNode }) {
       await refreshWorkflowCollections(session.userId);
     },
     uploadExternalInvoice: async (input) => {
-      const result = await services.invoices.uploadExternal(input);
+      if (!session) throw new Error("登录会话已失效");
+      const current = invoices.find((item) => invoiceInternalIdOf(item) === input.invoiceId);
+      if (!current) throw new Error("Invoice 不存在");
+      const uploaded = await services.invoices.uploadExternalInvoiceFile({
+        invoiceId: input.invoiceId,
+        creatorId: session.userId,
+        expectedVersion: current.version || 1,
+        clientRequestId: invoiceClientRequestId("upload"),
+        payoutAccountId: input.payoutAccountId,
+        file: input.file,
+      });
+      replaceInvoice(uploaded.data);
+      const result = await services.invoices.retryExternalInvoiceRecognition({
+        invoiceId: input.invoiceId,
+        creatorId: session.userId,
+        expectedVersion: uploaded.data.version || 1,
+        clientRequestId: invoiceClientRequestId("recognize"),
+      });
       replaceInvoice(result.data);
       if (session) await refreshWorkflowCollections(session.userId);
       return result.data;
     },
     confirmExternalInvoice: async (id) => {
-      const result = await services.invoices.confirmExternal(id);
+      if (!session) throw new Error("登录会话已失效");
+      const current = invoices.find((item) => invoiceInternalIdOf(item) === id);
+      if (!current) throw new Error("Invoice 不存在");
+      const result = await services.invoices.confirmExternalInvoice({
+        invoiceId: id,
+        creatorId: session.userId,
+        expectedVersion: current.version || 1,
+        clientRequestId: invoiceClientRequestId("confirm"),
+        acknowledgement: true,
+      });
       replaceInvoice(result.data);
       if (session) await refreshWorkflowCollections(session.userId);
     },
     correctExternalInvoice: async (id, extractedData) => {
-      const result = await services.invoices.correctExternal(id, extractedData);
+      if (!session) throw new Error("登录会话已失效");
+      const current = invoices.find((item) => invoiceInternalIdOf(item) === id);
+      if (!current) throw new Error("Invoice 不存在");
+      const result = await services.invoices.correctExternalInvoiceRecognition({
+        invoiceId: id,
+        creatorId: session.userId,
+        expectedVersion: current.version || 1,
+        clientRequestId: invoiceClientRequestId("correct"),
+        values: {
+          SOURCE_INVOICE_NUMBER: invoiceNumberOf(current),
+          INVOICE_DATE: extractedData.invoiceDate,
+          PUBLISHER: extractedData.invoiceFrom,
+          ADVERTISER: extractedData.billTo,
+          DESCRIPTION: current.invoiceType || "External Invoice",
+          AMOUNT: extractedData.total,
+          CURRENCY: extractedData.currency,
+          PAYMENT_ACCOUNT: extractedData.paymentDetails.account_number || extractedData.paymentDetails.iban || "",
+        },
+      });
       replaceInvoice(result.data);
       if (session) await refreshWorkflowCollections(session.userId);
     },
     resubmitExternalInvoice: async (input) => {
-      const result = await services.invoices.resubmitExternal(input);
+      if (!session) throw new Error("登录会话已失效");
+      const current = invoices.find((item) => invoiceInternalIdOf(item) === input.invoiceId);
+      if (!current) throw new Error("Invoice 不存在");
+      const uploaded = await services.invoices.uploadExternalInvoiceFile({
+        invoiceId: input.invoiceId,
+        creatorId: session.userId,
+        expectedVersion: current.version || 1,
+        clientRequestId: invoiceClientRequestId("reupload"),
+        payoutAccountId: input.payoutAccountId,
+        file: input.file,
+      });
+      replaceInvoice(uploaded.data);
+      const result = await services.invoices.retryExternalInvoiceRecognition({
+        invoiceId: input.invoiceId,
+        creatorId: session.userId,
+        expectedVersion: uploaded.data.version || 1,
+        clientRequestId: invoiceClientRequestId("recognize-reupload"),
+      });
       replaceInvoice(result.data);
-      if (session) await refreshWorkflowCollections(session.userId);
+      await refreshWorkflowCollections(session.userId);
       return result.data;
     },
+    retryExternalRecognition: async (id) => {
+      if (!session) throw new Error("登录会话已失效");
+      const current = invoices.find((item) => invoiceInternalIdOf(item) === id);
+      if (!current) throw new Error("Invoice 不存在");
+      const result = await services.invoices.retryExternalInvoiceRecognition({
+        invoiceId: id,
+        creatorId: session.userId,
+        expectedVersion: current.version || 1,
+        clientRequestId: invoiceClientRequestId("retry-recognition"),
+      });
+      replaceInvoice(result.data);
+      await refreshWorkflowCollections(session.userId);
+    },
     selectInvoicePayoutAccount: async (id, payoutAccountId) => {
-      const result = await services.invoices.selectPayoutAccount(id, payoutAccountId);
+      if (!session) throw new Error("登录会话已失效");
+      const current = invoices.find((item) => invoiceInternalIdOf(item) === id);
+      if (!current) throw new Error("Invoice 不存在");
+      const result = await services.invoices.selectExternalInvoicePayoutAccount({
+        invoiceId: id,
+        creatorId: session.userId,
+        expectedVersion: current.version || 1,
+        clientRequestId: invoiceClientRequestId("select-payout"),
+        payoutAccountId,
+      });
       replaceInvoice(result.data);
       if (session) await refreshWorkflowCollections(session.userId);
     },
     submitPaymentAccountCorrection: async (id, input) => {
-      const result = await services.payments.submitAccountCorrection(id, input);
+      const current = invoices.find((item) => invoiceInternalIdOf(item) === id);
+      if (!current) throw new Error("Invoice 不存在");
+      const result = await services.payments.submitAccountCorrection(id, {
+        ...input,
+        expectedVersion: current.version || 1,
+        clientRequestId: invoiceClientRequestId("payment-account-correction"),
+      });
       replaceInvoice(result.data);
       if (session) await refreshWorkflowCollections(session.userId);
     },
@@ -506,6 +678,7 @@ function AppProvider({ children }: { children: ReactNode }) {
     },
     logout: () => {
       if (session) void services.auth.logout(session.sessionId);
+      clearOnboardingDraft(session?.userId);
       persistSession(null);
     },
   };
@@ -602,7 +775,74 @@ function AdminLayoutBridge() {
   return <AdminLayout session={session} logout={logout} />;
 }
 
-function AuthShell({ children, step }: { children: ReactNode; step?: number }) {
+const ONBOARDING_STEP_ROUTES: Record<1 | 2 | 3, string> = {
+  1: "/register",
+  2: "/onboarding/social-verification",
+  3: "/onboarding/profile",
+};
+
+export const canVisitOnboardingStep = (
+  step: 1 | 2 | 3,
+  hasCreatorSession: boolean,
+  maxVisitedStep: 1 | 2 | 3,
+) =>
+  step === 1 ||
+  (step === 2 && hasCreatorSession) ||
+  (step === 3 && maxVisitedStep >= 3);
+
+function OnboardingProgress({
+  currentStep,
+  maxVisitedStep,
+}: {
+  currentStep: 1 | 2 | 3;
+  maxVisitedStep: 1 | 2 | 3;
+}) {
+  const { session } = useApp();
+  const navigate = useNavigate();
+
+  return (
+    <nav
+      className="auth-progress"
+      aria-label={`注册进度，第 ${currentStep} 步，共 3 步`}
+    >
+      {[1, 2, 3].map((item) => {
+        const step = item as 1 | 2 | 3;
+        const isCurrent = step === currentStep;
+        const isComplete = step < maxVisitedStep;
+        const canVisit = canVisitOnboardingStep(
+          step,
+          Boolean(session?.role === "CREATOR"),
+          maxVisitedStep,
+        );
+        return (
+          <button
+            key={step}
+            type="button"
+            className={`${step <= maxVisitedStep ? "active" : ""} ${
+              isCurrent ? "current" : ""
+            }`}
+            aria-current={isCurrent ? "step" : undefined}
+            aria-label={`第 ${step} 步${isComplete ? "，已完成" : isCurrent ? "，当前步骤" : ""}`}
+            disabled={!canVisit || isCurrent}
+            onClick={() => navigate(ONBOARDING_STEP_ROUTES[step])}
+          >
+            {isComplete ? <Check size={13} /> : step}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+function AuthShell({
+  children,
+  step,
+  maxVisitedStep = step,
+}: {
+  children: ReactNode;
+  step?: 1 | 2 | 3;
+  maxVisitedStep?: 1 | 2 | 3;
+}) {
   return (
     <main className="auth-layout">
       <section className="auth-brand-panel">
@@ -621,13 +861,10 @@ function AuthShell({ children, step }: { children: ReactNode; step?: number }) {
       <section className="auth-form-panel">
         <div className="auth-mobile-brand"><Brand compact /></div>
         {step ? (
-          <div className="auth-progress" aria-label={`注册进度，第 ${step} 步，共 3 步`}>
-            {[1, 2, 3].map((item) => (
-              <span key={item} className={item <= step ? "active" : ""}>
-                {item < step ? <Check size={13} /> : item}
-              </span>
-            ))}
-          </div>
+          <OnboardingProgress
+            currentStep={step}
+            maxVisitedStep={maxVisitedStep || step}
+          />
         ) : null}
         {children}
       </section>
@@ -737,10 +974,15 @@ export function validateRegistration(
 }
 
 function RegisterPage() {
-  const { register } = useApp();
+  const { register, session } = useApp();
   const navigate = useNavigate();
+  const reviewingRegistration = Boolean(
+    session?.role === "CREATOR" && !session.onboardingComplete,
+  );
+  const savedDraft = readOnboardingDraft(session?.userId);
+  const maxVisitedStep = savedDraft?.maxVisitedStep || (session ? 2 : 1);
   const [values, setValues] = useState({
-    email: "",
+    email: session?.email || "",
     password: "",
     invitationCode: "",
   });
@@ -751,6 +993,10 @@ function RegisterPage() {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (reviewingRegistration) {
+      navigate("/onboarding/social-verification");
+      return;
+    }
     const validationError = validateRegistration(values, agreed);
     if (validationError) {
       setError(validationError);
@@ -791,17 +1037,47 @@ function RegisterPage() {
           <p>已有账号？ <Link to="/login">登录</Link></p>
         </header>
 
+        <div className="register-progress">
+          <OnboardingProgress
+            currentStep={1}
+            maxVisitedStep={maxVisitedStep}
+          />
+        </div>
+
         <form className="register-form" onSubmit={submit} noValidate>
           <header>
             <img className="register-comets-mark" src="/comets-mark.svg" alt="" />
             <span className="eyebrow">CREATOR ACCOUNT</span>
-            <h1>创建你的账号</h1>
-            <p>注册 COMETS Pay，开始管理合作款项与付款进度。</p>
+            <h1>{reviewingRegistration ? "账号注册信息" : "创建你的账号"}</h1>
+            <p>
+              {reviewingRegistration
+                ? "账号已创建，你可以查看注册邮箱并继续完成认证。"
+                : "注册 COMETS Pay，开始管理合作款项与付款进度。"}
+            </p>
           </header>
 
-          {error ? <div className="form-alert danger" role="alert">{error}</div> : null}
+          {reviewingRegistration ? (
+            <>
+              <section className="registered-account-review" aria-label="已注册账号">
+                <CheckCircle2 size={21} />
+                <span>
+                  <small>注册邮箱 / Registered email</small>
+                  <strong>{session?.email}</strong>
+                </span>
+                <StatusBadge label="账号已创建" tone="success" />
+              </section>
+              <div className="registered-account-security-note">
+                为保护账号安全，密码不会在注册完成后显示或保存在浏览器草稿中。
+              </div>
+              <button className="register-primary" type="submit">
+                继续认证社媒账号 <ChevronRight size={17} />
+              </button>
+            </>
+          ) : (
+            <>
+              {error ? <div className="form-alert danger" role="alert">{error}</div> : null}
 
-          <label>
+              <label>
             <span>邮箱地址 / Email address <b>*</b></span>
             <input
               type="email"
@@ -811,9 +1087,9 @@ function RegisterPage() {
               placeholder="name@example.com"
             />
             <small>请使用接收品牌合作邀请的邮箱注册。</small>
-          </label>
+              </label>
 
-          <label>
+              <label>
             <span>密码 / Password <b>*</b></span>
             <span className="password-field">
               <input
@@ -838,18 +1114,18 @@ function RegisterPage() {
             <small id="register-password-requirements">
               必须同时包含大写字母、小写字母和数字，不可包含空格。
             </small>
-          </label>
+              </label>
 
-          <label>
+              <label>
             <span>邀请码 / Invitation code</span>
             <input
               value={values.invitationCode}
               onChange={(event) => setValues({ ...values, invitationCode: event.target.value })}
               placeholder="输入品牌或经纪人提供的邀请码"
             />
-          </label>
+              </label>
 
-          <label className="register-agreement">
+              <label className="register-agreement">
             <input
               type="checkbox"
               checked={agreed}
@@ -859,26 +1135,28 @@ function RegisterPage() {
               我已阅读并同意 <a href="#terms">服务协议</a>、<a href="#privacy">隐私政策</a>
               与 <a href="#data">数据处理协议</a>
             </span>
-          </label>
+              </label>
 
-          <button className="register-primary" type="submit" disabled={submitting}>
+              <button className="register-primary" type="submit" disabled={submitting}>
             {submitting ? <RefreshCcw className="spin" size={17} /> : null}
             {submitting ? "正在创建账号" : "开始注册"}
-          </button>
+              </button>
 
-          <div className="register-divider"><span>或</span></div>
+              <div className="register-divider"><span>或</span></div>
 
-          <button
-            className="register-google"
-            type="button"
-            disabled={submitting}
-            onClick={registerWithGoogle}
-          >
-            <Globe2 size={17} />
-            使用 Google 账号注册
-          </button>
+              <button
+                className="register-google"
+                type="button"
+                disabled={submitting}
+                onClick={registerWithGoogle}
+              >
+                <Globe2 size={17} />
+                使用 Google 账号注册
+              </button>
 
-          <p className="register-login-link">已经有账号？ <Link to="/login">立即登录</Link></p>
+              <p className="register-login-link">已经有账号？ <Link to="/login">立即登录</Link></p>
+            </>
+          )}
         </form>
       </section>
 
@@ -931,15 +1209,20 @@ export function validateSocialVerification(
 }
 
 function SocialVerificationPage() {
-  const { profile } = useApp();
+  const { profile, session } = useApp();
   const navigate = useNavigate();
+  const savedDraft = readOnboardingDraft(session?.userId);
   const [profileUrls, setProfileUrls] = useState<string[]>(
-    profile.social.profileUrls?.length
+    savedDraft?.social?.profileUrls?.length
+      ? savedDraft.social.profileUrls
+      : profile.social.profileUrls?.length
       ? profile.social.profileUrls
       : [profile.social.profileUrl || ""],
   );
   const [files, setFiles] = useState<FileRef[]>(
-    profile.social.screenshots?.length
+    savedDraft?.social?.files?.length
+      ? savedDraft.social.files
+      : profile.social.screenshots?.length
       ? profile.social.screenshots
       : profile.social.screenshot
         ? [profile.social.screenshot]
@@ -948,7 +1231,29 @@ function SocialVerificationPage() {
   const [error, setError] = useState("");
   const [verification, setVerification] = useState<
     "idle" | "verifying" | "verified"
-  >("idle");
+  >(savedDraft?.social?.verification === "verifying"
+    ? "idle"
+    : savedDraft?.social?.verification ||
+        (profile.social.verificationStatus === "VERIFIED"
+          ? "verified"
+          : "idle"));
+
+  useEffect(() => {
+    if (!session) return;
+    const current = readOnboardingDraft(session.userId);
+    writeOnboardingDraft({
+      userId: session.userId,
+      maxVisitedStep: current?.maxVisitedStep || 2,
+      registrationEmail: session.email,
+      social: {
+        profileUrls,
+        files,
+        verification,
+      },
+      profile: current?.profile,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [files, profileUrls, session, verification]);
 
   const chooseFiles = (selected: FileList | null) => {
     if (!selected?.length) return;
@@ -1009,6 +1314,21 @@ function SocialVerificationPage() {
         verificationStatus: "VERIFIED",
       }),
     );
+    if (session) {
+      const current = readOnboardingDraft(session.userId);
+      writeOnboardingDraft({
+        userId: session.userId,
+        maxVisitedStep: 3,
+        registrationEmail: session.email,
+        social: {
+          profileUrls: normalizedUrls,
+          files,
+          verification: "verified",
+        },
+        profile: current?.profile,
+        updatedAt: new Date().toISOString(),
+      });
+    }
     navigate("/onboarding/profile");
   };
 
@@ -1025,7 +1345,14 @@ function SocialVerificationPage() {
   };
 
   return (
-    <AuthShell step={2}>
+    <AuthShell
+      step={2}
+      maxVisitedStep={
+        verification === "verified" && savedDraft?.maxVisitedStep === 3
+          ? 3
+          : 2
+      }
+    >
       <form className="auth-form dense" onSubmit={submit}>
         <header>
           <span className="eyebrow">第 2 步</span>
@@ -1168,37 +1495,170 @@ const airwallexCountryCode = (country: string) =>
     "Hong Kong": "HK",
   }[country] ?? "JP");
 
+const transferMethodScenarioKey = (
+  condition: Pick<
+    AirwallexSchemaCondition,
+    "bankCountryCode" | "accountCurrency" | "entityType"
+  >,
+) =>
+  `${condition.bankCountryCode}:${condition.accountCurrency}:${condition.entityType}`;
+
+const transferMethodLabel = (method: AirwallexTransferMethodOption) =>
+  `${method.label}${method.recommended ? "（费用最低）" : ""}`;
+
 function OnboardingProfilePage() {
-  const { profile, completeOnboarding } = useApp();
+  const { profile, completeOnboarding, session } = useApp();
   const navigate = useNavigate();
-  const [form, setForm] = useState(profile);
-  const [agreed, setAgreed] = useState(false);
+  const savedDraft = readOnboardingDraft(session?.userId);
+  const [form, setForm] = useState(savedDraft?.profile?.form || profile);
+  const [agreed, setAgreed] = useState(savedDraft?.profile?.agreed || false);
   const [error, setError] = useState("");
   const [channel, setChannel] = useState<"AIRWALLEX" | "PAYPAL" | "PAYERMAX">(
-    profile.payout.channel || "AIRWALLEX",
+    savedDraft?.profile?.channel || profile.payout.channel || "AIRWALLEX",
   );
   const [condition, setCondition] = useState<AirwallexSchemaCondition>({
-    bankCountryCode: airwallexCountryCode(profile.payout.bankCountry),
-    accountCurrency: profile.payout.currency || "USD",
-    entityType: profile.payout.beneficiaryType || "PERSONAL",
-    transferMethod: profile.payout.transferMethod || "LOCAL",
+    bankCountryCode:
+      savedDraft?.profile?.condition.bankCountryCode ||
+      airwallexCountryCode(profile.payout.bankCountry),
+    accountCurrency:
+      savedDraft?.profile?.condition.accountCurrency ||
+      profile.payout.currency ||
+      "USD",
+    entityType:
+      savedDraft?.profile?.condition.entityType ||
+      profile.payout.beneficiaryType ||
+      "PERSONAL",
+    transferMethod:
+      savedDraft?.profile?.condition.transferMethod ||
+      profile.payout.transferMethod ||
+      "LOCAL",
   });
   const [schema, setSchema] = useState<AirwallexFormSchema | null>(null);
   const [schemaValues, setSchemaValues] = useState<Record<string, string>>(
-    profile.payout.schemaValues || {},
+    savedDraft?.profile?.schemaValues || profile.payout.schemaValues || {},
   );
+  const [transferMethods, setTransferMethods] = useState<
+    AirwallexTransferMethodOption[]
+  >([]);
+  const [transferMethodsLoading, setTransferMethodsLoading] = useState(true);
+  const [transferMethodsError, setTransferMethodsError] = useState("");
+  const [resolvedTransferScenario, setResolvedTransferScenario] = useState("");
+  const preserveInitialTransferMethodRef = useRef(Boolean(savedDraft?.profile));
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    const draft = window.sessionStorage.getItem("comets-social-draft");
-    if (draft) {
-      const social = JSON.parse(draft) as UserProfile["social"];
+    if (savedDraft?.social?.profileUrls.length) {
+      const normalizedUrls = savedDraft.social.profileUrls.map((url) =>
+        url.trim(),
+      );
+      const primaryHost = (() => {
+        try {
+          return new URL(normalizedUrls[0]).hostname.replace(/^www\./, "");
+        } catch {
+          return "多平台";
+        }
+      })();
+      setForm((current) => ({
+        ...current,
+        social: {
+          platform: "多平台",
+          handle: `${primaryHost} 等 ${normalizedUrls.length} 个主页`,
+          profileUrl: normalizedUrls[0],
+          profileUrls: normalizedUrls,
+          screenshot: savedDraft.social?.files[0],
+          screenshots: savedDraft.social?.files || [],
+          verificationStatus:
+            savedDraft.social?.verification === "verified"
+              ? "VERIFIED"
+              : "PENDING",
+        },
+      }));
+      return;
+    }
+    const legacyDraft = window.sessionStorage.getItem("comets-social-draft");
+    if (legacyDraft) {
+      const social = JSON.parse(legacyDraft) as UserProfile["social"];
       setForm((current) => ({ ...current, social }));
     }
   }, []);
 
   useEffect(() => {
+    if (!session) return;
+    const current = readOnboardingDraft(session.userId);
+    writeOnboardingDraft({
+      userId: session.userId,
+      maxVisitedStep: 3,
+      registrationEmail: session.email,
+      social: current?.social,
+      profile: {
+        form,
+        channel,
+        condition,
+        schemaValues,
+        agreed,
+      },
+      updatedAt: new Date().toISOString(),
+    });
+  }, [agreed, channel, condition, form, schemaValues, session]);
+
+  useEffect(() => {
+    let active = true;
+    const scenario = transferMethodScenarioKey(condition);
+    setTransferMethodsLoading(true);
+    setTransferMethodsError("");
+    services.payout
+      .listTransferMethods({
+        bankCountryCode: condition.bankCountryCode,
+        accountCurrency: condition.accountCurrency,
+        entityType: condition.entityType,
+      })
+      .then((result) => {
+        if (!active) return;
+        setTransferMethods(result.data);
+        const currentMethod = result.data.find(
+          (method) =>
+            method.value === condition.transferMethod && method.available,
+        );
+        const recommended = result.data.find(
+          (method) => method.recommended && method.available,
+        );
+        const nextMethod =
+          preserveInitialTransferMethodRef.current && currentMethod
+            ? currentMethod
+            : recommended || currentMethod;
+        preserveInitialTransferMethodRef.current = false;
+        if (nextMethod && nextMethod.value !== condition.transferMethod) {
+          setCondition((current) => ({
+            ...current,
+            transferMethod: nextMethod.value,
+          }));
+        }
+        setResolvedTransferScenario(scenario);
+        setTransferMethodsLoading(false);
+      })
+      .catch(() => {
+        if (!active) return;
+        setTransferMethodsError("转账方式加载失败，请重试。");
+        setResolvedTransferScenario(scenario);
+        setTransferMethodsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    condition.accountCurrency,
+    condition.bankCountryCode,
+    condition.entityType,
+  ]);
+
+  useEffect(() => {
+    if (
+      transferMethodsLoading ||
+      resolvedTransferScenario !== transferMethodScenarioKey(condition)
+    ) {
+      return;
+    }
     let active = true;
     setSchemaLoading(true);
     setError("");
@@ -1218,6 +1678,8 @@ function OnboardingProfilePage() {
     condition.bankCountryCode,
     condition.entityType,
     condition.transferMethod,
+    resolvedTransferScenario,
+    transferMethodsLoading,
   ]);
 
   const submit = async (event: FormEvent) => {
@@ -1230,7 +1692,7 @@ function OnboardingProfilePage() {
       setError("请阅读并同意服务协议与隐私政策");
       return;
     }
-    if (channel !== "AIRWALLEX" || !schema) {
+    if (channel !== "AIRWALLEX" || !schema || transferMethodsLoading) {
       setError("请选择已开放的收款渠道并等待表单加载");
       return;
     }
@@ -1354,12 +1816,39 @@ function OnboardingProfilePage() {
                 </label>
                 <label>
                   <span>转账方式 / Transfer method *</span>
-                  <select value={condition.transferMethod} onChange={(event) => setCondition({ ...condition, transferMethod: event.target.value as "LOCAL" | "SWIFT" })}>
-                    <option value="LOCAL">本地转账 / Local transfer</option>
-                    <option value="SWIFT">国际电汇 / SWIFT</option>
+                  <select
+                    value={condition.transferMethod}
+                    disabled={transferMethodsLoading}
+                    onChange={(event) =>
+                      setCondition({
+                        ...condition,
+                        transferMethod: event.target.value as "LOCAL" | "SWIFT",
+                      })
+                    }
+                  >
+                    {transferMethods.length ? (
+                      transferMethods.map((method) => (
+                        <option
+                          key={method.value}
+                          value={method.value}
+                          disabled={!method.available}
+                        >
+                          {transferMethodLabel(method)}
+                        </option>
+                      ))
+                    ) : (
+                      <option value={condition.transferMethod}>
+                        {condition.transferMethod === "LOCAL"
+                          ? "本地转账 / Local transfer"
+                          : "国际电汇 / SWIFT"}
+                      </option>
+                    )}
                   </select>
                 </label>
               </div>
+              {transferMethodsError ? (
+                <div className="form-alert danger">{transferMethodsError}</div>
+              ) : null}
               {schemaLoading ? (
                 <LoadingRows />
               ) : schema ? (
@@ -1408,7 +1897,7 @@ function OnboardingProfilePage() {
           <input type="checkbox" checked={agreed} onChange={(event) => setAgreed(event.target.checked)} />
           <span>我已阅读并同意《服务协议》和《隐私政策》</span>
         </label>
-        <button className="primary-button" type="submit" disabled={submitting || schemaLoading}>
+        <button className="primary-button" type="submit" disabled={submitting || schemaLoading || transferMethodsLoading}>
           {submitting ? <RefreshCcw className="spin" size={17} /> : <ShieldCheck size={17} />}
           {submitting ? "正在校验并创建 Beneficiary" : "校验付款信息并完成注册"}
         </button>
@@ -1418,7 +1907,7 @@ function OnboardingProfilePage() {
 }
 
 const navItems = [
-  { to: "/", label: "请款项目", icon: FolderKanban },
+  { to: "/", label: "首页", icon: FolderKanban },
   { to: "/contracts", label: "合同", icon: FileText },
   { to: "/invoices", label: "Invoice", icon: ReceiptText },
   { to: "/profile", label: "个人档案", icon: IdCard },
@@ -1426,8 +1915,8 @@ const navItems = [
 
 const creatorGuideSteps = [
   {
-    title: "查看请款项目",
-    description: "确认项目金额、关联合同、Invoice 状态和当前审批进度。",
+    title: "查看收款",
+    description: "确认收款金额、关联合同、Invoice 状态和当前审批进度。",
   },
   {
     title: "核对合同内容",
@@ -1464,8 +1953,8 @@ const creatorGuideStatuses = [
 const creatorGuideShortcuts = [
   {
     to: "/",
-    label: "请款项目",
-    description: "查看全部请款进度",
+    label: "首页",
+    description: "查看全部收款进度",
     icon: FolderKanban,
     tone: "request",
   },
@@ -1798,7 +2287,7 @@ function AppLayout() {
           <button type="button" className="icon-button" title="退出登录" onClick={signOut}><LogOut size={17} /></button>
         </div>
       </aside>
-      <main className="main-content">
+      <main className={`main-content ${location.pathname === "/" ? "request-home-main" : ""}`}>
         {accessDenied ? (
           <div className="role-access-notice" role="alert">
             <AlertCircle size={16} />
@@ -1959,7 +2448,7 @@ function RequestMiniProgress({ status }: { status: InvoiceStatus }) {
             : ["success", "current", "pending", "pending"];
 
   return (
-    <div className="request-mini-progress" aria-label={`当前请款状态：${REQUEST_STATUS_FROM_INVOICE[status].label}`}>
+    <div className="request-mini-progress" aria-label={`当前收款状态：${REQUEST_STATUS_FROM_INVOICE[status].label}`}>
       {REQUEST_TRACK_LABELS.map((label, index) => {
         const step = steps[index];
         return (
@@ -1977,6 +2466,8 @@ function RequestListPage() {
   const { invoices, profile, tasks } = useApp();
   const [query, setQuery] = useState("");
   const [group, setGroup] = useState<CreatorTask["group"] | "ALL">("ALL");
+  const [reviewFilter, setReviewFilter] = useState("ALL");
+  const [paymentFilter, setPaymentFilter] = useState<PaymentStatus | "ALL">("ALL");
   const normalizedQuery = normalizeInvoiceSearch(query);
   const invoiceGroup = (invoice: Invoice): CreatorTask["group"] => {
     const task = tasks.find((item) => item.resourceId === invoiceInternalIdOf(invoice));
@@ -1986,9 +2477,11 @@ function RequestListPage() {
     () => invoices.map(migrateInvoice).filter((invoice) => {
       const matchesGroup = group === "ALL" || invoiceGroup(invoice) === group;
       const matchesQuery = !normalizedQuery || normalizeInvoiceSearch(invoiceNumberOf(invoice)).includes(normalizedQuery);
-      return matchesGroup && matchesQuery;
+      return matchesGroup
+        && matchesQuery
+        && invoiceMatchesStatusFilters(invoice, reviewFilter, paymentFilter);
     }),
-    [group, invoices, normalizedQuery, tasks],
+    [group, invoices, normalizedQuery, paymentFilter, reviewFilter, tasks],
   );
   const groupedTasks = (["TODO", "PROCESSING", "COMPLETED"] as const).map((taskGroup) => ({
     group: taskGroup,
@@ -1997,13 +2490,13 @@ function RequestListPage() {
   const todoInvoices = invoices.map(migrateInvoice).filter((invoice) => invoiceGroup(invoice) === "TODO");
   const processingInvoices = invoices.map(migrateInvoice).filter((invoice) => invoiceGroup(invoice) === "PROCESSING");
   const paidInvoices = invoices.map(migrateInvoice).filter((invoice) => invoice.paymentStatus === "PAID");
-  const creatorHandle = profile.social.handle.replace(/^@/, "");
+  const socialSummary = creatorHomepageSocialSummary(profile.social);
 
   return (
     <div className="page-stack request-home-page">
       <header className="request-home-greeting">
-        <h1>你好，{profile.displayName}</h1>
-        <p>欢迎回来，@{creatorHandle}</p>
+        <h1>你好，{profile.displayName} <span aria-hidden="true">👋</span></h1>
+        <p>欢迎回来，{socialSummary}</p>
       </header>
 
       <section className="request-task-groups" aria-label="收款任务">
@@ -2014,64 +2507,93 @@ function RequestListPage() {
               <span>{section.items.length}</span>
             </header>
             <div>
-              {section.items.length ? section.items.map((task) => (
-                <Link to={task.deepLink} key={task.id}>
-                  <span className="request-action-icon purple">{task.type === "CONTRACT_SIGNATURE" ? <FileText size={18} /> : <ReceiptText size={18} />}</span>
-                  <span><strong>{task.title}</strong><small>{task.description}</small></span>
-                  <ChevronRight size={15} />
-                </Link>
-              )) : <p className="request-task-empty">暂无记录</p>}
+              {section.items.length ? section.items.map((task) => {
+                const TaskIcon = section.group === "COMPLETED"
+                  ? CheckCircle2
+                  : task.type === "CONTRACT_SIGNATURE"
+                    ? FileText
+                    : ReceiptText;
+                return (
+                  <Link to={task.deepLink} key={task.id}>
+                    <span className="request-action-icon purple"><TaskIcon size={18} /></span>
+                    <span><strong>{task.title}</strong><small>{task.description}</small></span>
+                    <ChevronRight size={15} />
+                  </Link>
+                );
+              }) : (
+                <div className="request-task-empty">
+                  <span aria-hidden="true"><Check size={22} /></span>
+                  <p>暂无记录</p>
+                </div>
+              )}
             </div>
           </article>
         ))}
       </section>
 
-      <section className="request-money-overview" aria-label="请款金额概览">
+      <section className="request-money-overview" aria-label="收款金额概览">
         <article>
-          <i className="amber" />
           <div>
             <span>
+              <i className="coral" />
               待签署金额
               <AmountInfoTooltip id="requesting-amount-tip" label="待签署金额">
                 当前账号下已匹配合同、但关联 Invoice 仍待你签署的项目金额合计。
               </AmountInfoTooltip>
             </span>
             <strong>{summarizeRequestAmount(todoInvoices)}</strong>
+            <small>{todoInvoices.length} 份 Invoice</small>
           </div>
-          <small>{todoInvoices.length} 份 Invoice</small>
         </article>
         <article>
-          <i className="blue" />
           <div>
             <span>
+              <i className="blue" />
               处理中金额
               <AmountInfoTooltip id="pending-arrival-amount-tip" label="处理中金额">
                 当前正在审核、等待付款或收款资料复核中的 Invoice 金额合计。
               </AmountInfoTooltip>
             </span>
             <strong>{summarizeRequestAmount(processingInvoices)}</strong>
+            <small>{processingInvoices.length} 份 Invoice</small>
           </div>
-          <small>{processingInvoices.length} 份 Invoice</small>
         </article>
         <article>
-          <i className="green" />
           <div>
             <span>
+              <i className="green" />
               已打款金额
               <AmountInfoTooltip id="completed-amount-tip" label="已打款金额">
                 关联 Invoice 已完成付款的项目金额合计。
               </AmountInfoTooltip>
             </span>
             <strong>{summarizeRequestAmount(paidInvoices)}</strong>
+            <small>{paidInvoices.length} 份 Invoice</small>
           </div>
-          <small>{paidInvoices.length} 份 Invoice</small>
         </article>
       </section>
 
       <section className="content-card request-project-panel">
-        <header><h2>请款项目</h2></header>
+        <header><h2>收款</h2></header>
         <div className="toolbar request-project-toolbar">
-          <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Invoice 编号" aria-label="搜索 Invoice 编号" /></label>
+          <div className="request-project-query-controls">
+            <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Invoice 编号" aria-label="搜索 Invoice 编号" /></label>
+            <label className="request-project-select">
+              <FileCheck2 size={16} />
+              <select value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value)} aria-label="筛选 Invoice 审核状态">
+                <option value="ALL">全部审核状态</option>
+                {Object.entries(INTERNAL_REVIEW_META).map(([status, meta]) => <option key={`INTERNAL:${status}`} value={`INTERNAL:${status}`}>Comets内部合同 · {meta.label}</option>)}
+                {Object.entries(EXTERNAL_COLLECTION_META).map(([status, meta]) => <option key={`EXTERNAL:${status}`} value={`EXTERNAL:${status}`}>外部 Invoice · {meta.label}</option>)}
+              </select>
+            </label>
+            <label className="request-project-select">
+              <WalletCards size={16} />
+              <select value={paymentFilter} onChange={(event) => setPaymentFilter(event.target.value as PaymentStatus | "ALL")} aria-label="筛选付款状态">
+                <option value="ALL">全部付款状态</option>
+                {Object.entries(PAYMENT_STATUS_META).map(([status, meta]) => <option key={status} value={status}>{meta.label}</option>)}
+              </select>
+            </label>
+          </div>
           <div className="filter-tabs">
             {(["ALL", "TODO", "PROCESSING", "COMPLETED"] as const).map((value) => (
               <button type="button" key={value} className={value === group ? "active" : ""} onClick={() => setGroup(value)}>
@@ -2093,7 +2615,7 @@ function RequestListPage() {
                     return (
                       <tr className={index === 0 && group === "ALL" && !query ? "request-priority-row" : ""} key={invoiceInternalIdOf(invoice)}>
                         <td><Link className="table-primary" to={`/invoices/${invoiceNumberOf(invoice)}`}><strong>{invoiceNumberOf(invoice)}</strong><small>{invoice.updatedAt}</small></Link></td>
-                        <td>{invoiceTypeOf(invoice) === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</td>
+                        <td>{creatorInvoiceTypeLabel(invoice)}</td>
                         <td className="amount-cell">{invoice.amount}</td>
                         <td><StatusBadge label={review.label} tone={review.tone} /></td>
                         <td><StatusBadge label={payment.label} tone={payment.tone} /></td>
@@ -2110,9 +2632,10 @@ function RequestListPage() {
               {filtered.map((invoice) => {
                 const review = invoiceReviewMeta(invoice);
                 const payment = invoicePaymentMeta(invoice);
+                const primaryStatus = invoicePrimaryStatusMeta(invoice);
                 return (
                   <Link to={`/invoices/${invoiceNumberOf(invoice)}`} className="request-mobile-card" key={invoiceInternalIdOf(invoice)}>
-                    <header><div><strong>{invoiceNumberOf(invoice)}</strong><small>{invoiceTypeOf(invoice) === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</small></div><StatusBadge label={payment.label} tone={payment.tone} /></header>
+                    <header><div><strong>{invoiceNumberOf(invoice)}</strong><small>{creatorInvoiceTypeLabel(invoice)}</small></div><StatusBadge label={primaryStatus.label} tone={primaryStatus.tone} /></header>
                     <div className="request-mobile-amount">{invoice.amount}</div>
                     <dl><div><dt>审核</dt><dd>{review.label}</dd></div><div><dt>付款</dt><dd>{payment.label}</dd></div><div><dt>更新</dt><dd>{invoice.updatedAt}</dd></div></dl>
                   </Link>
@@ -2121,7 +2644,7 @@ function RequestListPage() {
             </div>
             <footer className="request-project-footer">显示 {filtered.length} 份 Invoice，共 {invoices.length} 份</footer>
           </>
-        ) : <EmptyState title="没有匹配的收款" copy="请调整 Invoice 编号或任务分组后再试。" />}
+        ) : <EmptyState title="没有匹配的收款" copy="请调整 Invoice 编号、任务分组或状态筛选后再试。" />}
       </section>
     </div>
   );
@@ -2253,10 +2776,10 @@ function RequestDetailPage({ adminView = false }: { adminView?: boolean }) {
 
   return (
     <div className="page-stack">
-      <BackLink to={backTo}>返回请款项目</BackLink>
+      <BackLink to={backTo}>{adminView ? "返回请款项目" : "返回收款"}</BackLink>
       <PageHeading title={linkedInvoice.projectName} subtitle={`${baseRequest?.id || linkedInvoice.projectId} · ${linkedInvoice.brand}`} action={<StatusBadge label={meta.label} tone={meta.tone} />} />
       <section className="detail-metrics">
-        <article><span>请款金额</span><strong>{linkedInvoice.amount}</strong><small>以关联 Invoice 为准</small></article>
+        <article><span>{adminView ? "请款金额" : "收款金额"}</span><strong>{linkedInvoice.amount}</strong><small>以关联 Invoice 为准</small></article>
         <article><span>合同状态</span><strong>{contractStatusLabel[linkedContract.status]}</strong><small>按项目名匹配 1 份合同</small></article>
         <article><span>Invoice 状态</span><strong>{INVOICE_STATUS[linkedInvoice.status].label}</strong><small>按项目名匹配 1 份 Invoice</small></article>
       </section>
@@ -2297,7 +2820,7 @@ function RequestDetailPage({ adminView = false }: { adminView?: boolean }) {
           ) : null}
         </section>
         <aside className="detail-card progress-card">
-          <header><div><h2>请款进程</h2><p>{meta.description}</p></div></header>
+          <header><div><h2>{adminView ? "请款进程" : "收款进度"}</h2><p>{meta.description}</p></div></header>
           <div className="timeline">
             {progress.map((node) => (
               <div key={node.id} className={`timeline-item state-${node.state}`}>
@@ -2447,61 +2970,31 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
   }
   if (!baseContract) return <Navigate to="/contracts" replace />;
   const contract = baseContract;
+  const contractProfile = normalizePayoutProfile(
+    adminCreator.detail?.profile || profile,
+  );
   const statusOrder: Contract["status"][] = ["PENDING_SIGNATURE", "ACTIVE", "EXPIRED"];
   const currentStatusIndex = statusOrder.indexOf(contract.status);
-  const obligationGroups = [
+  const contractInformationTabs = [
     {
       id: "FULFILLMENT" as const,
-      title: "履约内容",
-      description: "用于内容交付与发布履约",
-      items: contract.obligations.filter((item) => item.stage === "履约中"),
+      title: "合同确认信息",
+      description: "签署前需要确认的合同主体与付款信息",
+      rows: contractConfirmationRows(contract, contractProfile),
     },
     {
       id: "CLAIM" as const,
-      title: "请款内容",
-      description: "用于终验后的请款资料准备",
-      items: contract.obligations.filter((item) => item.stage === "请款前"),
+      title: "收款信息",
+      description: adminView ? "敏感字段已脱敏" : "当前默认收款账户的完整信息",
+      rows: contractPayoutRows(
+        contractProfile,
+        adminView ? "ADMIN" : "CREATOR",
+      ),
     },
   ];
-  const activeObligationGroup = obligationGroups.find((group) => group.id === obligationTab) ?? obligationGroups[0];
-  const claimRules = [
-    {
-      label: "Invoice",
-      value: "终验后3个工作日内开具",
-      source: "标准条款3.2 · 第4页",
-      status: "confirmed" as const,
-    },
-    {
-      label: "付款",
-      value: "一次性支付100%，验收通过且收到Invoice后45个工作日内付款",
-      source: "IO第5条 · 第15页",
-      status: "confirmed" as const,
-    },
-    {
-      label: "付款方式",
-      value: "通过Airwallex银行转账",
-      source: "标准条款3.3 · 第4-5页",
-      status: "confirmed" as const,
-    },
-    {
-      label: "转账费用",
-      value: "由Advertiser承担转账手续费",
-      source: "标准条款3.5 · 第5页",
-      status: "confirmed" as const,
-    },
-    {
-      label: "收款账户",
-      value: "Léa Martin · BNP Paribas · 尾号4821",
-      source: "标准条款3.3 · 第4-5页",
-      status: "confirmed" as const,
-    },
-    {
-      label: "账户要求",
-      value: "合同与Invoice的账户必须一致有效；错误资料导致的费用或延误由Publisher承担",
-      source: "标准条款3.3、3.6 · 第5-6页",
-      status: "confirmed" as const,
-    },
-  ];
+  const activeInformationTab = contractInformationTabs.find(
+    (group) => group.id === obligationTab,
+  ) ?? contractInformationTabs[0];
   return (
     <div className="page-stack">
       <BackLink to={backTo}>返回合同列表</BackLink>
@@ -2541,7 +3034,6 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
               <div><span>服务周期</span><strong>{contract.servicePeriod}</strong></div>
               <div><span>付款方式</span><strong>Airwallex 银行转账</strong></div>
               <div><span>收款账户</span><strong>{maskPayoutIdentifier(profile.payout)}</strong></div>
-              <div><span>主要履约义务</span><strong>{contract.obligations.slice(0, 2).map((item) => item.title).join("、")}</strong></div>
             </div>
             <label className="signature-legal-consent">
               <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />
@@ -2601,8 +3093,8 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
           </footer>
         </section>
         <aside className="contract-obligations-card">
-          <div className="obligation-tabs" role="tablist" aria-label="我的履约事项">
-            {obligationGroups.map((group) => (
+          <div className="obligation-tabs" role="tablist" aria-label="合同与收款信息">
+            {contractInformationTabs.map((group) => (
               <button
                 className={obligationTab === group.id ? "active" : ""}
                 key={group.id}
@@ -2611,58 +3103,27 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
                 aria-selected={obligationTab === group.id}
                 type="button"
               >
-                {group.title}<span>{group.id === "CLAIM" ? claimRules.length : group.items.length}</span>
+                {group.title}<span>{group.rows.length}</span>
               </button>
             ))}
           </div>
           <div className="contract-obligation-content">
-            {obligationTab === "CLAIM" ? (
-              <section className="contract-claim-rules">
-                <aside className="contract-claim-demo-notice" role="note">
-                  <span><Info size={15} /></span>
-                  <div>
-                    <strong>演示数据说明</strong>
-                    <p>当前合同请款信息为演示数据，不作为实际请款或付款依据。正式版本将自动解析合同及关联IO，同步Invoice时限、付款安排、付款方式、费用承担和收款账户；合同中的空白项或未勾选项将标记为待确认，补充确认后再用于请款。</p>
+            <section className="contract-confirmation-information">
+              <header className="obligation-panel-heading">
+                <span className="resource-icon purple">
+                  {obligationTab === "CLAIM" ? <Landmark size={18} /> : <FileCheck2 size={18} />}
+                </span>
+                <div><h2>{activeInformationTab.title}</h2><p>{activeInformationTab.description}</p></div>
+              </header>
+              <dl className="contract-information-list">
+                {activeInformationTab.rows.map((row) => (
+                  <div key={row.label}>
+                    <dt>{row.label}</dt>
+                    <dd>{row.value}</dd>
                   </div>
-                </aside>
-                <header className="obligation-panel-heading">
-                  <span className="resource-icon purple"><ReceiptText size={18} /></span>
-                  <div><h2>合同请款信息</h2><p>关键请款条款与收款信息</p></div>
-                </header>
-                <dl className="claim-rule-list">
-                  {claimRules.map((rule) => (
-                    <div key={rule.label}>
-                      <dt>
-                        <span>{rule.label}</span>
-                        <small className={`claim-rule-status ${rule.status}`}>
-                          合同已明确
-                        </small>
-                      </dt>
-                      <dd><span>{rule.value}</span><small>{rule.source}</small></dd>
-                    </div>
-                  ))}
-                </dl>
-              </section>
-            ) : (
-              <>
-                <header className="obligation-panel-heading">
-                  <span className="resource-icon purple"><FileCheck2 size={18} /></span>
-                  <div><h2>{activeObligationGroup.title}事项</h2><p>{activeObligationGroup.description} · 根据合同原文自动提取</p></div>
-                </header>
-                <ol className="contract-obligation-list">
-                  {activeObligationGroup.items.map((obligation, index) => (
-                    <li key={obligation.id}>
-                      <span className="obligation-index">{index + 1}</span>
-                      <div className="obligation-item-copy">
-                        <strong>{obligation.title}</strong>
-                        <p>{obligation.summary}</p>
-                        <small>{obligation.clause}</small>
-                      </div>
-                    </li>
-                  ))}
-                </ol>
-              </>
-            )}
+                ))}
+              </dl>
+            </section>
           </div>
         </aside>
       </div>
@@ -2972,12 +3433,13 @@ function InvoiceUploadModal({
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [progress, setProgress] = useState(0);
   const selectedAccount = payoutAccounts.find(
     (account) => account.id === payoutAccountId,
   );
   const migratedInvoice = migrateInvoice(invoice);
   const isReupload = migratedInvoice.documentState?.kind === "EXTERNAL"
-    && migratedInvoice.documentState.status === "RETURNED_FOR_REUPLOAD";
+    && ["RETURNED_FOR_REUPLOAD", "RECOGNITION_FAILED"].includes(migratedInvoice.documentState.status);
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -2994,9 +3456,11 @@ function InvoiceUploadModal({
       return;
     }
     setSubmitting(true);
+    setProgress(20);
     setError("");
     try {
       const previewUrl = await fileToDataUrl(file);
+      setProgress(55);
       const [currency = selectedAccount.currency, rawTotal = "0"] =
         migratedInvoice.amount.split(/\s+/, 2);
       const issuedAt = new Date().toISOString().slice(0, 10);
@@ -3024,12 +3488,19 @@ function InvoiceUploadModal({
       const uploaded = isReupload
         ? await resubmitExternalInvoice(input)
         : await uploadExternalInvoice(input);
+      setProgress(100);
       onUploaded(uploaded);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "上传失败，请稍后重试");
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const acceptFile = (nextFile: File | null) => {
+    setFile(nextFile);
+    setError("");
+    setProgress(0);
   };
 
   return (
@@ -3050,35 +3521,40 @@ function InvoiceUploadModal({
           <label className="field">
             <span>Payment information *</span>
             <select value={payoutAccountId} onChange={(event) => setPayoutAccountId(event.target.value)} required>
-              {!payoutAccounts.length ? <option value="">暂无可用付款账户</option> : null}
+              {!payoutAccounts.length ? <option value="">暂无可用收款账户</option> : null}
               {payoutAccounts.map((account) => (
-                <option key={account.id} value={account.id}>{account.name} · {account.currency} · {maskPayoutIdentifier(account)}</option>
+                <option key={account.id} value={account.id}>{account.name} · {account.provider} · {account.currency} · {fullPayoutIdentifier(account)}</option>
               ))}
             </select>
           </label>
         </div>
         <div className="invoice-upload-reminder" role="note">
           <Info size={17} />
-          <p><strong>请确认付款方式一致</strong>请选择与 Invoice 中 Payment information 一致的付款账户。若不一致，请先前往个人档案修改付款信息，或重新上传与所选账户一致的 Invoice。</p>
+          <p><strong>请确认付款方式一致</strong>请选择与 Invoice 中 Payment information 一致的收款账户。若不一致，请先前往个人档案修改收款信息，或重新上传与所选账户一致的 Invoice。</p>
         </div>
-        <label className={`invoice-file-dropzone ${file ? "has-file" : ""}`}>
+        <label
+          className={`invoice-file-dropzone ${file ? "has-file" : ""}`}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => { event.preventDefault(); acceptFile(event.dataTransfer.files?.[0] || null); }}
+        >
           <input
             type="file"
             accept="application/pdf,image/png,image/jpeg"
             onChange={(event) => {
-              setFile(event.target.files?.[0] || null);
-              setError("");
+              acceptFile(event.target.files?.[0] || null);
             }}
           />
           <Upload size={22} />
           <strong>{file ? file.name : "选择或拖入 Invoice 文件"}</strong>
           <span>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : "PDF、PNG、JPG，最大 5MB"}</span>
         </label>
+        {file?.type.startsWith("image/") ? <img className="invoice-upload-preview" src={URL.createObjectURL(file)} alt="待上传 Invoice 预览" /> : null}
+        {submitting ? <div className="invoice-upload-progress" role="status" aria-live="polite"><span style={{ width: `${progress}%` }} /><strong>{progress < 55 ? "正在上传 Invoice 文件" : progress < 100 ? "正在识别 Invoice 信息" : "识别完成"}</strong></div> : null}
         {error ? <div className="signature-error" role="alert"><Info size={15} />{error}</div> : null}
         <footer>
           <button type="button" className="secondary-button" onClick={onClose}>取消</button>
           <button type="submit" className="primary-button" disabled={submitting || !selectedAccount || !file}>
-            {submitting ? "识别并上传中" : isReupload ? "上传新版本" : "确认上传"}
+            {submitting ? "正在识别 Invoice 信息" : isReupload ? "上传新版本" : "确认上传"}
           </button>
         </footer>
       </form>
@@ -3140,7 +3616,7 @@ function InvoiceListPage() {
                 aria-label="筛选 Invoice 审核状态"
               >
                 <option value="ALL">全部审核状态</option>
-                {Object.entries(INTERNAL_REVIEW_META).map(([status, meta]) => <option key={`INTERNAL:${status}`} value={`INTERNAL:${status}`}>内部 · {meta.label}</option>)}
+                {Object.entries(INTERNAL_REVIEW_META).map(([status, meta]) => <option key={`INTERNAL:${status}`} value={`INTERNAL:${status}`}>Comets内部合同 · {meta.label}</option>)}
                 {Object.entries(EXTERNAL_COLLECTION_META).map(([status, meta]) => <option key={`EXTERNAL:${status}`} value={`EXTERNAL:${status}`}>外部 · {meta.label}</option>)}
               </select>
             </label>
@@ -3173,7 +3649,7 @@ function InvoiceListPage() {
                   <span className="resource-icon peach"><ReceiptText size={17} /></span>
                   <span><strong>{invoiceNumberOf(invoice)}</strong><small>{invoice.issuedAt}</small></span>
                 </Link>
-                <div className="invoice-channel" role="cell">{invoiceTypeOf(invoice) === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</div>
+                <div className="invoice-channel" role="cell">{creatorInvoiceTypeLabel(invoice)}</div>
                 <div className="invoice-amount" role="cell"><strong>{invoice.amount}</strong></div>
                 <div className="invoice-status-cell" role="cell"><StatusBadge label={review.label} tone={review.tone} /></div>
                 <div className="invoice-status-cell" role="cell"><StatusBadge label={payment.label} tone={payment.tone} /></div>
@@ -3196,6 +3672,51 @@ function InvoiceListPage() {
   );
 }
 
+function ExternalInvoiceSummaryPanel({
+  data,
+  editable,
+  busy,
+  invoiceFromMatchesProfile,
+  billToMatchesComets,
+  onSave,
+}: {
+  data: InvoiceExtractedData;
+  editable: boolean;
+  busy: boolean;
+  invoiceFromMatchesProfile: boolean;
+  billToMatchesComets: boolean;
+  onSave(data: InvoiceExtractedData): Promise<void>;
+}) {
+  const [draft, setDraft] = useState(data);
+  useEffect(() => setDraft(data), [data]);
+  const update = (key: keyof InvoiceExtractedData, value: string) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+  };
+  return (
+    <div className="invoice-summary-panel" role="tabpanel">
+      <header><span className="resource-icon purple"><FileCheck2 size={17} /></span><div><h2>Invoice 摘要</h2><p>Mock OCR 识别结果与达人确认值</p></div></header>
+      <dl className="external-ocr-fields">
+        {([
+          ["Invoice From", "invoiceFrom"],
+          ["Bill To", "billTo"],
+          ["Invoice date", "invoiceDate"],
+          ["Currency", "currency"],
+          ["Total", "total"],
+        ] as const).map(([label, key]) => (
+          <div key={key}>
+            <dt>{label}</dt>
+            <dd>{editable ? <input value={String(draft[key] || "")} onChange={(event) => update(key, event.target.value)} /> : <strong>{String(draft[key] || "待识别")}</strong>}
+              {key === "invoiceFrom" && draft.invoiceFrom ? <small className={invoiceFromMatchesProfile ? "match-ok" : "match-error"}>{invoiceFromMatchesProfile ? "与 Real Name 一致" : "与档案 Real Name 不一致"}</small> : null}
+              {key === "billTo" && draft.billTo ? <small className={billToMatchesComets ? "match-ok" : "match-error"}>{billToMatchesComets ? "主体校验通过" : "应为 COMETS INTERNATIONAL LIMITED"}</small> : null}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      {editable ? <button type="button" className="secondary-button external-ocr-save" disabled={busy} onClick={() => void onSave(draft)}><Pencil size={15} />保存纠正值</button> : null}
+    </div>
+  );
+}
+
 function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
   const { id, creatorId } = useParams();
   const {
@@ -3206,6 +3727,7 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
     submitInvoiceFeedback,
     confirmExternalInvoice,
     correctExternalInvoice,
+    retryExternalRecognition,
     selectInvoicePayoutAccount,
     submitPaymentAccountCorrection,
   } = useApp();
@@ -3231,6 +3753,7 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
   const [issueDetails, setIssueDetails] = useState("");
   const [detailTab, setDetailTab] = useState<"SUMMARY" | "PAYOUT" | "PROCESS" | "PAYMENT">("SUMMARY");
   const [correctionAccountId, setCorrectionAccountId] = useState("");
+  const [confirmationAccepted, setConfirmationAccepted] = useState(false);
 
   useEffect(() => {
     if (!viewerExpanded) return;
@@ -3258,7 +3781,16 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
   const paymentIssue = invoice.paymentIssue;
   const repairSubmitted = recoveryStatusIsSubmitted(invoice.paymentRecoveryStatus);
   const [amountCurrency = currentProfile.payout.currency || "USD", amountTotal = "0"] = invoice.amount.split(/\s+/, 2);
-  const extractedData = invoice.extractedData || {
+  const extractedData = invoice.extractedData || (kind === "EXTERNAL" ? {
+    invoiceFrom: "",
+    billTo: "",
+    invoiceDate: "",
+    currency: "",
+    total: "",
+    paymentDetails: {},
+    invoiceFromMatchesProfile: false,
+    billToMatchesComets: false,
+  } : {
     invoiceFrom: currentProfile.legalName,
     billTo: "COMETS INTERNATIONAL LIMITED",
     invoiceDate: invoice.issuedAt,
@@ -3267,17 +3799,33 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
     paymentDetails: payoutAccountPaymentDetails(currentProfile.payout),
     invoiceFromMatchesProfile: true,
     billToMatchesComets: true,
-  };
+  });
   const usablePayoutAccounts = currentProfile.payoutAccounts.filter(isPayoutAccountUsable);
   const selectedPayoutAccount = usablePayoutAccounts.find((account) => account.id === invoice.payoutAccountId)
     || usablePayoutAccounts.find((account) => account.id === currentProfile.defaultPayoutAccountId)
     || currentProfile.payout;
   const paymentComparison = compareInvoicePaymentDetails(extractedData.paymentDetails, selectedPayoutAccount);
+  const payoutCurrencyMatches = normalizeInvoiceIdentity(selectedPayoutAccount.currency) === normalizeInvoiceIdentity(extractedData.currency);
+  const payoutInformationMatches = paymentComparison.matches && payoutCurrencyMatches;
   const invoiceFromMatchesProfile = normalizeInvoiceIdentity(extractedData.invoiceFrom) === normalizeInvoiceIdentity(currentProfile.legalName);
   const billToMatchesComets = normalizeInvoiceIdentity(extractedData.billTo) === normalizeInvoiceIdentity("COMETS INTERNATIONAL LIMITED");
-  const canConfirmExternal = paymentComparison.matches && invoiceFromMatchesProfile && billToMatchesComets;
+  const [expectedCurrency = amountCurrency, expectedTotal = amountTotal] = invoice.amount.split(/\s+/, 2);
+  const amountMatches = Number(extractedData.total.replace(/,/g, "")) === Number(expectedTotal.replace(/,/g, ""));
+  const currencyMatches = normalizeInvoiceIdentity(extractedData.currency) === normalizeInvoiceIdentity(expectedCurrency);
+  const canConfirmExternal = payoutInformationMatches && invoiceFromMatchesProfile && billToMatchesComets && amountMatches && currencyMatches;
   const isAwaitingSignature = state.kind === "INTERNAL" && state.status === "WAITING_SIGNATURE";
   const canUpload = state.kind === "EXTERNAL" && ["WAITING_UPLOAD", "RETURNED_FOR_REUPLOAD", "RECOGNITION_FAILED"].includes(state.status);
+  const payoutSnapshot = invoice.payoutSnapshot
+    || createInvoicePayoutSnapshot(selectedPayoutAccount, invoice.issuedAt);
+  const internalPayoutRows = payoutSnapshotRows(
+    payoutSnapshot,
+    adminView ? "ADMIN" : "CREATOR",
+  );
+  const fullSelectedIdentifier = fullPayoutIdentifier(selectedPayoutAccount);
+  const visiblePayoutRows = adminView
+    ? payoutSnapshotRows(payoutSnapshot, "ADMIN").map((row) => [row.label, row.value] as [string, string])
+    : creatorPayoutRows(selectedPayoutAccount);
+  const paymentIssueCurrentValue = fullSelectedIdentifier;
 
   const runAction = async (action: () => Promise<void>, success: string) => {
     setBusy(true);
@@ -3334,6 +3882,9 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
 
   const paymentTimeline = invoice.paymentStatus === "FAILED"
     ? [
+        ["审核通过", "complete"],
+        ["待付款", "complete"],
+        ["付款处理中", "complete"],
         ["付款失败", "error"],
         ["等待修改收款信息", repairSubmitted ? "complete" : "current"],
         ["收款资料已提交复核", repairSubmitted ? "current" : "pending"],
@@ -3342,6 +3893,7 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
         ["付款成功", invoice.paymentRecoveryStatus === "RETRY_SUCCEEDED" ? "complete" : "pending"],
       ] as const
     : [
+        ["审核通过", state.status === "APPROVED" ? "complete" : "pending"],
         ["等待付款", invoice.paymentStatus === "WAITING_PAYMENT" ? "current" : "complete"],
         ["付款处理中", invoice.paymentStatus === "PROCESSING" ? "current" : invoice.paymentStatus === "PAID" ? "complete" : "pending"],
         ["付款成功", invoice.paymentStatus === "PAID" ? "complete" : "pending"],
@@ -3352,14 +3904,14 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
       <BackLink to={backTo}>返回 Invoice 列表</BackLink>
       <PageHeading
         title={number}
-        subtitle={`${kind === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"} · ${currentProfile.social.platform} ${currentProfile.social.handle} · 更新于 ${invoice.updatedAt}`}
-        action={<button type="button" className="secondary-button" onClick={() => downloadInvoiceDocument(invoice)}><Download size={15} />下载 PDF</button>}
+        subtitle={`${creatorInvoiceTypeLabel(invoice)} · ${currentProfile.social.platform} ${currentProfile.social.handle} · 更新于 ${invoice.updatedAt}`}
+        action={invoice.document || kind === "INTERNAL" ? <button type="button" className="secondary-button" onClick={() => downloadInvoiceDocument(invoice)}><Download size={15} />下载 PDF</button> : undefined}
       />
       {notice ? <div className={`form-alert ${noticeTone}`}><CheckCircle2 size={17} />{notice}</div> : null}
       <div className="invoice-prototype-notice" role="note"><Info size={16} /><p><strong>原型说明</strong>当前文件、OCR、签署、审核和付款进度均为本地 MockApiAdapter 演示，不是真实支付或生产系统记录。</p></div>
       <section className="invoice-detail-metrics" aria-label="Invoice 概览">
-        <article><span>审核状态</span><strong><i className={`invoice-metric-accent tone-${review.tone}`} />{review.label}</strong><small>{kind === "INTERNAL" ? "内部 Invoice 流程" : "外部 Invoice 收集流程"}</small></article>
-        <article><span>Invoice 金额</span><strong>{invoice.amount}</strong><small>{extractedData.currency} · {kind === "EXTERNAL" ? "OCR 识别" : "系统生成"}</small></article>
+        <article><span>审核状态</span><strong><i className={`invoice-metric-accent tone-${review.tone}`} />{review.label}</strong><small>{kind === "INTERNAL" ? "Comets内部合同流程" : "外部 Invoice 收集流程"}</small></article>
+        <article><span>Invoice 金额</span><strong>{invoice.amount}</strong><small>{kind === "EXTERNAL" ? (invoice.extractedData ? `${extractedData.currency} · Mock OCR 识别` : "等待上传后识别") : `${extractedData.currency} · 系统生成`}</small></article>
         <article><span>付款状态</span><strong><i className={`invoice-metric-accent tone-${payment.tone}`} />{payment.label}</strong><small>{invoice.paymentExpectedAt ? `预计处理：${invoice.paymentExpectedAt}` : "与 Invoice 审核状态独立"}</small></article>
       </section>
 
@@ -3369,7 +3921,7 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
           <div className="payment-issue-alert-content">
             <div><strong>付款失败</strong><span>{repairSubmitted ? "收款资料已提交复核" : "等待修改收款信息"}</span></div>
             <p>{invoice.paymentFailureReason || paymentIssue?.message || "收款资料未通过付款校验"}</p>
-            {paymentIssue ? <dl><div><dt>错误字段</dt><dd>{paymentIssue.fieldLabel}</dd></div><div><dt>当前信息</dt><dd>{paymentIssue.maskedValue}</dd></div></dl> : null}
+            {paymentIssue ? <dl><div><dt>错误字段</dt><dd>{paymentIssue.fieldLabel}</dd></div><div><dt>当前信息</dt><dd>{paymentIssueCurrentValue || "待补充"}</dd></div></dl> : null}
           </div>
         </section>
       ) : invoice.rejectedReason ? <div className="form-alert danger"><Info size={17} /><div><strong>退回原因</strong><p>{invoice.rejectedReason}</p></div></div> : null}
@@ -3379,10 +3931,10 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
       <div className="document-layout">
         <section className={`invoice-viewer-card ${viewerExpanded ? "is-expanded" : ""}`}>
           <header className="invoice-viewer-toolbar">
-            <div><span className="invoice-viewer-icon"><FileText size={18} /></span><span><strong>Invoice 全文</strong><small>{number} · {invoice.fileVersions?.length || 1} 个文件版本</small></span></div>
+            <div><span className="invoice-viewer-icon"><FileText size={18} /></span><span><strong>Invoice 全文</strong><small>{number} · {invoice.sourceFileVersions?.length || (invoice.document ? 1 : 0)} 个文件版本</small></span></div>
             <div className="invoice-viewer-actions">
               <button type="button" className="invoice-expand-button" title={viewerExpanded ? "退出放大查看" : "放大查看 Invoice"} aria-pressed={viewerExpanded} onClick={() => setViewerExpanded((expanded) => !expanded)}>{viewerExpanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}{viewerExpanded ? "退出放大" : "放大查看"}</button>
-              <button type="button" className="invoice-download-button" title={`下载 Invoice ${number}`} onClick={() => downloadInvoiceDocument(invoice)}><Download size={15} />下载 PDF</button>
+              {invoice.document || kind === "INTERNAL" ? <button type="button" className="invoice-download-button" title={`下载 Invoice ${number}`} onClick={() => downloadInvoiceDocument(invoice)}><Download size={15} />下载 PDF</button> : null}
             </div>
           </header>
           <div className="invoice-document-stage">
@@ -3400,18 +3952,20 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
         <aside className="document-sidebar">
           <section className="invoice-inspection-card">
             <div className="invoice-inspection-tabs" role="tablist" aria-label="Invoice 详情信息">
-              {([ ["SUMMARY", "Invoice 摘要"], ["PAYOUT", "收款账户"], ["PROCESS", "审核处理"], ["PAYMENT", "付款状态"] ] as const).map(([value, label]) => <button key={value} type="button" role="tab" aria-selected={detailTab === value} className={detailTab === value ? "active" : ""} onClick={() => setDetailTab(value)}>{label}</button>)}
+              {([ ["SUMMARY", "Invoice 摘要"], ["PAYOUT", "收款信息"], ["PROCESS", "处理状态"], ["PAYMENT", "付款状态"] ] as const).map(([value, label]) => <button key={value} type="button" role="tab" aria-selected={detailTab === value} className={detailTab === value ? "active" : ""} onClick={() => setDetailTab(value)}>{label}</button>)}
             </div>
-            {detailTab === "SUMMARY" ? <div className="invoice-summary-panel" role="tabpanel"><header><span className="resource-icon purple"><FileCheck2 size={17} /></span><div><h2>Invoice 摘要</h2><p>{kind === "EXTERNAL" ? "OCR 识别结果" : "系统生成信息"}</p></div></header><dl><div><dt>Invoice 编号</dt><dd><strong>{number}</strong></dd></div><div><dt>Invoice 类型</dt><dd><strong>{kind === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</strong></dd></div><div><dt>Invoice From</dt><dd><strong>{extractedData.invoiceFrom}</strong><small className={invoiceFromMatchesProfile ? "match-ok" : "match-error"}>{invoiceFromMatchesProfile ? "与 Real Name 一致" : "与档案 Real Name 不一致"}</small></dd></div><div><dt>Bill To</dt><dd><strong>{extractedData.billTo}</strong><small className={billToMatchesComets ? "match-ok" : "match-error"}>{billToMatchesComets ? "主体校验通过" : "应为 COMETS INTERNATIONAL LIMITED"}</small></dd></div><div><dt>Invoice date</dt><dd><strong>{extractedData.invoiceDate}</strong></dd></div><div><dt>Currency / Total</dt><dd><strong>{extractedData.currency} {extractedData.total}</strong></dd></div></dl></div> : null}
-            {detailTab === "PAYOUT" ? <div className="invoice-payout-panel" role="tabpanel"><header><div><h2>收款账户比对</h2><p>仅比较 Invoice 中已识别的收款字段</p></div><StatusBadge label={paymentComparison.matches ? "信息一致" : "账户不匹配"} tone={paymentComparison.matches ? "success" : "danger"} /></header>{canCreatorAct && invoice.paymentStatus !== "FAILED" ? <label className="field invoice-account-select"><span>收款账户</span><select value={selectedPayoutAccount.id} onChange={(event) => void runAction(() => selectInvoicePayoutAccount(resourceId, event.target.value), "收款账户已更新")} >{usablePayoutAccounts.map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency} · {maskPayoutIdentifier(account)}</option>)}</select></label> : null}{!paymentComparison.matches ? <div className="invoice-account-mismatch" role="alert"><Info size={17} /><div><strong>收款账号不匹配</strong><p>请选择其他已验证账户，或更新个人档案后重新核对。</p></div></div> : <div className="invoice-account-match"><CheckCircle2 size={17} /><span>已识别字段均与所选收款账户一致。</span></div>}<dl className="invoice-payment-compare-list">{Object.entries(paymentComparison.merged).filter(([, value]) => value).map(([key, value]) => { const compared = paymentComparison.fields.find((field) => field.key === key); return <div key={key}><dt>{PAYMENT_DETAIL_LABELS[key] || key}</dt><dd><strong>{key === "account_number" ? maskPayoutIdentifier(selectedPayoutAccount) : value}</strong><span className={compared?.matches === false ? "match-error" : "match-ok"}>{compared?.matches === false ? "不一致" : <Check size={12} />}</span></dd></div>; })}</dl></div> : null}
-            {detailTab === "PROCESS" ? <div className="invoice-process-panel" role="tabpanel"><header><div><h2>审核处理状态</h2><p>Invoice 文档状态与付款状态分开记录</p></div><StatusBadge label={review.label} tone={review.tone} /></header>{invoice.rejectedReason ? <div className="payment-repair-note"><Info size={17} /><span>{invoice.rejectedReason}</span></div> : null}<div className="invoice-history-log"><h3>操作记录</h3>{invoice.operationHistory?.map((event) => <article key={event.id}><span>{event.label}</span><div><strong>{event.actor}</strong><small>{new Date(event.occurredAt).toLocaleString("zh-CN", { hour12: false })}</small>{event.reason ? <p>{event.reason}</p> : null}</div></article>)}</div><div className="invoice-action-stack">{canCreatorAct && state.kind === "EXTERNAL" && state.status === "WAITING_CONFIRMATION" ? <button className="primary-button" type="button" disabled={busy || !canConfirmExternal} onClick={() => void runAction(() => confirmExternalInvoice(resourceId), "Invoice 已确认并提交审核")}><FileCheck2 size={16} />确认并提交审核</button> : null}{canCreatorAct && state.kind === "EXTERNAL" && state.status === "RETURNED_FOR_CORRECTION" ? <button className="primary-button" type="button" disabled={busy} onClick={() => void runAction(() => correctExternalInvoice(resourceId, extractedData), "修改已保存，请重新确认")}><Pencil size={16} />修改并重新确认</button> : null}{canCreatorAct && canUpload ? <button className="primary-button" type="button" onClick={() => setUploadOpen(true)}><Upload size={16} />{state.kind === "EXTERNAL" && state.status === "WAITING_UPLOAD" ? "上传 Invoice" : "重新上传文件"}</button> : null}{canCreatorAct && isAwaitingSignature ? <button className="invoice-issue-button" type="button" onClick={() => setIssueOpen(true)}><Info size={16} />Invoice 信息有误</button> : null}{canCreatorAct && isAwaitingSignature ? <button className="primary-button" disabled={busy} onClick={() => setSignatureOpen(true)}><PenLine size={16} />签署 Invoice</button> : null}<button className="invoice-action-download-button" type="button" onClick={() => downloadInvoiceDocument(invoice)}><Download size={16} />下载 Invoice</button></div></div> : null}
-            {detailTab === "PAYMENT" ? <div className="invoice-process-panel" role="tabpanel"><header><div><h2>付款状态</h2><p>{invoice.paymentExpectedAt ? `预计处理时间：${invoice.paymentExpectedAt}` : "进度更新至原 Invoice"}</p></div><StatusBadge label={payment.label} tone={payment.tone} /></header><dl className="invoice-payment-card"><div><dt>Invoice 编号</dt><dd>{number}</dd></div><div><dt>金额</dt><dd>{invoice.amount}</dd></div><div><dt>收款账户</dt><dd>{maskPayoutIdentifier(selectedPayoutAccount)}</dd></div>{invoice.paymentCompletedAt ? <div><dt>完成时间</dt><dd>{invoice.paymentCompletedAt}</dd></div> : null}{invoice.paymentFailureReason ? <div><dt>失败原因</dt><dd>{invoice.paymentFailureReason}</dd></div> : null}</dl><div className="compact-timeline invoice-full-timeline">{paymentTimeline.map(([label, status]) => <div className={status} key={label}><span>{status === "complete" ? <Check size={13} /> : status === "current" ? <Clock3 size={12} /> : status === "error" ? <Info size={13} /> : null}</span><div><strong>{label}</strong></div></div>)}</div>{canCreatorAct && invoice.paymentStatus === "FAILED" && !repairSubmitted ? <div className="invoice-action-stack"><button className="payment-edit-button" type="button" onClick={() => navigate(`/profile?repairInvoice=${number}&field=${paymentIssue?.fieldKey || "account_number"}#payout-information`)}><Pencil size={16} />修改收款信息</button><label className="field invoice-account-select"><span>或选择其他已验证账户</span><select value={correctionAccountId} onChange={(event) => setCorrectionAccountId(event.target.value)}><option value="">请选择</option>{usablePayoutAccounts.filter((account) => account.id !== invoice.payoutAccountId).map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency} · {maskPayoutIdentifier(account)}</option>)}</select></label><button className="payment-retry-button" type="button" disabled={!correctionAccountId || busy} onClick={() => void runAction(() => submitPaymentAccountCorrection(resourceId, { payoutAccountId: correctionAccountId, submittedBy: session?.userId || currentProfile.id }), "收款资料已提交复核")}><FileCheck2 size={16} />提交资料复核</button></div> : null}{repairSubmitted ? <div className="review-note"><Clock3 size={17} /><span>收款资料已提交复核，重新付款将由系统后续处理。</span></div> : null}</div> : null}
+            {detailTab === "SUMMARY" && kind === "EXTERNAL" ? <ExternalInvoiceSummaryPanel data={extractedData} editable={canCreatorAct && ["WAITING_CONFIRMATION", "RETURNED_FOR_CORRECTION"].includes(state.status)} busy={busy} invoiceFromMatchesProfile={invoiceFromMatchesProfile} billToMatchesComets={billToMatchesComets} onSave={async (next) => { await runAction(() => correctExternalInvoice(resourceId, next), "纠正值已保存，原始 OCR 结果已保留"); }} /> : null}
+            {detailTab === "SUMMARY" && kind === "INTERNAL" ? <div className="invoice-summary-panel" role="tabpanel"><header><span className="resource-icon purple"><FileCheck2 size={17} /></span><div><h2>Invoice 摘要</h2><p>系统生成信息</p></div></header><dl><div><dt>Invoice 编号</dt><dd><strong>{number}</strong></dd></div><div><dt>Invoice 类型</dt><dd><strong>{creatorInvoiceTypeLabel(invoice)}</strong></dd></div><div><dt>Invoice From</dt><dd><strong>{extractedData.invoiceFrom}</strong></dd></div><div><dt>Bill To</dt><dd><strong>{extractedData.billTo}</strong></dd></div><div><dt>Invoice date</dt><dd><strong>{extractedData.invoiceDate}</strong></dd></div><div><dt>Currency / Total</dt><dd><strong>{extractedData.currency} {extractedData.total}</strong></dd></div></dl></div> : null}
+            {detailTab === "PAYOUT" && kind === "INTERNAL" ? <div className="invoice-payout-panel invoice-payout-snapshot" role="tabpanel"><header><div><h2>收款信息</h2><p>由支付管理端同步</p></div><span className="invoice-snapshot-label">只读快照</span></header><dl className="invoice-payment-compare-list">{internalPayoutRows.map((row) => <div key={row.label}><dt>{row.label}</dt><dd><strong>{row.value}</strong></dd></div>)}</dl></div> : null}
+            {detailTab === "PAYOUT" && kind === "EXTERNAL" ? <div className="invoice-payout-panel" role="tabpanel"><header><div><h2>收款账户比对</h2><p>{adminView ? "管理员只读视图按既有规则隐藏敏感值" : "仅当前登录达人可查看自己的完整收款信息"}</p></div><StatusBadge label={payoutInformationMatches ? "信息一致" : "账户不匹配"} tone={payoutInformationMatches ? "success" : "danger"} /></header>{canCreatorAct && invoice.paymentStatus !== "FAILED" && ["WAITING_UPLOAD", "WAITING_CONFIRMATION", "RETURNED_FOR_CORRECTION", "RETURNED_FOR_REUPLOAD", "RECOGNITION_FAILED"].includes(state.status) ? <label className="field invoice-account-select"><span>收款账户</span><select value={selectedPayoutAccount.id} onChange={(event) => void runAction(() => selectInvoicePayoutAccount(resourceId, event.target.value), "收款账户已更新")}>{usablePayoutAccounts.map((account) => <option key={account.id} value={account.id}>{account.name} · {account.provider} · {account.currency} · {fullPayoutIdentifier(account)}</option>)}</select></label> : null}{!payoutInformationMatches ? <div className="invoice-account-mismatch" role="alert"><Info size={17} /><div><strong>收款账户不匹配</strong><p>{!payoutCurrencyMatches ? `所选账户币种 ${selectedPayoutAccount.currency} 与 Invoice 币种 ${extractedData.currency || "待识别"} 不一致。` : "请核对下方标记为“不一致”的具体字段。"} 请选择其他已验证账户、更新个人档案，或上传与账户一致的 Invoice。</p></div></div> : <div className="invoice-account-match"><CheckCircle2 size={17} /><span>Invoice 已识别的收款字段及币种均与所选账户一致。</span></div>}<dl className="invoice-payment-compare-list">{visiblePayoutRows.map(([label, value]) => { const key = Object.entries(PAYMENT_DETAIL_LABELS).find(([, currentLabel]) => currentLabel === label)?.[0]; const compared = key ? paymentComparison.fields.find((field) => field.key === key) : undefined; return <div key={label}><dt>{label}</dt><dd><strong>{value}</strong>{label === "Currency" && !payoutCurrencyMatches ? <span className="match-error">不一致</span> : compared ? <span className={compared.matches === false ? "match-error" : "match-ok"}>{compared.matches === false ? "不一致" : <Check size={12} />}</span> : null}</dd></div>; })}</dl></div> : null}
+            {detailTab === "PROCESS" ? <div className="invoice-process-panel" role="tabpanel"><header><div><h2>处理状态</h2><p>采集、审核与付款进度都记录在同一个 Invoice 下</p></div><StatusBadge label={review.label} tone={review.tone} /></header>{invoice.returnReason || invoice.rejectedReason ? <div className="payment-repair-note"><Info size={17} /><span>{invoice.returnReason || invoice.rejectedReason}</span></div> : null}<div className="invoice-history-log"><h3>完整操作记录</h3>{[...(invoice.reviewHistory || [])].reverse().map((event) => <article key={event.eventId}><span>{event.action}</span><div><strong>{event.actor}</strong><small>{new Date(event.occurredAt).toLocaleString("zh-CN", { hour12: false })}</small>{event.reason ? <p>{event.reason}</p> : null}</div></article>)}{!invoice.reviewHistory?.length ? invoice.operationHistory?.map((event) => <article key={event.id}><span>{event.label}</span><div><strong>{event.actor}</strong><small>{new Date(event.occurredAt).toLocaleString("zh-CN", { hour12: false })}</small>{event.reason ? <p>{event.reason}</p> : null}</div></article>) : null}</div><div className="invoice-action-stack">{canCreatorAct && state.kind === "EXTERNAL" && state.status === "WAITING_CONFIRMATION" ? <><label className="invoice-confirmation-check"><input type="checkbox" checked={confirmationAccepted} onChange={(event) => setConfirmationAccepted(event.target.checked)} /><span>我已核对 Invoice 文件、金额、币种、开票主体及收款信息，并确认以上信息准确。</span></label>{!canConfirmExternal ? <div className="signature-error" role="alert"><Info size={15} />请先修正页面中标记的开票主体、Bill To、金额、币种或收款账户字段。</div> : null}<button className="primary-button" type="button" disabled={busy || !canConfirmExternal || !confirmationAccepted} onClick={() => void runAction(() => confirmExternalInvoice(resourceId), "Invoice 已确认并提交审核")}><FileCheck2 size={16} />确认并提交审核</button></> : null}{canCreatorAct && state.kind === "EXTERNAL" && state.status === "RETURNED_FOR_CORRECTION" ? <button className="primary-button" type="button" disabled={busy} onClick={() => { setDetailTab("SUMMARY"); }}><Pencil size={16} />修改并重新提交</button> : null}{canCreatorAct && state.kind === "EXTERNAL" && state.status === "RECOGNITION_FAILED" ? <button className="secondary-button" type="button" disabled={busy} onClick={() => void runAction(() => retryExternalRecognition(resourceId), "重新识别完成，请核对结果")}><RefreshCcw size={16} />重新识别</button> : null}{canCreatorAct && canUpload ? <button className="primary-button" type="button" onClick={() => setUploadOpen(true)}><Upload size={16} />{state.kind === "EXTERNAL" && state.status === "WAITING_UPLOAD" ? "上传 Invoice" : "重新上传 Invoice"}</button> : null}{canCreatorAct && isAwaitingSignature ? <button className="invoice-issue-button" type="button" onClick={() => setIssueOpen(true)}><Info size={16} />Invoice 信息有误</button> : null}{canCreatorAct && isAwaitingSignature ? <button className="primary-button" disabled={busy} onClick={() => setSignatureOpen(true)}><PenLine size={16} />签署 Invoice</button> : null}<button className="invoice-action-download-button" type="button" onClick={() => downloadInvoiceDocument(invoice)}><Download size={16} />下载 Invoice</button></div></div> : null}
+            {detailTab === "PAYMENT" ? <div className="invoice-process-panel" role="tabpanel"><header><div><h2>付款状态</h2><p>{invoice.expectedPaymentAt || invoice.paymentExpectedAt ? `预计付款时间：${invoice.expectedPaymentAt || invoice.paymentExpectedAt}` : "付款进度更新至原 Invoice"}</p></div><StatusBadge label={payment.label} tone={payment.tone} /></header><dl className="invoice-payment-card"><div><dt>Invoice 编号</dt><dd>{number}</dd></div><div><dt>金额和币种</dt><dd>{invoice.amount}</dd></div>{visiblePayoutRows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}{invoice.paidAt || invoice.paymentCompletedAt ? <div><dt>付款完成时间</dt><dd>{invoice.paidAt || invoice.paymentCompletedAt}</dd></div> : null}{invoice.paymentFailureReason ? <div><dt>付款失败原因</dt><dd>{invoice.paymentFailureReason}</dd></div> : null}</dl><div className="compact-timeline invoice-full-timeline">{paymentTimeline.map(([label, status]) => <div className={status} key={label}><span>{status === "complete" ? <Check size={13} /> : status === "current" ? <Clock3 size={12} /> : status === "error" ? <Info size={13} /> : null}</span><div><strong>{label}</strong></div></div>)}</div>{canCreatorAct && invoice.paymentStatus === "FAILED" && !repairSubmitted ? <div className="invoice-action-stack"><button className="payment-edit-button" type="button" onClick={() => navigate(`/profile?repairInvoice=${number}&field=${paymentIssue?.fieldKey || "account_number"}#payout-information`)}><Pencil size={16} />修改收款信息</button><label className="field invoice-account-select"><span>或选择其他已验证账户</span><select value={correctionAccountId} onChange={(event) => setCorrectionAccountId(event.target.value)}><option value="">请选择</option>{usablePayoutAccounts.filter((account) => account.id !== invoice.payoutAccountId).map((account) => <option key={account.id} value={account.id}>{account.name} · {account.provider} · {account.currency} · {fullPayoutIdentifier(account)}</option>)}</select></label><button className="payment-retry-button" type="button" disabled={!correctionAccountId || busy} onClick={() => void runAction(() => submitPaymentAccountCorrection(resourceId, { payoutAccountId: correctionAccountId, submittedBy: session?.userId || currentProfile.id }), "收款资料已提交复核")}><FileCheck2 size={16} />提交资料复核</button></div> : null}{repairSubmitted ? <div className="review-note"><Clock3 size={17} /><span>收款资料已提交复核，后续财务复核和重新付款由系统处理。</span></div> : null}</div> : null}
           </section>
         </aside>
       </div>
 
       {canCreatorAct && signatureOpen ? <SignatureModal invoice={invoice} signerName={currentProfile.legalName} payoutAccountName={currentProfile.payout.accountHolder || currentProfile.legalName} onClose={() => setSignatureOpen(false)} onConfirm={sign} /> : null}
-      {canCreatorAct && uploadOpen && state.kind === "EXTERNAL" ? <InvoiceUploadModal invoice={invoice} profile={currentProfile} onClose={() => setUploadOpen(false)} onUploaded={() => { setUploadOpen(false); setNoticeTone("success"); setNotice("文件已上传，OCR 识别结果已生成"); }} /> : null}
+      {canCreatorAct && uploadOpen && state.kind === "EXTERNAL" ? <InvoiceUploadModal invoice={invoice} profile={currentProfile} onClose={() => setUploadOpen(false)} onUploaded={() => { setUploadOpen(false); setDetailTab("SUMMARY"); setNoticeTone("success"); setNotice("识别结果已在当前页面展示，请逐项核对后提交审核"); }} /> : null}
       {canCreatorAct && issueOpen && isAwaitingSignature ? <div className="invoice-issue-modal-overlay" role="presentation"><form className="invoice-issue-modal" role="dialog" aria-modal="true" aria-labelledby="invoice-issue-title" onSubmit={(event) => void submitIssue(event)}><header><div><span className="invoice-issue-modal-icon"><Info size={19} /></span><div><h2 id="invoice-issue-title">反馈 Invoice 信息问题</h2><p>请说明不准确的信息，工作人员会尽快核查。</p></div></div><button type="button" className="icon-button" title="关闭" onClick={() => setIssueOpen(false)}><X size={18} /></button></header><label className="field"><span>问题类型</span><select value={issueType} onChange={(event) => setIssueType(event.target.value)}><option>收款信息有误</option><option>金额或币种有误</option><option>Invoice 主体有误</option><option>其他信息有误</option></select></label><label className="field"><span>问题说明</span><textarea value={issueDetails} onChange={(event) => setIssueDetails(event.target.value)} placeholder="请描述需要核查或修改的内容" required /></label><footer><button type="button" className="secondary-button" onClick={() => setIssueOpen(false)}>取消</button><button type="submit" className="primary-button" disabled={!issueDetails.trim() || busy}>提交反馈</button></footer></form></div> : null}
       {issueSuccessOpen ? <div className="profile-save-overlay" role="presentation"><section className="profile-save-dialog" role="dialog" aria-modal="true" aria-labelledby="invoice-issue-success-title"><span className="profile-save-icon success"><CheckCircle2 size={25} /></span><h2 id="invoice-issue-success-title">反馈提交成功</h2><p>“{submittedIssueType}”已持久化记录，可在操作历史中查看。</p><button type="button" className="primary-button" onClick={() => setIssueSuccessOpen(false)}>知道了</button></section></div> : null}
     </div>
@@ -3437,6 +3991,19 @@ const PAYOUT_CHANNELS: Array<{
   { id: "PAYERMAX", label: "PayerMax", isAvailable: false },
 ];
 
+function SocialBrandIcon({ platform }: { platform: string }) {
+  if (platform === "YouTube") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#ff0033" d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8Z"/><path fill="#fff" d="m9.6 15.6 6.2-3.6-6.2-3.6v7.2Z"/></svg>;
+  }
+  if (platform === "Instagram") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="instagram-brand-gradient" x1="2" y1="22" x2="22" y2="2"><stop stopColor="#ffd600"/><stop offset=".45" stopColor="#ff0069"/><stop offset="1" stopColor="#7638fa"/></linearGradient></defs><rect x="2" y="2" width="20" height="20" rx="6" fill="url(#instagram-brand-gradient)"/><circle cx="12" cy="12" r="4.25" fill="none" stroke="#fff" strokeWidth="1.8"/><circle cx="17.7" cy="6.4" r="1.15" fill="#fff"/></svg>;
+  }
+  if (platform === "TikTok") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#25f4ee" d="M14.2 3h2.6a4.7 4.7 0 0 0 3.1 3.8v2.7a7.3 7.3 0 0 1-3.1-1v6.4a5.9 5.9 0 1 1-5.1-5.8v2.8a3.1 3.1 0 1 0 2.5 3V3Z" transform="translate(-.7 .35)"/><path fill="#fe2c55" d="M14.2 3h2.6a4.7 4.7 0 0 0 3.1 3.8v2.7a7.3 7.3 0 0 1-3.1-1v6.4a5.9 5.9 0 1 1-5.1-5.8v2.8a3.1 3.1 0 1 0 2.5 3V3Z" transform="translate(.7 -.35)"/><path fill="#17171d" d="M14.2 3h2.6a4.7 4.7 0 0 0 3.1 3.8v2.7a7.3 7.3 0 0 1-3.1-1v6.4a5.9 5.9 0 1 1-5.1-5.8v2.8a3.1 3.1 0 1 0 2.5 3V3Z"/></svg>;
+  }
+  return <Globe2 size={20} aria-hidden="true" />;
+}
+
 function ProfilePage() {
   const {
     profile,
@@ -3452,7 +4019,7 @@ function ProfilePage() {
   );
   const repairInvoiceId = repairParams.get("repairInvoice");
   const repairFieldKey = repairParams.get("field") || "";
-  const repairInvoice = invoices.find((item) => item.id === repairInvoiceId);
+  const repairInvoice = invoices.find((item) => item.id === repairInvoiceId || invoiceNumberOf(item) === repairInvoiceId);
   const repairIssue = repairInvoice?.paymentIssue;
   const hasRepairContext = Boolean(repairInvoiceId && repairIssue);
   const isRepairFlow = Boolean(
@@ -3489,6 +4056,13 @@ function ProfilePage() {
     transferMethod: profile.payout.transferMethod,
   });
   const [schema, setSchema] = useState<AirwallexFormSchema | null>(null);
+  const [transferMethods, setTransferMethods] = useState<
+    AirwallexTransferMethodOption[]
+  >([]);
+  const [transferMethodsLoading, setTransferMethodsLoading] = useState(true);
+  const [transferMethodsError, setTransferMethodsError] = useState("");
+  const [resolvedTransferScenario, setResolvedTransferScenario] = useState("");
+  const preserveNextTransferMethodRef = useRef(true);
   const [schemaValues, setSchemaValues] = useState<Record<string, string>>({
     ...profile.payout.schemaValues,
     account_name: profile.payout.accountHolder,
@@ -3528,6 +4102,7 @@ function ProfilePage() {
         ? current
         : normalized.payout.channel,
     );
+    preserveNextTransferMethodRef.current = true;
     setCondition({
       bankCountryCode: airwallexCountryCode(normalized.payout.bankCountry),
       accountCurrency: normalized.payout.currency,
@@ -3622,6 +4197,59 @@ function ProfilePage() {
 
   useEffect(() => {
     let active = true;
+    const scenario = transferMethodScenarioKey(condition);
+    setTransferMethodsLoading(true);
+    setTransferMethodsError("");
+    services.payout
+      .listTransferMethods({
+        bankCountryCode: condition.bankCountryCode,
+        accountCurrency: condition.accountCurrency,
+        entityType: condition.entityType,
+      })
+      .then((result) => {
+        if (!active) return;
+        setTransferMethods(result.data);
+        const currentMethod = result.data.find(
+          (method) =>
+            method.value === condition.transferMethod && method.available,
+        );
+        const recommended = result.data.find(
+          (method) => method.recommended && method.available,
+        );
+        const nextMethod =
+          preserveNextTransferMethodRef.current && currentMethod
+            ? currentMethod
+            : recommended || currentMethod;
+        preserveNextTransferMethodRef.current = false;
+        if (nextMethod && nextMethod.value !== condition.transferMethod) {
+          updateCondition({ transferMethod: nextMethod.value });
+        }
+        setResolvedTransferScenario(scenario);
+        setTransferMethodsLoading(false);
+      })
+      .catch(() => {
+        if (!active) return;
+        setTransferMethodsError("转账方式加载失败，请重试。");
+        setResolvedTransferScenario(scenario);
+        setTransferMethodsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    condition.accountCurrency,
+    condition.bankCountryCode,
+    condition.entityType,
+  ]);
+
+  useEffect(() => {
+    let active = true;
+    if (
+      transferMethodsLoading ||
+      resolvedTransferScenario !== transferMethodScenarioKey(condition)
+    ) {
+      return;
+    }
     setSchemaLoading(true);
     setSchemaError("");
     setSchemaFieldErrors({});
@@ -3668,6 +4296,8 @@ function ProfilePage() {
     condition.bankCountryCode,
     condition.entityType,
     condition.transferMethod,
+    resolvedTransferScenario,
+    transferMethodsLoading,
   ]);
 
   const selectedCountry =
@@ -3713,7 +4343,7 @@ function ProfilePage() {
         setPayoutAccountAliasTouched(true);
         throw new Error(payoutAccountAliasError);
       }
-      if (!schema || schemaLoading) {
+      if (!schema || schemaLoading || transferMethodsLoading) {
         throw new Error("请等待付款信息加载完成后再保存");
       }
       const fieldErrors = validateAirwallexSchemaValues(schema, schemaValues);
@@ -3865,6 +4495,7 @@ function ProfilePage() {
   };
 
   const supplementalFields = buildProfileSupplementalFields(draft);
+  const socialEvidence = normalizeSocialEvidence(draft.social);
   const platformProfiles = (
     draft.social.profileUrls?.length
       ? draft.social.profileUrls
@@ -3882,8 +4513,41 @@ function ProfilePage() {
       platform,
       url,
       accountName: getSocialAccountName(url, draft.social.handle),
+      evidence: socialEvidence[url] || [],
     };
   });
+
+  const uploadSocialEvidence = (
+    profileUrl: string,
+    event: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    if (!selectedFiles.length) return;
+    setDraft((current) => {
+      const evidenceByProfileUrl = normalizeSocialEvidence(current.social);
+      const fileRefs = selectedFiles.map((file, index) => ({
+        id: `social-proof-${Date.now()}-${index}`,
+        name: file.name,
+        mimeType: file.type || "image/png",
+        size: file.size,
+      }));
+      const nextEvidence = {
+        ...evidenceByProfileUrl,
+        [profileUrl]: fileRefs,
+      };
+      const flattened = Object.values(nextEvidence).flat();
+      return {
+        ...current,
+        social: {
+          ...current.social,
+          evidenceByProfileUrl: nextEvidence,
+          screenshots: flattened,
+          screenshot: flattened[0],
+        },
+      };
+    });
+    event.target.value = "";
+  };
 
   const cancelEditing = () => {
     resetFromProfile(profile);
@@ -3961,6 +4625,7 @@ function ProfilePage() {
     });
     setSelectedPayoutChannel(account.channel);
     setActivePayoutAccountId(account.id);
+    preserveNextTransferMethodRef.current = true;
     setCondition({
       bankCountryCode: airwallexCountryCode(account.bankCountry),
       accountCurrency: account.currency,
@@ -3988,6 +4653,10 @@ function ProfilePage() {
   };
 
   const addAirwallexAccount = () => {
+    if (payoutAccountsForChannel(normalizePayoutProfile(draft).payoutAccounts, "AIRWALLEX").length) {
+      setPayoutToast("每个收款渠道最多保留一个账户。");
+      return;
+    }
     const account: PayoutAccount = {
       id: `payout-awx-${Date.now()}`,
       name: "",
@@ -4069,7 +4738,7 @@ function ProfilePage() {
     void persistPayoutAccounts(
       payoutAccounts,
       account.id,
-      `已将“${account.name}”设为默认付款账户`,
+      `已将“${account.name}”设为默认收款账户`,
     );
   };
 
@@ -4107,7 +4776,7 @@ function ProfilePage() {
       void persistPayoutAccounts(
         nextAccounts,
         nextDefaultId,
-        "付款账户已删除",
+        "收款账户已删除",
       );
       return;
     }
@@ -4125,7 +4794,7 @@ function ProfilePage() {
     void persistPayoutAccounts(
       nextAccounts,
       nextDefaultId,
-      "付款账户已停用",
+      "收款账户已停用",
     );
   };
 
@@ -4145,7 +4814,7 @@ function ProfilePage() {
     void persistPayoutAccounts(
       nextAccounts,
       normalizedDraft.defaultPayoutAccountId,
-      "付款账户已重新启用",
+      "收款账户已重新启用",
     );
   };
 
@@ -4232,7 +4901,7 @@ function ProfilePage() {
           <small>{payoutAccounts.length} 个账户 · {usablePayoutAccounts.length} 个可用</small>
         </article>
         <article>
-          <span>默认付款账户</span>
+          <span>默认收款账户</span>
           <strong>{defaultPayoutAccount?.name || "待设置"}</strong>
           <small>{defaultPayoutAccount ? payoutAccountSummary(defaultPayoutAccount) : "暂无可用于付款的账户"}</small>
         </article>
@@ -4246,29 +4915,30 @@ function ProfilePage() {
           </header>
           <div className="profile-social-grid">
             {platformProfiles.map((item) => (
-              <article key={item.url}>
-                <span className="resource-icon peach"><Globe2 size={18} /></span>
-                <div><strong>{item.platform}</strong><span>{item.accountName}</span></div>
-                {!profileEditing ? <StatusBadge label="已认证" tone="success" /> : null}
-                <a href={item.url} target="_blank" rel="noreferrer" aria-label={`查看 ${item.platform} 主页`}><ExternalLink size={14} /></a>
+              <article className="profile-social-account-card" key={item.url}>
+                <div className="profile-social-account-main">
+                  <span className={`social-brand-icon social-brand-${item.platform.toLowerCase()}`}><SocialBrandIcon platform={item.platform} /></span>
+                  <div><strong>{item.platform}</strong><span>{item.accountName}</span></div>
+                  {!profileEditing ? <StatusBadge label="已认证" tone="success" /> : null}
+                  <a href={item.url} target="_blank" rel="noreferrer" aria-label={`查看 ${item.platform} 主页`}><ExternalLink size={14} /></a>
+                </div>
+                <div className="profile-social-evidence">
+                  <span>认证截图</span>
+                  <div className="profile-resource-list">
+                    {item.evidence.length
+                      ? item.evidence.map((file) => <span key={file.id}>{file.name}</span>)
+                      : <span>未上传</span>}
+                  </div>
+                  {profileEditing ? (
+                    <label className="social-evidence-upload">
+                      <Upload size={14} />上传认证截图
+                      <input type="file" accept="image/png,image/jpeg" multiple onChange={(event) => uploadSocialEvidence(item.url, event)} />
+                    </label>
+                  ) : null}
+                </div>
               </article>
             ))}
           </div>
-          <dl className="definition-list">
-            <div>
-              <dt>认证截图</dt>
-              <dd className="profile-resource-list">
-                {(draft.social.screenshots?.length
-                  ? draft.social.screenshots
-                  : draft.social.screenshot
-                    ? [draft.social.screenshot]
-                    : []
-                ).map((file) => <span key={file.id}>{file.name}</span>)}
-                {!draft.social.screenshots?.length && !draft.social.screenshot ? <span>未上传</span> : null}
-              </dd>
-            </div>
-          </dl>
-          {profileEditing ? <label className="secondary-button upload-button"><Upload size={16} />上传认证截图<input type="file" accept="image/png,image/jpeg" /></label> : null}
         </section>
 
         <section className="detail-card form-detail-card profile-section-card">
@@ -4277,7 +4947,7 @@ function ProfilePage() {
             <UserRound size={19} />
           </header>
           <div className="form-grid profile-contact-grid">
-            <label><span>显示名称 / Display name</span><input disabled={!profileEditing} value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} /></label>
+            <label><span>显示名称 / Display name</span><input readOnly aria-readonly="true" value={normalizedDraft.displayName} /></label>
             <label><span>真实姓名 / Real Name *</span><input disabled={!profileEditing} required value={draft.legalName} onChange={(event) => setDraft({ ...draft, legalName: event.target.value })} /></label>
             <label><span>联系电话 / Tel *</span><input disabled={!profileEditing} required value={draft.phone} onChange={(event) => setDraft({ ...draft, phone: event.target.value })} /></label>
             <label className={emailInvalid ? "profile-contact-field-error" : undefined}>
@@ -4304,14 +4974,14 @@ function ProfilePage() {
 
         <section className="detail-card form-detail-card profile-section-card payout-accounts-card">
           <header>
-            <div><span className="profile-section-icon profile-section-icon-payout"><WalletCards size={17} /></span><div><h2>付款账户</h2><p>按付款渠道查看账户，并指定一个默认账户用于新的付款</p></div></div>
+            <div><span className="profile-section-icon profile-section-icon-payout"><WalletCards size={17} /></span><div><h2>收款账户</h2><p>按收款渠道查看账户，并指定一个默认账户用于新的付款</p></div></div>
             <StatusBadge label={`${selectedUsablePayoutAccounts.length} 个可用`} tone={selectedUsablePayoutAccounts.length ? "success" : "danger"} />
           </header>
 
           <div
             className="payout-channel-selector"
             role="tablist"
-            aria-label="付款渠道"
+            aria-label="收款渠道"
           >
             {PAYOUT_CHANNELS.map((channel) => {
               const channelAccounts = payoutAccountsForChannel(
@@ -4353,7 +5023,7 @@ function ProfilePage() {
             id="payout-channel-accounts"
             className="payout-channel-account-stage"
             role="tabpanel"
-            aria-label={`${selectedPayoutChannelConfig.label} 付款账户`}
+            aria-label={`${selectedPayoutChannelConfig.label} 收款账户`}
           >
             {incompletePayoutAccounts.length ? (
               <aside className="payout-incomplete-notice" role="note">
@@ -4369,7 +5039,7 @@ function ProfilePage() {
               <div className="payout-channel-empty" role="status">
                 <WalletCards size={20} />
                 <div>
-                  <strong>{selectedPayoutChannelConfig.label} 暂无付款账户</strong>
+                  <strong>{selectedPayoutChannelConfig.label} 暂无收款账户</strong>
                   <span>
                     {selectedPayoutChannelConfig.isAvailable
                       ? "新增并完成验证后，账户可用于后续付款。"
@@ -4425,7 +5095,7 @@ function ProfilePage() {
                       data-payout-menu={account.id}
                     >
                       {isDefault ? (
-                        <span className="payout-default-star" aria-label="默认付款账户" title="默认付款账户">
+                        <span className="payout-default-star" aria-label="默认收款账户" title="默认收款账户">
                           <Star size={14} fill="currentColor" />
                         </span>
                       ) : null}
@@ -4495,10 +5165,10 @@ function ProfilePage() {
           </div>
 
           <div className="payout-account-add-actions">
-            <button type="button" className="secondary-button" disabled={payoutAccountEditing} onClick={addAirwallexAccount}>
+            {!payoutAccountsForChannel(payoutAccounts, "AIRWALLEX").length ? <button type="button" className="secondary-button" disabled={payoutAccountEditing} onClick={addAirwallexAccount}>
               <Plus size={15} />Airwallex 账户
-            </button>
-            <button
+            </button> : null}
+            {!payoutAccountsForChannel(payoutAccounts, "PAYPAL").length ? <button
               type="button"
               className="secondary-button is-upcoming"
               disabled={payoutAccountEditing}
@@ -4510,7 +5180,7 @@ function ProfilePage() {
               }}
             >
               <Plus size={15} />PayPal 账户<span>暂未开放</span>
-            </button>
+            </button> : null}
             <button
               type="button"
               className="secondary-button is-upcoming"
@@ -4600,36 +5270,46 @@ function ProfilePage() {
         <section className="detail-card form-detail-card profile-section-card payout-condition-card">
           <header>
             <div><span className="profile-section-icon profile-section-icon-scenario"><RefreshCcw size={17} /></span><div><h2>付款场景</h2><p>修改条件后会重新同步对应付款字段</p></div></div>
-            {schemaLoading ? <StatusBadge label="正在同步" tone="amber" /> : schemaError ? <StatusBadge label="同步失败" tone="danger" /> : <StatusBadge label="已同步" tone="success" />}
+            {schemaLoading || transferMethodsLoading ? <StatusBadge label="正在同步" tone="amber" /> : schemaError || transferMethodsError ? <StatusBadge label="同步失败" tone="danger" /> : <StatusBadge label="已同步" tone="success" />}
           </header>
           <div className="form-grid airwallex-condition-grid profile-condition-grid">
             <label>
               <span>国家 / Country *</span>
-              <select disabled={!editing || schemaLoading} value={condition.bankCountryCode} onChange={(event) => updateCondition({ bankCountryCode: event.target.value })}>
+              <select disabled={!editing || schemaLoading || transferMethodsLoading} value={condition.bankCountryCode} onChange={(event) => updateCondition({ bankCountryCode: event.target.value })}>
                 {AIRWALLEX_COUNTRIES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </label>
             <label>
               <span>收款人类型 / Recipient type *</span>
-              <select disabled={!editing || schemaLoading} value={condition.entityType} onChange={(event) => updateCondition({ entityType: event.target.value as "PERSONAL" | "COMPANY" })}>
+              <select disabled={!editing || schemaLoading || transferMethodsLoading} value={condition.entityType} onChange={(event) => updateCondition({ entityType: event.target.value as "PERSONAL" | "COMPANY" })}>
                 <option value="PERSONAL">个人 / Individual</option>
                 <option value="COMPANY">企业 / Company</option>
               </select>
             </label>
             <label>
               <span>账户币种 / Account currency *</span>
-              <select disabled={!editing || schemaLoading} value={condition.accountCurrency} onChange={(event) => updateCondition({ accountCurrency: event.target.value })}>
+              <select disabled={!editing || schemaLoading || transferMethodsLoading} value={condition.accountCurrency} onChange={(event) => updateCondition({ accountCurrency: event.target.value })}>
                 {["USD", "EUR", "GBP", "JPY", "AUD", "HKD", "SGD"].map((item) => <option key={item}>{item}</option>)}
               </select>
             </label>
             <label>
               <span>转账方式 / Transfer method *</span>
-              <select disabled={!editing || schemaLoading} value={condition.transferMethod} onChange={(event) => updateCondition({ transferMethod: event.target.value as "LOCAL" | "SWIFT" })}>
-                <option value="LOCAL">本地转账 / Local transfer</option>
-                <option value="SWIFT">国际电汇 / SWIFT</option>
+              <select disabled={!editing || schemaLoading || transferMethodsLoading} value={condition.transferMethod} onChange={(event) => updateCondition({ transferMethod: event.target.value as "LOCAL" | "SWIFT" })}>
+                {transferMethods.length ? (
+                  transferMethods.map((method) => (
+                    <option key={method.value} value={method.value} disabled={!method.available}>
+                      {transferMethodLabel(method)}
+                    </option>
+                  ))
+                ) : (
+                  <option value={condition.transferMethod}>
+                    {condition.transferMethod === "LOCAL" ? "本地转账 / Local transfer" : "国际电汇 / SWIFT"}
+                  </option>
+                )}
               </select>
             </label>
           </div>
+          {transferMethodsError ? <div className="form-alert danger">{transferMethodsError}</div> : null}
         </section>
 
         <section
@@ -4642,7 +5322,7 @@ function ProfilePage() {
             {!editing && draft.payout.status === "VALIDATED" ? <StatusBadge label="校验通过" tone="success" /> : null}
           </header>
           {schemaError ? <div className="form-alert danger">{schemaError}</div> : null}
-          {schemaLoading ? (
+          {schemaLoading || transferMethodsLoading ? (
             <LoadingRows />
           ) : schema ? (
             <div className="form-grid schema-field-grid profile-schema-fields">
@@ -4734,7 +5414,7 @@ function ProfilePage() {
           {payoutAccountEditing ? (
             <footer
               className="profile-payout-edit-actions"
-              aria-label="付款账户编辑操作"
+              aria-label="收款账户编辑操作"
             >
               <button
                 type="button"
@@ -4773,14 +5453,14 @@ function ProfilePage() {
               <div>
                 <h2 id="payout-account-dialog-title">
                   {payoutDialog.kind === "REPLACE_DEFAULT"
-                    ? "请先更换默认付款账户"
+                    ? "请先更换默认收款账户"
                     : payoutDialog.operation === "DELETE"
-                      ? "删除付款账户？"
-                      : "停用付款账户？"}
+                      ? "删除收款账户？"
+                      : "停用收款账户？"}
                 </h2>
                 <p id="payout-account-dialog-description">
                   {payoutDialog.kind === "REPLACE_DEFAULT"
-                    ? "该账户是当前默认付款账户，请选择一个新的默认账户后继续。"
+                    ? "该账户是当前默认收款账户，请选择一个新的默认账户后继续。"
                     : payoutDialog.operation === "DELETE"
                       ? "删除后将无法恢复，该账户将不再用于后续付款。"
                       : "停用后，该账户不能用于新的付款，但历史项目、Invoice 和付款记录仍会保留。"}
@@ -4797,9 +5477,9 @@ function ProfilePage() {
 
             {payoutDialog.kind === "REPLACE_DEFAULT" ? (
               <div className="payout-replacement-section">
-                <strong>选择新的默认付款账户</strong>
+                <strong>选择新的默认收款账户</strong>
                 {replacementAccounts.length ? (
-                  <div className="payout-replacement-list" role="radiogroup" aria-label="新的默认付款账户">
+                  <div className="payout-replacement-list" role="radiogroup" aria-label="新的默认收款账户">
                     {replacementAccounts.map((account) => (
                       <label key={account.id}>
                         <input
@@ -4825,7 +5505,7 @@ function ProfilePage() {
                 ) : (
                   <div className="payout-replacement-empty">
                     <Info size={16} />
-                    <span>当前没有其他可用账户，请先新增付款账户并完成验证。</span>
+                    <span>当前没有其他可用账户，请先新增收款账户并完成验证。</span>
                   </div>
                 )}
               </div>
