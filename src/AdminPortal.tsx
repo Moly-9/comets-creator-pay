@@ -119,6 +119,15 @@ const invitationLabel: Record<InvitationStatus, string> = {
   EXPIRED: "已过期",
 };
 
+const adminContractStatusTone: Record<
+  Contract["status"],
+  "purple" | "info" | "neutral"
+> = {
+  PENDING_SIGNATURE: "purple",
+  ACTIVE: "info",
+  EXPIRED: "neutral",
+};
+
 const auditActionLabel: Record<AuditEvent["action"], string> = {
   LOGIN: "登录",
   USER_CREATED: "创建账号",
@@ -905,7 +914,7 @@ export function AdminRequestProjectsPage() {
                     <td><strong>{item.request.projectName}</strong><small className="admin-table-block">{item.request.id} · {item.request.brand}</small></td>
                     <td><strong>{item.creator.name}</strong><small className="admin-table-block">{item.creator.id}</small></td>
                     <td><strong>{item.request.amount}</strong></td>
-                    <td><AdminBadge label={contractStatusLabel[item.contract.status]} tone={item.contract.status === "已付款" ? "success" : "info"} /></td>
+                    <td><AdminBadge label={contractStatusLabel[item.contract.status]} tone={adminContractStatusTone[item.contract.status]} /></td>
                     <td><AdminBadge label={meta.label} tone={meta.tone} /></td>
                     <td><AdminBadge label={meta.requestLabel} tone={meta.tone} /></td>
                     <td><span className="admin-table-secondary">{item.request.updatedAt}</span></td>
@@ -988,21 +997,21 @@ export function AdminContractsPage() {
     `${normalizedQuery}|${creatorId}|${status}`,
   );
   const counts: Record<Contract["status"], number> = {
-    未请款: rows.filter((item) => item.record.status === "未请款").length,
-    请款中: rows.filter((item) => item.record.status === "请款中").length,
-    已付款: rows.filter((item) => item.record.status === "已付款").length,
+    PENDING_SIGNATURE: rows.filter((item) => item.record.status === "PENDING_SIGNATURE").length,
+    ACTIVE: rows.filter((item) => item.record.status === "ACTIVE").length,
+    EXPIRED: rows.filter((item) => item.record.status === "EXPIRED").length,
   };
 
   if (!data) return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> 正在加载合同</div></div>;
 
   return (
     <div className="admin-page-stack admin-business-page">
-      <PageHeader title="合同" description="查看本系统所有创作者的合同与当前请款状态。" />
+      <PageHeader title="合同" description="查看本系统所有创作者的合同与当前生命周期状态。" />
       <section className="admin-business-summary admin-business-summary-card" aria-label="合同概览">
-        <article><span>合同总数</span><strong>{rows.length}</strong><small>本系统全部合同</small></article>
-        <article><span>未付款</span><strong>{counts.未请款}</strong><small>暂无关联 Invoice</small></article>
-        <article><span>付款中</span><strong>{counts.请款中}</strong><small>已进入 Invoice 流程</small></article>
-        <article><span>已付款</span><strong>{counts.已付款}</strong><small>款项已完成支付</small></article>
+        <article><span>全部合同</span><strong>{rows.length}</strong><small>本系统全部合同</small></article>
+        <article><span>待签署</span><strong>{counts.PENDING_SIGNATURE}</strong><small>等待完成合同签署</small></article>
+        <article><span>执行中</span><strong>{counts.ACTIVE}</strong><small>当前处于履约服务周期</small></article>
+        <article><span>已过期</span><strong>{counts.EXPIRED}</strong><small>合同服务周期已结束</small></article>
       </section>
       <section className="admin-panel admin-table-panel">
         <header className="admin-panel-heading"><div><h2>全部合同</h2><p>只读查看与下载</p></div><FileText size={18} /></header>
@@ -1015,7 +1024,7 @@ export function AdminContractsPage() {
             </AdminSelectControl>
           </div>
           <div className="admin-status-tabs" role="tablist" aria-label="合同状态筛选">
-            {(["ALL", "未请款", "请款中", "已付款"] as const).map((value) => (
+            {(["ALL", "PENDING_SIGNATURE", "ACTIVE", "EXPIRED"] as const).map((value) => (
               <button type="button" role="tab" aria-selected={status === value} className={status === value ? "active" : ""} key={value} onClick={() => setStatus(value)}>
                 {value === "ALL" ? "全部" : contractStatusLabel[value]}
               </button>
@@ -1032,7 +1041,7 @@ export function AdminContractsPage() {
                   <td><strong>{record.projectName}</strong><small className="admin-table-block">{record.brand}</small></td>
                   <td><strong>{creator.name}</strong><small className="admin-table-block">{creator.id}</small></td>
                   <td><strong>{record.amount}</strong></td>
-                  <td><AdminBadge label={contractStatusLabel[record.status]} tone={record.status === "已付款" ? "success" : record.status === "请款中" ? "info" : "purple"} /></td>
+                  <td><AdminBadge label={contractStatusLabel[record.status]} tone={adminContractStatusTone[record.status]} /></td>
                   <td><span className="admin-table-secondary">{record.effectiveDate}</span></td>
                   <td><span className="admin-table-secondary">{record.updatedAt}</span></td>
                   <td><div className="admin-inline-actions"><Link className="admin-icon-link" to={`/admin/contracts/${creator.id}/${record.id}`} title="查看合同详情"><Eye size={15} /><span>查看</span></Link><a className="admin-icon-link" href={record.documentUrl} download={record.fileName} title="下载合同"><Download size={15} /><span>下载</span></a></div></td>
@@ -1044,7 +1053,7 @@ export function AdminContractsPage() {
         <div className="admin-business-mobile-list">
           {contractPagination.items.map(({ creator, record }) => (
             <article key={`${creator.id}-${record.id}`}>
-              <header><strong>{record.projectName}</strong><AdminBadge label={contractStatusLabel[record.status]} tone={record.status === "已付款" ? "success" : record.status === "请款中" ? "info" : "purple"} /></header>
+              <header><strong>{record.projectName}</strong><AdminBadge label={contractStatusLabel[record.status]} tone={adminContractStatusTone[record.status]} /></header>
               <small className="admin-mobile-record-id">{record.id} · {record.orderId}</small>
               <dl><div><dt>品牌</dt><dd>{record.brand}</dd></div><div><dt>达人</dt><dd>{creator.name} · {creator.id}</dd></div><div><dt>合同金额</dt><dd>{record.amount}</dd></div><div><dt>生效日期</dt><dd>{record.effectiveDate}</dd></div><div><dt>更新日期</dt><dd>{record.updatedAt}</dd></div></dl>
               <div className="admin-business-mobile-actions"><Link to={`/admin/contracts/${creator.id}/${record.id}`}><Eye size={14} /> 查看</Link><a href={record.documentUrl} download={record.fileName}><Download size={14} /> 下载</a></div>
@@ -2240,7 +2249,7 @@ function BusinessTable({
                       <td>{item.projectName}</td>
                       <td>{item.brand}</td>
                       <td>{item.amount}</td>
-                      <td><AdminBadge label={contractStatusLabel[item.status]} tone={item.status === "已付款" ? "success" : "info"} /></td>
+                      <td><AdminBadge label={contractStatusLabel[item.status]} tone={adminContractStatusTone[item.status]} /></td>
                       <td>
                         <div className="admin-inline-actions">
                           <a className="admin-icon-link" href={item.documentUrl} target="_blank" rel="noreferrer"><Eye size={15} /><span>查看</span></a>

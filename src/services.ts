@@ -12,9 +12,19 @@ import {
   type CreateManagedUserInput,
 } from "./admin-store";
 import {
+  isPayoutAccountUsable,
   normalizePayoutProfile,
   syncPayoutAccounts,
 } from "./payout-accounts";
+import {
+  buildCreatorNotifications,
+  buildCreatorTasks,
+  invoiceInternalIdOf,
+  invoiceNumberOf,
+  legacyStatusForInvoice,
+  migrateInvoice,
+  migrateInvoices,
+} from "./creator-workflow";
 import type {
   AccountStatus,
   AdminBusinessData,
@@ -27,13 +37,19 @@ import type {
   ApiResult,
   AuditEvent,
   Contract,
+  CreatorNotification,
+  CreatorTask,
   CorrectionRequest,
+  ExternalInvoiceUploadInput,
   ExternalBusinessEvent,
   ExternalSyncIssue,
   Invoice,
   InvoiceSignature,
   InvoiceStatus,
+  InvoiceExtractedData,
+  InvoiceFeedbackInput,
   InvoiceUploadInput,
+  PaymentAccountCorrectionInput,
   PayoutAccount,
   RequestProject,
   SensitiveFieldKey,
@@ -45,6 +61,8 @@ import type {
 
 const INVOICE_STORAGE_KEY = "comets-creator-invoices-v2";
 const PROFILE_STORAGE_KEY = "comets-creator-profile-v2";
+const CONTRACT_STORAGE_KEY = "comets-creator-contracts-v1";
+const CREATOR_NOTIFICATION_STORAGE_KEY = "comets-creator-notifications-v2";
 
 const wait = (duration = 240) =>
   new Promise<void>((resolve) => globalThis.setTimeout(resolve, duration));
@@ -399,16 +417,42 @@ export interface RequestProjectService {
 export interface ContractService {
   list(creatorId?: string): Promise<ApiResult<Contract[]>>;
   get(id: string, creatorId?: string): Promise<ApiResult<Contract | undefined>>;
+  signContract(
+    id: string,
+    actor: Pick<Session, "userId" | "role">,
+  ): Promise<ApiResult<Contract>>;
 }
 
 export interface InvoiceService {
   list(creatorId?: string): Promise<ApiResult<Invoice[]>>;
   get(id: string, creatorId?: string): Promise<ApiResult<Invoice | undefined>>;
-  upload(input: InvoiceUploadInput): Promise<ApiResult<Invoice>>;
+  signInternalInvoice(
+    invoiceId: string,
+    signature: InvoiceSignature,
+  ): Promise<ApiResult<Invoice>>;
+  submitFeedback(
+    invoiceId: string,
+    input: InvoiceFeedbackInput,
+  ): Promise<ApiResult<Invoice>>;
+  uploadExternal(input: ExternalInvoiceUploadInput): Promise<ApiResult<Invoice>>;
+  confirmExternal(invoiceId: string): Promise<ApiResult<Invoice>>;
+  correctExternal(
+    invoiceId: string,
+    extractedData: InvoiceExtractedData,
+  ): Promise<ApiResult<Invoice>>;
+  resubmitExternal(input: ExternalInvoiceUploadInput): Promise<ApiResult<Invoice>>;
   selectPayoutAccount(id: string, payoutAccountId: string): Promise<ApiResult<Invoice>>;
-  transition(id: string, status: InvoiceStatus): Promise<ApiResult<Invoice>>;
-  resolvePaymentIssue(id: string, correctedValue: string): Promise<ApiResult<Invoice>>;
-  sign(id: string, signature: InvoiceSignature): Promise<ApiResult<Invoice>>;
+}
+
+export interface TaskService {
+  list(creatorId?: string): Promise<ApiResult<CreatorTask[]>>;
+}
+
+export interface PaymentService {
+  submitAccountCorrection(
+    invoiceId: string,
+    input: PaymentAccountCorrectionInput,
+  ): Promise<ApiResult<Invoice>>;
 }
 
 export interface PayoutService {
@@ -489,8 +533,15 @@ export interface AdminSettingsService {
   ): Promise<ApiResult<AdminSettings>>;
 }
 
-export interface NotificationService {
+export interface AdminNotificationService {
   list(userId: string): Promise<ApiResult<AdminUserDetail["notifications"]>>;
+}
+
+export interface NotificationService {
+  list(userId?: string): Promise<ApiResult<CreatorNotification[]>>;
+  markRead(id: string, userId?: string): Promise<ApiResult<CreatorNotification>>;
+  markAllRead(userId?: string): Promise<ApiResult<CreatorNotification[]>>;
+  getUnreadCount(userId?: string): Promise<ApiResult<number>>;
 }
 
 export interface ExternalBusinessDataAdapter {
@@ -512,6 +563,8 @@ export interface Services {
   requests: RequestProjectService;
   contracts: ContractService;
   invoices: InvoiceService;
+  tasks: TaskService;
+  payments: PaymentService;
   payout: PayoutService;
   adminUsers: AdminUserService;
   adminBusiness: AdminBusinessDataService;
@@ -519,6 +572,7 @@ export interface Services {
   audit: AuditService;
   adminSettings: AdminSettingsService;
   notifications: NotificationService;
+  adminNotifications: AdminNotificationService;
   externalBusinessData: ExternalBusinessDataAdapter;
 }
 
@@ -596,22 +650,24 @@ export const migrateLegacyInvoiceState = (invoice: LegacyInvoice): Invoice => {
     const seededPaymentFailure = seedInvoices.find(
       (item) => item.id === "INV-20260728-00001",
     );
-    return seededPaymentFailure
-      ? structuredClone(seededPaymentFailure)
-      : { ...invoice, status: "PAYMENT_FAILED" };
+    return migrateInvoice(
+      seededPaymentFailure
+        ? structuredClone(seededPaymentFailure)
+        : { ...invoice, status: "PAYMENT_FAILED" },
+    );
   }
   if (legacyStatus !== "REJECTED") {
-    return invoice as Invoice;
+    return migrateInvoice(invoice as Invoice);
   }
   if (invoice.id === "INV-240711-C") {
     const { rejectedReason: _rejectedReason, ...current } = invoice;
-    return {
+    return migrateInvoice({
       ...current,
       status: "PENDING_REVIEW",
       updatedAt: "07-28 15:40",
-    };
+    });
   }
-  return { ...invoice, status: "PAYMENT_FAILED" };
+  return migrateInvoice({ ...invoice, status: "PAYMENT_FAILED" });
 };
 
 export const filterRequests = (
@@ -1061,7 +1117,9 @@ export const validateRequiredProfileFields = (profile: UserProfile) => {
 
 export class MockApiAdapter implements Services {
   private invoiceData = this.readInvoices();
+  private contractData = this.readContracts();
   private profileData = this.readProfile();
+  private creatorNotificationData = this.readCreatorNotifications();
 
   constructor() {
     adminStore.syncProfile(this.profileData, false);
@@ -1092,10 +1150,10 @@ export class MockApiAdapter implements Services {
   }
 
   private readInvoices() {
-    if (typeof window === "undefined") return sortInvoices(structuredClone(seedInvoices));
+    if (typeof window === "undefined") return sortInvoices(migrateInvoices(structuredClone(seedInvoices)));
     try {
       const stored = window.localStorage.getItem(INVOICE_STORAGE_KEY);
-      if (!stored) return sortInvoices(structuredClone(seedInvoices));
+      if (!stored) return sortInvoices(migrateInvoices(structuredClone(seedInvoices)));
 
       const legacyIdMap: Record<string, string> = {
         "INV-260727-S": "INV-20260727-00001",
@@ -1122,11 +1180,195 @@ export class MockApiAdapter implements Services {
       const customInvoices = storedInvoices.filter(
         (invoice) => !seedInvoices.some((seed) => seed.id === invoice.id),
       ).map((invoice) => ({ ...invoice, channel: "Airwallex" as const }));
-      return sortInvoices(
-        [...mergedSeedInvoices, ...customInvoices].map(migrateLegacyInvoiceState),
-      );
+      return sortInvoices([...mergedSeedInvoices, ...customInvoices].map(migrateLegacyInvoiceState));
     } catch {
-      return sortInvoices(structuredClone(seedInvoices));
+      return sortInvoices(migrateInvoices(structuredClone(seedInvoices)));
+    }
+  }
+
+  private readContracts() {
+    if (typeof window === "undefined") return structuredClone(seedContracts);
+    try {
+      const stored = window.localStorage.getItem(CONTRACT_STORAGE_KEY);
+      if (!stored) return structuredClone(seedContracts);
+      const storedContracts = JSON.parse(stored) as Contract[];
+      const storedById = new Map(storedContracts.map((contract) => [contract.id, contract]));
+      return seedContracts.map((contract) => ({
+        ...structuredClone(contract),
+        ...storedById.get(contract.id),
+        projectId: contract.projectId,
+        projectName: contract.projectName,
+        brand: contract.brand,
+      }));
+    } catch {
+      return structuredClone(seedContracts);
+    }
+  }
+
+  private readCreatorNotifications() {
+    const current = buildCreatorNotifications(this.contractData, this.invoiceData);
+    if (typeof window === "undefined") return current;
+    try {
+      const stored = JSON.parse(
+        window.localStorage.getItem(CREATOR_NOTIFICATION_STORAGE_KEY) || "[]",
+      ) as CreatorNotification[];
+      const readById = new Map(stored.map((item) => [item.id, item.read]));
+      return current.map((item) => ({ ...item, read: readById.get(item.id) ?? false }));
+    } catch {
+      return current;
+    }
+  }
+
+  private persistInvoices() {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(this.invoiceData));
+    }
+    this.refreshCreatorNotifications();
+  }
+
+  private persistContracts() {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(CONTRACT_STORAGE_KEY, JSON.stringify(this.contractData));
+    }
+    this.refreshCreatorNotifications();
+  }
+
+  private refreshCreatorNotifications() {
+    const readById = new Map(this.creatorNotificationData?.map((item) => [item.id, item.read]) || []);
+    this.creatorNotificationData = buildCreatorNotifications(this.contractData, this.invoiceData)
+      .map((item) => ({ ...item, read: readById.get(item.id) ?? false }));
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(
+        CREATOR_NOTIFICATION_STORAGE_KEY,
+        JSON.stringify(this.creatorNotificationData),
+      );
+    }
+  }
+
+  private findInvoice(resourceId: string) {
+    return this.invoiceData.find((invoice) => (
+      invoiceInternalIdOf(invoice) === resourceId
+      || invoiceNumberOf(invoice) === resourceId
+      || invoice.id === resourceId
+    ));
+  }
+
+  private recordInvoiceOperation(
+    invoice: Invoice,
+    type: NonNullable<Invoice["operationHistory"]>[number]["type"],
+    label: string,
+    actor: string,
+    reason?: string,
+  ) {
+    const occurredAt = new Date().toISOString();
+    invoice.operationHistory = [
+      ...(invoice.operationHistory || []),
+      {
+        id: `operation:${type}:${Date.now()}`,
+        type,
+        label,
+        actor,
+        occurredAt,
+        reason,
+      },
+    ];
+    invoice.updatedAt = occurredAt;
+    invoice.status = legacyStatusForInvoice(invoice.documentState!, invoice.paymentStatus!);
+    return occurredAt;
+  }
+
+  private uploadExternalFile(
+    input: ExternalInvoiceUploadInput,
+    requiredStatus: "WAITING_UPLOAD" | "RETURNED_FOR_REUPLOAD" | "RECOGNITION_FAILED",
+  ) {
+    const invoice = this.findInvoice(input.invoiceId);
+    if (!invoice) throw new Error("Invoice 不存在");
+    if (
+      invoice.documentState?.kind !== "EXTERNAL"
+      || invoice.documentState.status !== requiredStatus
+    ) {
+      throw new Error(
+        requiredStatus === "WAITING_UPLOAD"
+          ? "当前 Invoice 不是待上传状态"
+          : "当前 Invoice 未被要求重新上传",
+      );
+    }
+    if (!/^(application\/pdf|image\/(png|jpeg))$/.test(input.file.mimeType)) {
+      throw new Error("仅支持 PDF、PNG 或 JPEG 文件");
+    }
+    if (input.file.size <= 0 || input.file.size > 5 * 1024 * 1024) {
+      throw new Error("文件大小必须在 5MB 以内");
+    }
+    const account = this.profileData.payoutAccounts.find(
+      (candidate) => candidate.id === input.payoutAccountId,
+    );
+    if (!account || !isPayoutAccountUsable(account)) {
+      throw new Error("请选择已验证且可用于收款的账户");
+    }
+    const previous = invoice.fileVersions?.at(-1);
+    const version = (previous?.version || 0) + 1;
+    const uploadedAt = new Date().toISOString();
+    const fileVersion = {
+      ...structuredClone(input.file),
+      version,
+      uploadedAt,
+      demoHash: `demo-${invoiceInternalIdOf(invoice)}-${version}-${input.file.size}`,
+      supersedesFileId: previous?.id,
+    };
+    invoice.documentState = { kind: "EXTERNAL", status: "RECOGNIZING" };
+    invoice.payoutAccountId = input.payoutAccountId;
+    invoice.document = structuredClone(input.file);
+    invoice.extractedData = structuredClone(input.extractedData);
+    invoice.fileVersions = [...(invoice.fileVersions || []), fileVersion];
+    invoice.rejectedReason = undefined;
+    this.recordInvoiceOperation(
+      invoice,
+      requiredStatus === "WAITING_UPLOAD"
+        ? "EXTERNAL_FILE_UPLOADED"
+        : "EXTERNAL_RESUBMITTED",
+      requiredStatus === "WAITING_UPLOAD" ? "外部 Invoice 文件已上传" : "外部 Invoice 新版本已上传",
+      "达人",
+    );
+    invoice.documentState = { kind: "EXTERNAL", status: "WAITING_CONFIRMATION" };
+    this.recordInvoiceOperation(
+      invoice,
+      "EXTERNAL_RECOGNIZED",
+      `OCR 识别完成 · 文件版本 v${version}`,
+      "系统",
+    );
+    this.persistInvoices();
+    return structuredClone(invoice);
+  }
+
+  private assertExternalConfirmationReady(invoice: Invoice) {
+    if (
+      invoice.documentState?.kind !== "EXTERNAL"
+      || invoice.documentState.status !== "WAITING_CONFIRMATION"
+    ) throw new Error("当前 Invoice 不能确认");
+    if (!invoice.extractedData) throw new Error("Invoice 尚未生成 OCR 识别结果");
+    const account = this.profileData.payoutAccounts.find(
+      (candidate) => candidate.id === invoice.payoutAccountId,
+    );
+    if (!account || !isPayoutAccountUsable(account)) {
+      throw new Error("所选收款账户已失效，请重新选择");
+    }
+    const [, expectedAmount = ""] = invoice.amount.split(/\s+/, 2);
+    const expectedCurrency = invoice.amount.split(/\s+/, 1)[0];
+    const extracted = invoice.extractedData;
+    if (Number(extracted.total.replace(/,/g, "")) !== Number(expectedAmount.replace(/,/g, ""))) {
+      throw new Error("Invoice 金额与系统下发金额不一致");
+    }
+    if (normalizePaymentDetail(extracted.currency) !== normalizePaymentDetail(expectedCurrency)) {
+      throw new Error("Invoice 币种与系统下发币种不一致");
+    }
+    if (normalizePaymentDetail(extracted.invoiceFrom) !== normalizePaymentDetail(this.profileData.legalName)) {
+      throw new Error("Invoice From 与个人档案 Real Name 不一致");
+    }
+    if (normalizePaymentDetail(extracted.billTo) !== normalizePaymentDetail("COMETS INTERNATIONAL LIMITED")) {
+      throw new Error("Bill To 必须为 COMETS INTERNATIONAL LIMITED");
+    }
+    if (!compareInvoicePaymentDetails(extracted.paymentDetails, account).matches) {
+      throw new Error("Invoice 收款信息与所选账户不一致");
     }
   }
 
@@ -1263,15 +1505,51 @@ export class MockApiAdapter implements Services {
       return {
         data:
           creatorId === PRIMARY_CREATOR_ID
-            ? structuredClone(seedContracts)
+            ? structuredClone(this.contractData)
             : [],
       };
     },
     get: async (id, creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
       if (creatorId !== PRIMARY_CREATOR_ID) return { data: undefined };
-      const item = seedContracts.find((entry) => entry.id === id);
+      const item = this.contractData.find((entry) => entry.id === id);
       return { data: item ? structuredClone(item) : undefined };
+    },
+    signContract: async (id, actor) => {
+      await wait();
+      if (actor.role !== "CREATOR") {
+        throw new Error("管理员只读视图不能替达人签署合同");
+      }
+      if (actor.userId !== PRIMARY_CREATOR_ID) {
+        throw new Error("当前账号无权签署该合同");
+      }
+      const contract = this.contractData.find((entry) => entry.id === id);
+      if (!contract) throw new Error("合同不存在");
+      if (contract.status !== "PENDING_SIGNATURE") {
+        throw new Error("只有待签署合同可以签署");
+      }
+      const signedAt = new Date().toISOString();
+      contract.status = "ACTIVE";
+      contract.signedAt = signedAt;
+      contract.updatedAt = signedAt.slice(0, 10);
+      contract.signatureRecord = {
+        id: `contract-signature:${contract.id}:${Date.now()}`,
+        actorId: actor.userId,
+        actorRole: actor.role,
+        signedAt,
+        acknowledgement: "已确认演示合同摘要并提交签署记录",
+      };
+      contract.history = [
+        ...(contract.history || []),
+        {
+          id: `contract-history:${contract.id}:${Date.now()}`,
+          action: "SIGNED",
+          actorId: actor.userId,
+          occurredAt: signedAt,
+        },
+      ];
+      this.persistContracts();
+      return { data: structuredClone(contract), message: "合同签署记录已保存" };
     },
   };
 
@@ -1288,133 +1566,178 @@ export class MockApiAdapter implements Services {
     get: async (id, creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
       if (creatorId !== PRIMARY_CREATOR_ID) return { data: undefined };
-      const item = this.invoiceData.find((entry) => entry.id === id);
+      const item = this.findInvoice(id);
       return { data: item ? structuredClone(item) : undefined };
     },
-    upload: async (input) => {
-      await wait(480);
-      const issuedAt = input.extractedData.invoiceDate;
-      const id = createInvoiceId(issuedAt, this.invoiceData);
-      const now = new Date().toISOString();
-      const invoice: Invoice = {
-        id,
-        projectId: input.projectId,
-        projectName: input.projectName,
-        brand: input.brand,
-        channel: "Airwallex",
-        amount: `${input.extractedData.currency} ${input.extractedData.total}`,
-        status: "PENDING_CONFIRMATION",
-        issuedAt,
-        updatedAt: "刚刚",
-        invoiceType: input.invoiceType,
-        payoutAccountId: input.payoutAccountId,
-        document: structuredClone(input.file),
-        extractedData: structuredClone(input.extractedData),
-        processHistory: [{
-          id: `event-${Date.now()}`,
-          status: "PENDING_CONFIRMATION",
-          label: "上传待确认",
-          actor: "达人",
-          occurredAt: now,
-        }],
-      };
-      this.invoiceData = sortInvoices([invoice, ...this.invoiceData]);
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(this.invoiceData));
+    signInternalInvoice: async (invoiceId, signature) => {
+      await wait();
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice) throw new Error("Invoice 不存在");
+      if (
+        invoice.documentState?.kind !== "INTERNAL"
+        || invoice.documentState.status !== "WAITING_SIGNATURE"
+      ) throw new Error("只有待签署的内部 Invoice 可以签署");
+      if (invoice.signature) throw new Error("该 Invoice 已完成签署，不能重复操作");
+      invoice.signature = structuredClone(signature);
+      invoice.documentState = { kind: "INTERNAL", status: "UNDER_REVIEW" };
+      this.recordInvoiceOperation(invoice, "INTERNAL_SIGNED", "内部 Invoice 已签署并提交审核", signature.signerName);
+      this.persistInvoices();
+      return { data: structuredClone(invoice), message: "Invoice 已签署并提交审核" };
+    },
+    submitFeedback: async (invoiceId, input) => {
+      await wait();
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice) throw new Error("Invoice 不存在");
+      if (
+        invoice.documentState?.kind !== "INTERNAL"
+        || invoice.documentState.status !== "WAITING_SIGNATURE"
+      ) throw new Error("只有待签署的内部 Invoice 可以提交信息反馈");
+      if (!input.issueType.trim() || !input.details.trim()) {
+        throw new Error("问题类型和问题说明不能为空");
       }
-      return { data: structuredClone(invoice), message: "Invoice 已上传，等待确认" };
+      const submittedAt = new Date().toISOString();
+      invoice.feedbackRecords = [
+        ...(invoice.feedbackRecords || []),
+        {
+          id: `feedback:${invoiceInternalIdOf(invoice)}:${Date.now()}`,
+          issueType: input.issueType.trim(),
+          details: input.details.trim(),
+          invoiceId: invoiceInternalIdOf(invoice),
+          invoiceVersion: Math.max(1, invoice.fileVersions?.at(-1)?.version || 1),
+          submittedAt,
+          submittedBy: input.submittedBy,
+        },
+      ];
+      invoice.documentState = { kind: "INTERNAL", status: "CREATOR_FEEDBACK" };
+      this.recordInvoiceOperation(
+        invoice,
+        "FEEDBACK_SUBMITTED",
+        "Invoice 信息反馈已收到",
+        input.submittedBy,
+        `${input.issueType.trim()}：${input.details.trim()}`,
+      );
+      this.persistInvoices();
+      return { data: structuredClone(invoice), message: "Invoice 反馈已收到" };
+    },
+    uploadExternal: async (input) => {
+      await wait(480);
+      return {
+        data: this.uploadExternalFile(input, "WAITING_UPLOAD"),
+        message: "Invoice 文件已上传，OCR 识别完成",
+      };
+    },
+    confirmExternal: async (invoiceId) => {
+      await wait();
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice) throw new Error("Invoice 不存在");
+      this.assertExternalConfirmationReady(invoice);
+      invoice.documentState = { kind: "EXTERNAL", status: "WAITING_MEDIA_REVIEW" };
+      this.recordInvoiceOperation(invoice, "EXTERNAL_CONFIRMED", "外部 Invoice 已确认并提交审核", "达人");
+      this.persistInvoices();
+      return { data: structuredClone(invoice), message: "Invoice 已确认并提交审核" };
+    },
+    correctExternal: async (invoiceId, extractedData) => {
+      await wait();
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice) throw new Error("Invoice 不存在");
+      if (
+        invoice.documentState?.kind !== "EXTERNAL"
+        || invoice.documentState.status !== "RETURNED_FOR_CORRECTION"
+      ) throw new Error("当前 Invoice 未被退回修改");
+      invoice.extractedData = structuredClone(extractedData);
+      invoice.documentState = { kind: "EXTERNAL", status: "WAITING_CONFIRMATION" };
+      invoice.rejectedReason = undefined;
+      this.recordInvoiceOperation(invoice, "EXTERNAL_CORRECTED", "外部 Invoice 识别信息已修改", "达人");
+      this.persistInvoices();
+      return { data: structuredClone(invoice), message: "修改已保存，请重新确认" };
+    },
+    resubmitExternal: async (input) => {
+      await wait(480);
+      const invoice = this.findInvoice(input.invoiceId);
+      const requiredStatus = invoice?.documentState?.kind === "EXTERNAL"
+        && invoice.documentState.status === "RECOGNITION_FAILED"
+        ? "RECOGNITION_FAILED"
+        : "RETURNED_FOR_REUPLOAD";
+      return {
+        data: this.uploadExternalFile(input, requiredStatus),
+        message: "新文件版本已上传，旧版本已保留",
+      };
     },
     selectPayoutAccount: async (id, payoutAccountId) => {
       await wait(180);
-      const invoice = this.invoiceData.find((item) => item.id === id);
+      const invoice = this.findInvoice(id);
       if (!invoice) throw new Error("Invoice 不存在");
+      const account = this.profileData.payoutAccounts.find(
+        (candidate) => candidate.id === payoutAccountId,
+      );
+      if (!account || !isPayoutAccountUsable(account)) {
+        throw new Error("请选择已验证且可用于收款的账户");
+      }
+      if (invoice.payoutAccountId === payoutAccountId) {
+        throw new Error("请选择与当前不同的收款账户");
+      }
       invoice.payoutAccountId = payoutAccountId;
-      invoice.updatedAt = "刚刚";
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(this.invoiceData));
-      }
-      return { data: structuredClone(invoice), message: "付款账户已更新" };
+      this.recordInvoiceOperation(invoice, "PAYOUT_ACCOUNT_SELECTED", "已选择新的收款账户", "达人");
+      this.persistInvoices();
+      return { data: structuredClone(invoice), message: "收款账户已更新" };
     },
-    transition: async (id, status) => {
-      await wait();
-      const invoice = this.invoiceData.find((item) => item.id === id);
-      if (!invoice) throw new Error("Invoice 不存在");
-      const isSubmittingPaymentCorrection =
-        invoice.status === "PAYMENT_FAILED" && status === "PENDING_REVIEW";
-      if (invoice.status === "PAYMENT_FAILED") {
-        if (!isSubmittingPaymentCorrection) {
-          throw new Error("付款信息修正后必须先提交资料审核");
-        }
-        if (!invoice.paymentIssue?.resolvedAt) {
-          throw new Error("请先修改错误的付款信息并完成校验");
-        }
-      }
-      invoice.status = status;
-      invoice.updatedAt = "刚刚";
-      const statusLabels: Record<InvoiceStatus, string> = {
-        PENDING_CONFIRMATION: "上传待确认",
-        DRAFT_SIGNATURE: "待签署",
-        PENDING_REVIEW: "待审核",
-        CHANGES_REQUIRED: "待修改",
-        APPROVED: "待付款",
-        PAYMENT_FAILED: "付款异常",
-        PAID: "已付款",
+  };
+
+  tasks: TaskService = {
+    list: async (creatorId = PRIMARY_CREATOR_ID) => {
+      await wait(80);
+      return {
+        data: creatorId === PRIMARY_CREATOR_ID
+          ? structuredClone(buildCreatorTasks(this.contractData, this.invoiceData))
+          : [],
       };
-      invoice.processHistory = [
-        ...(invoice.processHistory || []),
-        {
-          id: `event-${Date.now()}`,
-          status,
-          label: statusLabels[status],
-          actor: status === "CHANGES_REQUIRED" ? "审核账号 / 系统" : "系统",
-          occurredAt: new Date().toISOString(),
-          ...(status === "CHANGES_REQUIRED" && invoice.rejectedReason
-            ? { reason: invoice.rejectedReason }
-            : {}),
-        },
-      ];
-      if (isSubmittingPaymentCorrection && invoice.paymentIssue) {
-        invoice.paymentIssue.resubmittedAt = new Date().toISOString();
-      }
-      if (status !== "PAYMENT_FAILED") invoice.rejectedReason = undefined;
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(this.invoiceData));
-      }
-      return { data: structuredClone(invoice), message: "Invoice 状态已更新" };
     },
-    resolvePaymentIssue: async (id, correctedValue) => {
+  };
+
+  payments: PaymentService = {
+    submitAccountCorrection: async (invoiceId, input) => {
       await wait();
-      const invoice = this.invoiceData.find((item) => item.id === id);
-      if (!invoice || invoice.status !== "PAYMENT_FAILED" || !invoice.paymentIssue) {
-        throw new Error("当前 Invoice 没有待修复的付款信息");
-      }
-      if (
-        !correctedValue.trim() ||
-        correctedValue.trim() === invoice.paymentIssue.invalidValue
-      ) {
-        throw new Error(`请修改${invoice.paymentIssue.fieldLabel.split(" / ")[0]}`);
-      }
-      invoice.paymentIssue.resolvedAt = new Date().toISOString();
-      invoice.updatedAt = "刚刚";
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(this.invoiceData));
-      }
-      return { data: structuredClone(invoice), message: "付款信息已修改并通过校验" };
-    },
-    sign: async (id, signature) => {
-      await wait();
-      const invoice = this.invoiceData.find((item) => item.id === id);
+      const invoice = this.findInvoice(invoiceId);
       if (!invoice) throw new Error("Invoice 不存在");
-      if (invoice.status !== "DRAFT_SIGNATURE") {
-        throw new Error("当前 Invoice 无需签署");
+      if (invoice.documentState?.status !== "APPROVED" || invoice.paymentStatus !== "FAILED") {
+        throw new Error("当前 Invoice 不在付款失败修正流程中");
       }
-      invoice.signature = structuredClone(signature);
-      invoice.status = "PENDING_REVIEW";
-      invoice.updatedAt = "刚刚";
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(this.invoiceData));
+      if (invoice.paymentRecoveryStatus !== "AWAITING_CREATOR_UPDATE") {
+        throw new Error("收款资料已提交，不能重复操作");
       }
-      return { data: structuredClone(invoice), message: "Invoice 已签署并提交审核" };
+      const currentAccountId = invoice.payoutAccountId;
+      const changedAccount = Boolean(
+        input.payoutAccountId && input.payoutAccountId !== currentAccountId,
+      );
+      const changedField = Boolean(
+        invoice.paymentIssue
+        && input.fieldKey === invoice.paymentIssue.fieldKey
+        && input.correctedValue?.trim()
+        && input.correctedValue.trim() !== invoice.paymentIssue.invalidValue,
+      );
+      if (!changedAccount && !changedField) {
+        throw new Error("请修改错误字段或选择其他已验证收款账户后再提交");
+      }
+      if (changedAccount) {
+        const account = this.profileData.payoutAccounts.find(
+          (candidate) => candidate.id === input.payoutAccountId,
+        );
+        if (!account || !isPayoutAccountUsable(account)) {
+          throw new Error("新收款账户必须已通过验证且处于可用状态");
+        }
+        invoice.payoutAccountId = account.id;
+      }
+      const occurredAt = new Date().toISOString();
+      if (invoice.paymentIssue) invoice.paymentIssue.resolvedAt = occurredAt;
+      invoice.paymentRecoveryStatus = "PENDING_FINANCE_CONFIRMATION";
+      this.recordInvoiceOperation(
+        invoice,
+        "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED",
+        "收款资料已提交复核",
+        input.submittedBy,
+      );
+      this.persistInvoices();
+      return { data: structuredClone(invoice), message: "收款资料已提交复核" };
     },
   };
 
@@ -1559,6 +1882,52 @@ export class MockApiAdapter implements Services {
   };
 
   notifications: NotificationService = {
+    list: async (userId = PRIMARY_CREATOR_ID) => {
+      await wait(60);
+      return {
+        data: userId === PRIMARY_CREATOR_ID
+          ? structuredClone(this.creatorNotificationData)
+          : [],
+      };
+    },
+    markRead: async (id, userId = PRIMARY_CREATOR_ID) => {
+      await wait(40);
+      if (userId !== PRIMARY_CREATOR_ID) throw new Error("通知不存在");
+      const item = this.creatorNotificationData.find((candidate) => candidate.id === id);
+      if (!item) throw new Error("通知不存在");
+      item.read = true;
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(
+          CREATOR_NOTIFICATION_STORAGE_KEY,
+          JSON.stringify(this.creatorNotificationData),
+        );
+      }
+      return { data: structuredClone(item) };
+    },
+    markAllRead: async (userId = PRIMARY_CREATOR_ID) => {
+      await wait(40);
+      if (userId === PRIMARY_CREATOR_ID) {
+        this.creatorNotificationData.forEach((item) => { item.read = true; });
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(
+            CREATOR_NOTIFICATION_STORAGE_KEY,
+            JSON.stringify(this.creatorNotificationData),
+          );
+        }
+      }
+      return { data: structuredClone(this.creatorNotificationData) };
+    },
+    getUnreadCount: async (userId = PRIMARY_CREATOR_ID) => {
+      await wait(20);
+      return {
+        data: userId === PRIMARY_CREATOR_ID
+          ? this.creatorNotificationData.filter((item) => !item.read).length
+          : 0,
+      };
+    },
+  };
+
+  adminNotifications: AdminNotificationService = {
     list: async (userId) => {
       await wait(100);
       return { data: adminStore.listNotifications(userId) };

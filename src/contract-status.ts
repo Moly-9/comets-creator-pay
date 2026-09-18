@@ -1,7 +1,13 @@
 import type { Contract } from "./types";
 
 export const contractStatusLabel: Record<Contract["status"], string> = {
-  未请款: "未付款",
-  请款中: "付款中",
-  已付款: "已付款",
+  PENDING_SIGNATURE: "待签署",
+  ACTIVE: "执行中",
+  EXPIRED: "已过期",
+};
+
+export const contractStatusTone: Record<Contract["status"], string> = {
+  PENDING_SIGNATURE: "purple",
+  ACTIVE: "blue",
+  EXPIRED: "neutral",
 };

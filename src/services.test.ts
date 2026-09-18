@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { contracts, initialProfile, invoices, requests } from "./data";
 import {
   ADMIN_DEMO_CREDENTIALS,
@@ -14,8 +14,6 @@ import {
 import { contractStatusLabel } from "./contract-status";
 import {
   buildLinkedRequestProjects,
-  buildTopbarNotifications,
-  deriveContractStatus,
   filterInvoiceList,
   normalizeProjectMatchKey,
   shouldShowInvoicePreSigningControls,
@@ -23,6 +21,13 @@ import {
   validateRegistration,
   validateSocialVerification,
 } from "./App";
+import {
+  buildCreatorNotifications,
+  buildCreatorTasks,
+  invoiceInternalIdOf,
+  invoiceNumberOf,
+  migrateInvoice,
+} from "./creator-workflow";
 import {
   buildAirwallexMockSchema,
   buildProfileSupplementalFields,
@@ -35,6 +40,7 @@ import {
   MockApiAdapter,
   normalizeAirwallexFormSchema,
   normalizeAirwallexSchemaValue,
+  payoutAccountPaymentDetails,
   reconcileAirwallexSchemaValues,
   sanitizeEnglishAccountName,
   summarizeAmountsByCurrency,
@@ -42,6 +48,10 @@ import {
   validateAirwallexSchemaValues,
   validateRequiredProfileFields,
 } from "./services";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("administrator list pagination", () => {
   const items = Array.from({ length: 135 }, (_, index) => index + 1);
@@ -80,11 +90,11 @@ describe("administrator list pagination", () => {
 });
 
 describe("contract status display labels", () => {
-  it("renames contract fields without changing their internal status keys", () => {
+  it("maps stable lifecycle keys to creator-facing labels", () => {
     expect(contractStatusLabel).toEqual({
-      未请款: "未付款",
-      请款中: "付款中",
-      已付款: "已付款",
+      PENDING_SIGNATURE: "待签署",
+      ACTIVE: "执行中",
+      EXPIRED: "已过期",
     });
   });
 });
@@ -351,7 +361,6 @@ describe("external business data adapter contract", () => {
 
     expect(contractOnlyRecords).toHaveLength(6);
     for (const contract of contractOnlyRecords) {
-      expect(contract.record.status).toBe("未请款");
       expect(
         aggregate.requests.some(
           (request) =>
@@ -372,7 +381,7 @@ describe("external business data adapter contract", () => {
       resourceType: "CONTRACT" as const,
       version: 1,
       occurredAt: "2026-08-02T10:00:00+08:00",
-      payload: { projectName: "外部同步项目" },
+      payload: { projectName: "外部同步项目", status: "PENDING_SIGNATURE" },
     };
 
     expect(store.upsertExternalEvent(event)).toEqual({
@@ -429,6 +438,7 @@ describe("external business data adapter contract", () => {
         projectName: "Creator External Campaign",
         brand: "COMETS Demo",
         amount: "USD 1,500",
+        status: "ACTIVE",
       },
     });
     store.upsertExternalEvent({
@@ -474,6 +484,7 @@ describe("external business data adapter contract", () => {
         projectName: "管理员聚合项目",
         brand: "COMETS Demo",
         amount: "USD 1,800",
+        status: "ACTIVE",
       },
     });
     store.upsertExternalEvent({
@@ -565,6 +576,7 @@ describe("external business data adapter contract", () => {
         projectName: "尚未请款项目",
         brand: "COMETS Demo",
         amount: "EUR 900",
+        status: "PENDING_SIGNATURE",
       },
     });
 
@@ -610,7 +622,9 @@ describe("linked request projects", () => {
 
   it("excludes contracts that have not created an Invoice", () => {
     const result = buildLinkedRequestProjects(requests, contracts, invoices);
-    const unrequestedContracts = contracts.filter((contract) => contract.status === "未请款");
+    const unrequestedContracts = contracts.filter((contract) =>
+      !invoices.some((invoice) => invoice.projectId === contract.projectId),
+    );
 
     expect(unrequestedContracts).toHaveLength(3);
     expect(unrequestedContracts.every((contract) =>
@@ -689,28 +703,22 @@ describe("request filtering", () => {
 });
 
 describe("contract lifecycle data", () => {
-  it("keeps unrequested contracts outside the Invoice project set", () => {
+  it("keeps contract lifecycle independent from the Invoice project set", () => {
     const invoiceProjects = new Set(invoices.map((invoice) => invoice.projectName));
     const contractProjects = new Set(contracts.map((contract) => contract.projectName));
 
     expect(contracts).toHaveLength(8);
     expect(invoices).toHaveLength(5);
     expect([...invoiceProjects].every((project) => contractProjects.has(project))).toBe(true);
-    expect(contracts.filter((contract) => contract.status === "未请款")).toHaveLength(3);
-    expect(contracts.filter((contract) => contract.status === "请款中")).toHaveLength(4);
-    expect(contracts.filter((contract) => contract.status === "已付款")).toHaveLength(1);
+    expect(contracts.filter((contract) => contract.status === "PENDING_SIGNATURE")).toHaveLength(2);
+    expect(contracts.filter((contract) => contract.status === "ACTIVE")).toHaveLength(3);
+    expect(contracts.filter((contract) => contract.status === "EXPIRED")).toHaveLength(3);
     expect(new Set(contracts.map((contract) => contract.id)).size).toBe(8);
   });
 
-  it("derives contract status from its one-to-one Invoice", () => {
-    expect(deriveContractStatus("DRAFT_SIGNATURE")).toBe("请款中");
-    expect(deriveContractStatus("PENDING_REVIEW")).toBe("请款中");
-    expect(deriveContractStatus("APPROVED")).toBe("请款中");
-    expect(deriveContractStatus("PAYMENT_FAILED")).toBe("请款中");
-    expect(deriveContractStatus("PAID")).toBe("已付款");
-
+  it("does not rewrite contract lifecycle from its one-to-one Invoice", () => {
     const linked = buildLinkedRequestProjects(requests, contracts, invoices);
-    expect(linked.every((item) => item.contract.status === deriveContractStatus(item.invoice.status))).toBe(true);
+    expect(linked.every((item) => item.contract.status === contracts.find((contract) => contract.id === item.contract.id)?.status)).toBe(true);
   });
 
   it("keeps Invoice, request project, and contract ownership one-to-one", () => {
@@ -738,14 +746,14 @@ describe("contract lifecycle data", () => {
     }
   });
 
-  it("matches each contract to an Invoice by exact project name and brand", () => {
+  it("matches each linked contract to an Invoice by exact project name and brand", () => {
     for (const contract of contracts) {
       const matches = invoices.filter(
         (invoice) =>
           invoice.projectName === contract.projectName &&
           invoice.brand === contract.brand,
       );
-      if (contract.status === "未请款") {
+      if (!matches.length) {
         expect(matches).toHaveLength(0);
       } else {
         expect(matches).toHaveLength(1);
@@ -788,56 +796,52 @@ describe("invoice ordering", () => {
     expect(compareInvoicePaymentDetails({ account_number: "wrong" }, account).matches).toBe(false);
   });
 
-  it("uploads an invoice as pending confirmation with OCR data and history", async () => {
+  it("uploads a system-issued external Invoice task and keeps its stable identifiers", async () => {
     const adapter = new MockApiAdapter();
-    const contract = contracts.find((item) => item.status === "未请款")!;
     const account = initialProfile.payoutAccounts[0];
-    const result = await adapter.invoices.upload({
-      projectId: contract.projectId,
-      projectName: contract.projectName,
-      brand: contract.brand,
-      amount: contract.amount,
+    const result = await adapter.invoices.uploadExternal({
+      invoiceId: "invoice-creator-001-external-003",
       payoutAccountId: account.id,
-      invoiceType: "EXTERNAL_CONTRACT",
       file: { id: "file-1", name: "invoice.pdf", mimeType: "application/pdf", size: 1024, previewUrl: "data:application/pdf;base64,AA==" },
       extractedData: {
         invoiceFrom: initialProfile.legalName,
         billTo: "COMETS INTERNATIONAL LIMITED",
         invoiceDate: "2026-08-21",
-        currency: "EUR",
-        total: "8500",
-        paymentDetails: { account_name: account.accountHolder },
+        currency: "USD",
+        total: "3240",
+        paymentDetails: payoutAccountPaymentDetails(account),
         invoiceFromMatchesProfile: true,
         billToMatchesComets: true,
       },
     });
-    expect(result.data.id).toMatch(/^INV-20260821-\d{5}$/);
+    expect(result.data.invoiceId).toBe("invoice-creator-001-external-003");
+    expect(result.data.invoiceNumber).toBe("INV-20260718-00001");
     expect(result.data.status).toBe("PENDING_CONFIRMATION");
-    expect(result.data.processHistory?.[0]).toMatchObject({ label: "上传待确认", actor: "达人" });
+    expect(result.data.documentState).toEqual({ kind: "EXTERNAL", status: "WAITING_CONFIRMATION" });
+    expect(result.data.operationHistory?.map((event) => event.type)).toEqual(
+      expect.arrayContaining(["EXTERNAL_FILE_UPLOADED", "EXTERNAL_RECOGNIZED"]),
+    );
   });
 
-  it("builds actionable topbar notifications from current Invoice states", () => {
-    const notifications = buildTopbarNotifications(invoices);
+  it("builds persisted notification models without project or execution identifiers", () => {
+    const notifications = buildCreatorNotifications(contracts, invoices);
 
     expect(notifications.map((item) => item.title)).toEqual(
       expect.arrayContaining([
-        "付款信息待修复",
-        "Invoice 待签署",
-        "Invoice 已提交审核",
-        "款项已完成",
+        "Invoice INV-20260727-00001 等待签署",
+        "Invoice INV-20260718-00001 等待上传",
+        "Invoice INV-20260728-00001 付款失败，请修正收款信息",
+        "Invoice INV-20260625-00001 已完成付款",
       ]),
     );
-    expect(
-      notifications.every((item) => item.to.startsWith("/invoices/")),
-    ).toBe(true);
+    expect(notifications.every((item) => item.deepLink.startsWith("/"))).toBe(true);
+    expect(JSON.stringify(notifications)).not.toMatch(/七月联名|夏季家居|Payment Order|Payout ID|Transfer ID/);
   });
 
-  it("fuzzy-searches only invoice IDs and projects, then combines filters", () => {
+  it("searches only by Invoice number and combines legacy status filters", () => {
     expect(filterInvoiceList(invoices, "260728", "ALL")).toHaveLength(1);
-    expect(filterInvoiceList(invoices, "夏季家居", "ALL")[0]?.id).toBe(
-      "INV-20260727-00001",
-    );
-    expect(filterInvoiceList(invoices, "七月联名", "PAYMENT_FAILED", "Airwallex")[0]?.id).toBe(
+    expect(filterInvoiceList(invoices, "夏季家居", "ALL")).toHaveLength(0);
+    expect(filterInvoiceList(invoices, "20260728", "PAYMENT_FAILED", "Airwallex")[0]?.id).toBe(
       "INV-20260728-00001",
     );
     expect(filterInvoiceList(invoices, "Mellow Home", "ALL")).toHaveLength(0);
@@ -920,83 +924,227 @@ describe("invoice ordering", () => {
     expect(invoices).toEqual(original);
   });
 
-  it("blocks payment-correction review before payout information is repaired", async () => {
+  it("requires a failed payout value to actually change", async () => {
     const adapter = new MockApiAdapter();
     await expect(
-      adapter.invoices.transition("INV-20260728-00001", "PENDING_REVIEW"),
-    ).rejects.toThrow("请先修改错误的付款信息并完成校验");
-  });
-
-  it("requires the failed payout value to actually change", async () => {
-    const adapter = new MockApiAdapter();
-    await expect(
-      adapter.invoices.resolvePaymentIssue(
+      adapter.payments.submitAccountCorrection(
         "INV-20260728-00001",
-        "FR7630006000011234567890189",
+        {
+          fieldKey: "account_number",
+          correctedValue: "FR7630006000011234567890189",
+          submittedBy: "CREATOR-001",
+        },
       ),
-    ).rejects.toThrow("请修改银行账号");
+    ).rejects.toThrow("请修改错误字段或选择其他已验证收款账户");
   });
 
-  it("resolves a payout issue and restarts review from document review", async () => {
+  it("submits payment account correction without changing the approved document state", async () => {
     const adapter = new MockApiAdapter();
-    const repaired = await adapter.invoices.resolvePaymentIssue(
+    const before = await adapter.invoices.list();
+    const result = await adapter.payments.submitAccountCorrection(
       "INV-20260728-00001",
-      "FR7630006000011234567890197",
+      {
+        payoutAccountId: "payout-awx-jp-backup",
+        submittedBy: "CREATOR-001",
+      },
     );
-    expect(repaired.data.paymentIssue?.resolvedAt).toBeTruthy();
-
-    const result = await adapter.invoices.transition(
-      "INV-20260728-00001",
-      "PENDING_REVIEW",
-    );
-    expect(result.data.status).toBe("PENDING_REVIEW");
-    expect(result.data.rejectedReason).toBeUndefined();
+    const after = await adapter.invoices.list();
+    expect(result.data.documentState).toEqual({ kind: "EXTERNAL", status: "APPROVED" });
+    expect(result.data.paymentStatus).toBe("FAILED");
+    expect(result.data.paymentRecoveryStatus).toBe("PENDING_FINANCE_CONFIRMATION");
     expect(result.data.paymentIssue?.resolvedAt).toBeTruthy();
-    expect(result.data.paymentIssue?.resubmittedAt).toBeTruthy();
+    expect(after.data).toHaveLength(before.data.length);
+    expect(after.data.filter((item) => invoiceInternalIdOf(item) === invoiceInternalIdOf(result.data))).toHaveLength(1);
   });
 
-  it("does not allow a repaired payment failure to skip document review", async () => {
+  it("persists an internal signature, enters review, and rejects a duplicate signature", async () => {
     const adapter = new MockApiAdapter();
-    await adapter.invoices.resolvePaymentIssue(
-      "INV-20260728-00001",
-      "FR7630006000011234567890197",
-    );
-
-    await expect(
-      adapter.invoices.transition("INV-20260728-00001", "APPROVED"),
-    ).rejects.toThrow("付款信息修正后必须先提交资料审核");
-  });
-
-  it("persists a handwritten signature and advances the invoice to review", async () => {
-    const adapter = new MockApiAdapter();
-    const result = await adapter.invoices.sign("INV-20260727-00001", {
-      method: "DRAWN",
+    const signature = {
+      method: "DRAWN" as const,
       dataUrl: "data:image/png;base64,c2lnbmF0dXJl",
       signerName: "Léa Martin",
       signedAt: "2026-07-27T14:45:00.000Z",
-    });
-
-    expect(result.data.status).toBe("PENDING_REVIEW");
-    expect(result.data.signature).toMatchObject({
-      method: "DRAWN",
-      signerName: "Léa Martin",
-    });
+    };
+    const result = await adapter.invoices.signInternalInvoice("invoice-creator-001-internal-001", signature);
+    expect(result.data.documentState).toEqual({ kind: "INTERNAL", status: "UNDER_REVIEW" });
+    expect(result.data.paymentStatus).toBe("WAITING_PAYMENT");
+    expect(result.data.operationHistory?.at(-1)?.type).toBe("INTERNAL_SIGNED");
+    await expect(
+      adapter.invoices.signInternalInvoice("invoice-creator-001-internal-001", signature),
+    ).rejects.toThrow("只有待签署的内部 Invoice 可以签署");
   });
 
-  it("persists a generated electronic signature and advances the invoice to review", async () => {
+  it("persists creator feedback and moves the internal Invoice into feedback processing", async () => {
     const adapter = new MockApiAdapter();
-    const result = await adapter.invoices.sign("INV-20260727-00001", {
-      method: "GENERATED",
-      dataUrl: "data:image/png;base64,ZWxlY3Ryb25pYy1zaWduYXR1cmU=",
-      signerName: "Léa Martin",
-      signedAt: "2026-07-28T10:30:00.000Z",
+    const result = await adapter.invoices.submitFeedback("invoice-creator-001-internal-001", {
+      issueType: "金额或币种有误",
+      details: "币种应为 EUR",
+      submittedBy: "CREATOR-001",
     });
+    expect(result.data.documentState).toEqual({ kind: "INTERNAL", status: "CREATOR_FEEDBACK" });
+    expect(result.data.feedbackRecords?.at(-1)).toMatchObject({
+      issueType: "金额或币种有误",
+      invoiceId: "invoice-creator-001-internal-001",
+      submittedBy: "CREATOR-001",
+    });
+    expect(result.data.operationHistory?.at(-1)?.type).toBe("FEEDBACK_SUBMITTED");
+  });
 
-    expect(result.data.status).toBe("PENDING_REVIEW");
-    expect(result.data.signature).toMatchObject({
-      method: "GENERATED",
-      signerName: "Léa Martin",
+  it("uploads and confirms an external Invoice through explicit commands", async () => {
+    const adapter = new MockApiAdapter();
+    const account = initialProfile.payoutAccounts[0];
+    const uploaded = await adapter.invoices.uploadExternal({
+      invoiceId: "invoice-creator-001-external-003",
+      payoutAccountId: account.id,
+      file: { id: "external-v1", name: "invoice.pdf", mimeType: "application/pdf", size: 2048 },
+      extractedData: {
+        invoiceFrom: initialProfile.legalName,
+        billTo: "COMETS INTERNATIONAL LIMITED",
+        invoiceDate: "2026-07-18",
+        currency: "USD",
+        total: "3240",
+        paymentDetails: payoutAccountPaymentDetails(account),
+        invoiceFromMatchesProfile: true,
+        billToMatchesComets: true,
+      },
     });
+    expect(uploaded.data.documentState).toEqual({ kind: "EXTERNAL", status: "WAITING_CONFIRMATION" });
+    const confirmed = await adapter.invoices.confirmExternal("invoice-creator-001-external-003");
+    expect(confirmed.data.documentState).toEqual({ kind: "EXTERNAL", status: "WAITING_MEDIA_REVIEW" });
+    expect(confirmed.data.paymentStatus).toBe("WAITING_PAYMENT");
+  });
+
+  it("distinguishes returned correction from returned re-upload", async () => {
+    const adapter = new MockApiAdapter();
+    const account = initialProfile.payoutAccounts[0];
+    await expect(
+      adapter.invoices.correctExternal("invoice-creator-001-external-004", {
+        invoiceFrom: initialProfile.legalName,
+        billTo: "COMETS INTERNATIONAL LIMITED",
+        invoiceDate: "2026-07-14",
+        currency: "EUR",
+        total: "1850",
+        paymentDetails: payoutAccountPaymentDetails(account),
+        invoiceFromMatchesProfile: true,
+        billToMatchesComets: true,
+      }),
+    ).rejects.toThrow("当前 Invoice 未被退回修改");
+    const reuploaded = await adapter.invoices.resubmitExternal({
+      invoiceId: "invoice-creator-001-external-004",
+      payoutAccountId: account.id,
+      file: { id: "external-v2", name: "invoice-v2.pdf", mimeType: "application/pdf", size: 4096 },
+      extractedData: {
+        invoiceFrom: initialProfile.legalName,
+        billTo: "COMETS INTERNATIONAL LIMITED",
+        invoiceDate: "2026-07-14",
+        currency: "EUR",
+        total: "1850",
+        paymentDetails: payoutAccountPaymentDetails(account),
+        invoiceFromMatchesProfile: true,
+        billToMatchesComets: true,
+      },
+    });
+    expect(reuploaded.data.fileVersions).toHaveLength(2);
+    expect(reuploaded.data.fileVersions?.map((file) => file.id)).toEqual(["invoice-file-external-004-v1", "external-v2"]);
+  });
+});
+
+describe("creator invoice-centric workflow", () => {
+  it("signs a pending contract only once and rejects administrator signing", async () => {
+    const adapter = new MockApiAdapter();
+    await expect(
+      adapter.contracts.signContract("CON-260727-KOL-02", {
+        userId: "ADMIN-001",
+        role: "ADMIN",
+      }),
+    ).rejects.toThrow("管理员只读视图不能替达人签署合同");
+
+    const signed = await adapter.contracts.signContract("CON-260727-KOL-02", {
+      userId: "CREATOR-001",
+      role: "CREATOR",
+    });
+    expect(signed.data.status).toBe("ACTIVE");
+    expect(signed.data.signatureRecord).toMatchObject({ actorRole: "CREATOR" });
+    await expect(
+      adapter.contracts.signContract("CON-260727-KOL-02", {
+        userId: "CREATOR-001",
+        role: "CREATOR",
+      }),
+    ).rejects.toThrow("只有待签署合同可以签署");
+  });
+
+  it("aggregates stable tasks with resource IDs, invoice-number copy, and deep links", () => {
+    const tasks = buildCreatorTasks(contracts, [
+      ...invoices,
+      {
+        ...invoices[0],
+        id: "INV-20260918-00009",
+        invoiceNumber: "INV-20260918-00009",
+        invoiceId: "invoice-processing-demo",
+        documentState: { kind: "INTERNAL", status: "UNDER_REVIEW" },
+        status: "PENDING_REVIEW",
+      },
+    ]);
+    const uploadTask = tasks.find((task) => task.type === "EXTERNAL_INVOICE_UPLOAD");
+    expect(uploadTask).toMatchObject({
+      resourceId: "invoice-creator-001-external-003",
+      resourceNumber: "INV-20260718-00001",
+      deepLink: "/invoices/INV-20260718-00001",
+    });
+    expect(tasks.some((task) => task.group === "TODO")).toBe(true);
+    expect(tasks.some((task) => task.group === "PROCESSING")).toBe(true);
+    expect(tasks.some((task) => task.group === "COMPLETED")).toBe(true);
+    expect(JSON.stringify(tasks)).not.toMatch(/七月联名|夏季家居|Mellow Home|Payment Order|Payout ID|Transfer ID/);
+  });
+
+  it("persists creator notification read state across adapter refreshes", async () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+      },
+    });
+    const firstAdapter = new MockApiAdapter();
+    const firstList = await firstAdapter.notifications.list("CREATOR-001");
+    const target = firstList.data[0];
+    await firstAdapter.notifications.markRead(target.id, "CREATOR-001");
+    expect((await firstAdapter.notifications.getUnreadCount("CREATOR-001")).data).toBe(firstList.data.length - 1);
+
+    const refreshedAdapter = new MockApiAdapter();
+    const refreshed = await refreshedAdapter.notifications.list("CREATOR-001");
+    expect(refreshed.data.find((item) => item.id === target.id)?.read).toBe(true);
+    const allRead = await refreshedAdapter.notifications.markAllRead("CREATOR-001");
+    expect(allRead.data.every((item) => item.read)).toBe(true);
+  });
+
+  it.each([
+    ["PENDING_REVIEW", "UNDER_REVIEW", "WAITING_PAYMENT"],
+    ["APPROVED", "APPROVED", "WAITING_PAYMENT"],
+    ["PAYMENT_FAILED", "APPROVED", "FAILED"],
+    ["PAID", "APPROVED", "PAID"],
+  ] as const)("migrates legacy %s into separated document and payment states", (legacy, documentStatus, paymentStatus) => {
+    const migrated = migrateInvoice({
+      ...invoices[0],
+      invoiceId: undefined,
+      invoiceNumber: undefined,
+      documentState: undefined,
+      paymentStatus: undefined,
+      paymentRecoveryStatus: undefined,
+      status: legacy,
+    });
+    expect(migrated.invoiceId).toBe(`invoice:${invoices[0].id}`);
+    expect(migrated.invoiceNumber).toBe(invoices[0].id);
+    expect(migrated.documentState?.status).toBe(documentStatus);
+    expect(migrated.paymentStatus).toBe(paymentStatus);
+  });
+
+  it("keeps invoiceNumber user-visible while preserving invoiceId for service commands", () => {
+    const invoice = migrateInvoice(invoices[0]);
+    expect(invoiceNumberOf(invoice)).toBe("INV-20260727-00001");
+    expect(invoiceInternalIdOf(invoice)).toBe("invoice-creator-001-internal-001");
+    expect(invoiceNumberOf(invoice)).not.toBe(invoiceInternalIdOf(invoice));
   });
 });
 

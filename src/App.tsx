@@ -87,7 +87,7 @@ import {
   invoices as seedInvoices,
   requests as seedRequests,
 } from "./data";
-import { contractStatusLabel } from "./contract-status";
+import { contractStatusLabel, contractStatusTone } from "./contract-status";
 import {
   isPayoutAccountProcessing,
   isPayoutAccountUsable,
@@ -103,6 +103,19 @@ import {
   syncPayoutAccounts,
   validatePayoutAccountAlias,
 } from "./payout-accounts";
+import {
+  EXTERNAL_COLLECTION_META,
+  INTERNAL_REVIEW_META,
+  PAYMENT_STATUS_META,
+  invoiceInternalIdOf,
+  invoiceNumberOf,
+  invoicePaymentMeta,
+  invoiceReviewFilterValue,
+  invoiceReviewMeta,
+  invoiceTypeOf,
+  migrateInvoice,
+  recoveryStatusIsSubmitted,
+} from "./creator-workflow";
 import {
   AirwallexBeneficiaryValidationError,
   buildProfileSupplementalFields,
@@ -123,11 +136,16 @@ import type {
   AirwallexSchemaCondition,
   Contract,
   CorrectionRequest,
+  CreatorNotification,
+  CreatorTask,
+  ExternalInvoiceUploadInput,
   FileRef,
   Invoice,
+  InvoiceExtractedData,
+  InvoiceFeedbackInput,
   InvoiceSignature,
   InvoiceStatus,
-  InvoiceUploadInput,
+  PaymentAccountCorrectionInput,
   PayoutAccount,
   RequestProject,
   Session,
@@ -195,9 +213,7 @@ export const filterInvoiceList = (
   if (!terms.length) return statusFiltered;
 
   return statusFiltered.filter((invoice) => {
-    const searchable = normalizeInvoiceSearch(
-      [invoice.id, invoice.projectName].join(" "),
-    );
+    const searchable = normalizeInvoiceSearch(invoiceNumberOf(invoice));
     return terms.every((term) =>
       searchable.includes(normalizeInvoiceSearch(term)),
     );
@@ -208,26 +224,9 @@ const CONTRACT_STATUS: Record<
   Contract["status"],
   { tone: string; description: string }
 > = {
-  未请款: { tone: "purple", description: "尚未创建关联 Invoice，当前未进入请款流程" },
-  请款中: { tone: "blue", description: "合同已进入请款流程，等待审核或款项支付" },
-  已付款: { tone: "success", description: "合同款项已完成支付" },
-};
-
-export const deriveContractStatus = (invoiceStatus: InvoiceStatus): Contract["status"] => {
-  if (invoiceStatus === "PAID") return "已付款";
-  return "请款中";
-};
-
-export const syncContractWithInvoices = (
-  contract: Contract,
-  invoices: Invoice[],
-): Contract => {
-  const invoice = invoices.find((item) => (
-    item.projectId === contract.projectId
-    && item.projectName === contract.projectName
-    && item.brand === contract.brand
-  ));
-  return invoice ? { ...contract, status: deriveContractStatus(invoice.status) } : contract;
+  PENDING_SIGNATURE: { tone: contractStatusTone.PENDING_SIGNATURE, description: "合同等待签署，完成签署后进入履约执行阶段" },
+  ACTIVE: { tone: contractStatusTone.ACTIVE, description: "合同已完成签署，当前处于服务履约执行期" },
+  EXPIRED: { tone: contractStatusTone.EXPIRED, description: "合同已完成签署，且约定服务周期已结束" },
 };
 
 export const syncRequestWithInvoices = (
@@ -241,7 +240,6 @@ export const syncRequestWithInvoices = (
     ...request,
     amount: invoice.amount,
     status: invoice.status,
-    contractStatus: deriveContractStatus(invoice.status),
     invoiceStatus: INVOICE_STATUS[invoice.status].label,
     updatedAt: invoice.updatedAt,
     issues: invoice.status === "PAYMENT_FAILED" ? request.issues : [],
@@ -252,16 +250,25 @@ export const syncRequestWithInvoices = (
 interface AppState {
   session: Session | null;
   profile: UserProfile;
+  contracts: Contract[];
   invoices: Invoice[];
+  tasks: CreatorTask[];
+  notifications: CreatorNotification[];
   login(email: string, password: string): Promise<Session>;
   register(name: string, email: string, password: string): Promise<void>;
   completeOnboarding(profile: UserProfile): Promise<void>;
   saveProfile(profile: UserProfile): Promise<void>;
-  uploadInvoice(input: InvoiceUploadInput): Promise<Invoice>;
+  signContract(id: string): Promise<void>;
+  signInternalInvoice(id: string, signature: InvoiceSignature): Promise<void>;
+  submitInvoiceFeedback(id: string, input: InvoiceFeedbackInput): Promise<void>;
+  uploadExternalInvoice(input: ExternalInvoiceUploadInput): Promise<Invoice>;
+  confirmExternalInvoice(id: string): Promise<void>;
+  correctExternalInvoice(id: string, extractedData: InvoiceExtractedData): Promise<void>;
+  resubmitExternalInvoice(input: ExternalInvoiceUploadInput): Promise<Invoice>;
   selectInvoicePayoutAccount(id: string, payoutAccountId: string): Promise<void>;
-  updateInvoice(id: string, status: InvoiceStatus): Promise<void>;
-  resolveInvoicePaymentIssue(id: string, correctedValue: string): Promise<void>;
-  signInvoice(id: string, signature: InvoiceSignature): Promise<void>;
+  submitPaymentAccountCorrection(id: string, input: PaymentAccountCorrectionInput): Promise<void>;
+  markNotificationRead(id: string): Promise<void>;
+  markAllNotificationsRead(): Promise<void>;
   logout(): void;
 }
 
@@ -308,19 +315,49 @@ function AppProvider({ children }: { children: ReactNode }) {
       ? adminStore.getProfile(session.userId) || initialProfile
       : initialProfile,
   );
-  const [invoices, setInvoices] = useState<Invoice[]>(() =>
+  const [contracts, setContracts] = useState<Contract[]>(() =>
     session?.role === "CREATOR" && session.userId === PRIMARY_CREATOR_ID
-      ? sortInvoices(seedInvoices)
+      ? seedContracts
       : [],
   );
+  const [invoices, setInvoices] = useState<Invoice[]>(() =>
+    session?.role === "CREATOR" && session.userId === PRIMARY_CREATOR_ID
+      ? sortInvoices(seedInvoices.map(migrateInvoice))
+      : [],
+  );
+  const [tasks, setTasks] = useState<CreatorTask[]>([]);
+  const [notifications, setNotifications] = useState<CreatorNotification[]>([]);
+
+  const refreshWorkflowCollections = async (userId: string) => {
+    const [taskResult, notificationResult] = await Promise.all([
+      services.tasks.list(userId),
+      services.notifications.list(userId),
+    ]);
+    setTasks(taskResult.data);
+    setNotifications(notificationResult.data);
+  };
+
+  const replaceInvoice = (next: Invoice) => {
+    setInvoices((items) => sortInvoices(items.map((item) => (
+      invoiceInternalIdOf(item) === invoiceInternalIdOf(next) ? next : item
+    ))));
+  };
 
   useEffect(() => {
     if (session?.role === "CREATOR") {
-      services.invoices
-        .list(session.userId)
-        .then((result) => setInvoices(result.data));
+      Promise.all([
+        services.invoices.list(session.userId),
+        services.contracts.list(session.userId),
+      ]).then(([invoiceResult, contractResult]) => {
+        setInvoices(invoiceResult.data);
+        setContracts(contractResult.data);
+      });
+      void refreshWorkflowCollections(session.userId);
     } else {
       setInvoices([]);
+      setContracts([]);
+      setTasks([]);
+      setNotifications([]);
     }
     if (session?.role === "CREATOR") {
       services.profile
@@ -358,7 +395,10 @@ function AppProvider({ children }: { children: ReactNode }) {
   const value: AppState = {
     session,
     profile,
+    contracts,
     invoices,
+    tasks,
+    notifications,
     login: async (email, password) => {
       const result = await services.auth.login(email, password);
       if (result.data.role === "CREATOR") {
@@ -398,43 +438,71 @@ function AppProvider({ children }: { children: ReactNode }) {
       const result = await services.profile.save(nextProfile);
       setProfile(result.data);
     },
-    uploadInvoice: async (input) => {
-      const result = await services.invoices.upload(input);
-      setInvoices((items) => sortInvoices([result.data, ...items]));
+    signContract: async (id) => {
+      if (!session) throw new Error("登录会话已失效");
+      const result = await services.contracts.signContract(id, session);
+      setContracts((items) => items.map((item) => item.id === id ? result.data : item));
+      await refreshWorkflowCollections(session.userId);
+    },
+    signInternalInvoice: async (id, signature) => {
+      if (
+        session?.role !== "CREATOR" ||
+        !session.permissions.includes("INVOICE_SIGN")
+      ) throw new Error("当前账号没有 Invoice 签署权限");
+      if (session.verificationStatus !== "VERIFIED") {
+        throw new Error("完成社媒认证后才能签署 Invoice");
+      }
+      const result = await services.invoices.signInternalInvoice(id, signature);
+      replaceInvoice(result.data);
+      await refreshWorkflowCollections(session.userId);
+    },
+    submitInvoiceFeedback: async (id, input) => {
+      if (!session) throw new Error("登录会话已失效");
+      const result = await services.invoices.submitFeedback(id, input);
+      replaceInvoice(result.data);
+      await refreshWorkflowCollections(session.userId);
+    },
+    uploadExternalInvoice: async (input) => {
+      const result = await services.invoices.uploadExternal(input);
+      replaceInvoice(result.data);
+      if (session) await refreshWorkflowCollections(session.userId);
+      return result.data;
+    },
+    confirmExternalInvoice: async (id) => {
+      const result = await services.invoices.confirmExternal(id);
+      replaceInvoice(result.data);
+      if (session) await refreshWorkflowCollections(session.userId);
+    },
+    correctExternalInvoice: async (id, extractedData) => {
+      const result = await services.invoices.correctExternal(id, extractedData);
+      replaceInvoice(result.data);
+      if (session) await refreshWorkflowCollections(session.userId);
+    },
+    resubmitExternalInvoice: async (input) => {
+      const result = await services.invoices.resubmitExternal(input);
+      replaceInvoice(result.data);
+      if (session) await refreshWorkflowCollections(session.userId);
       return result.data;
     },
     selectInvoicePayoutAccount: async (id, payoutAccountId) => {
       const result = await services.invoices.selectPayoutAccount(id, payoutAccountId);
-      setInvoices((items) =>
-        sortInvoices(items.map((item) => (item.id === id ? result.data : item))),
-      );
+      replaceInvoice(result.data);
+      if (session) await refreshWorkflowCollections(session.userId);
     },
-    updateInvoice: async (id, status) => {
-      const result = await services.invoices.transition(id, status);
-      setInvoices((items) =>
-        sortInvoices(items.map((item) => (item.id === id ? result.data : item))),
-      );
+    submitPaymentAccountCorrection: async (id, input) => {
+      const result = await services.payments.submitAccountCorrection(id, input);
+      replaceInvoice(result.data);
+      if (session) await refreshWorkflowCollections(session.userId);
     },
-    resolveInvoicePaymentIssue: async (id, correctedValue) => {
-      const result = await services.invoices.resolvePaymentIssue(id, correctedValue);
-      setInvoices((items) =>
-        sortInvoices(items.map((item) => (item.id === id ? result.data : item))),
-      );
+    markNotificationRead: async (id) => {
+      if (!session) return;
+      const result = await services.notifications.markRead(id, session.userId);
+      setNotifications((items) => items.map((item) => item.id === id ? result.data : item));
     },
-    signInvoice: async (id, signature) => {
-      if (
-        session?.role !== "CREATOR" ||
-        !session.permissions.includes("INVOICE_SIGN")
-      ) {
-        throw new Error("当前账号没有 Invoice 签署权限");
-      }
-      if (session.verificationStatus !== "VERIFIED") {
-        throw new Error("完成社媒认证后才能签署 Invoice");
-      }
-      const result = await services.invoices.sign(id, signature);
-      setInvoices((items) =>
-        sortInvoices(items.map((item) => (item.id === id ? result.data : item))),
-      );
+    markAllNotificationsRead: async () => {
+      if (!session) return;
+      const result = await services.notifications.markAllRead(session.userId);
+      setNotifications(result.data);
     },
     logout: () => {
       if (session) void services.auth.logout(session.sessionId);
@@ -1356,9 +1424,6 @@ const navItems = [
   { to: "/profile", label: "个人档案", icon: IdCard },
 ];
 
-const TOPBAR_NOTIFICATION_READ_STORAGE_KEY =
-  "comets-creator-notification-read-v1";
-
 const creatorGuideSteps = [
   {
     title: "查看请款项目",
@@ -1427,85 +1492,14 @@ const creatorGuideShortcuts = [
   },
 ];
 
-type TopbarNotificationTone = "purple" | "amber" | "danger" | "success";
-
-export interface TopbarNotificationItem {
-  id: string;
-  title: string;
-  description: string;
-  time: string;
-  to: string;
-  tone: TopbarNotificationTone;
-}
-
-export function buildTopbarNotifications(
-  invoices: Invoice[],
-): TopbarNotificationItem[] {
-  const paymentFailed = invoices.find(
-    (invoice) => invoice.status === "PAYMENT_FAILED",
-  );
-  const unsigned = invoices.find(
-    (invoice) => invoice.status === "DRAFT_SIGNATURE",
-  );
-  const pendingReview = invoices.find(
-    (invoice) => invoice.status === "PENDING_REVIEW",
-  );
-  const paid = invoices.find((invoice) => invoice.status === "PAID");
-
-  return [
-    ...(paymentFailed
-      ? [
-          {
-            id: `payment-failed-${paymentFailed.id}`,
-            title: "付款信息待修复",
-            description: `${paymentFailed.id} 付款失败，请核对并修改收款信息。`,
-            time: "刚刚",
-            to: `/invoices/${paymentFailed.id}`,
-            tone: "danger" as const,
-          },
-        ]
-      : []),
-    ...(unsigned
-      ? [
-          {
-            id: `invoice-sign-${unsigned.id}`,
-            title: "Invoice 待签署",
-            description: `${unsigned.id} 等待你的签署，签署后将进入审核。`,
-            time: "今天 14:30",
-            to: `/invoices/${unsigned.id}`,
-            tone: "amber" as const,
-          },
-        ]
-      : []),
-    ...(pendingReview
-      ? [
-          {
-            id: `invoice-review-${pendingReview.id}`,
-            title: "Invoice 已提交审核",
-            description: `${pendingReview.id} 已进入审核流程，可查看最新进度。`,
-            time: "今天 10:12",
-            to: `/invoices/${pendingReview.id}`,
-            tone: "purple" as const,
-          },
-        ]
-      : []),
-    ...(paid
-      ? [
-          {
-            id: `invoice-paid-${paid.id}`,
-            title: "款项已完成",
-            description: `${paid.id} 已完成付款，可查看付款参考号。`,
-            time: "07-16 14:32",
-            to: `/invoices/${paid.id}`,
-            tone: "success" as const,
-          },
-        ]
-      : []),
-  ];
-}
-
 function AppLayout() {
-  const { profile, invoices, logout } = useApp();
+  const {
+    profile,
+    notifications,
+    markNotificationRead,
+    markAllNotificationsRead,
+    logout,
+  } = useApp();
   const navigate = useNavigate();
   const location = useLocation();
   const accessDenied = (
@@ -1515,30 +1509,8 @@ function AppLayout() {
   const [activeTopbarMenu, setActiveTopbarMenu] = useState<
     "help" | "notifications" | null
   >(null);
-  const [readNotificationIds, setReadNotificationIds] = useState<string[]>(
-    () => {
-      try {
-        const stored = JSON.parse(
-          window.localStorage.getItem(
-            TOPBAR_NOTIFICATION_READ_STORAGE_KEY,
-          ) || "[]",
-        );
-        return Array.isArray(stored)
-          ? stored.filter((item): item is string => typeof item === "string")
-          : [];
-      } catch {
-        return [];
-      }
-    },
-  );
   const topbarActionsRef = useRef<HTMLDivElement>(null);
-  const notifications = useMemo(
-    () => buildTopbarNotifications(invoices),
-    [invoices],
-  );
-  const unreadCount = notifications.filter(
-    (item) => !readNotificationIds.includes(item.id),
-  ).length;
+  const unreadCount = notifications.filter((item) => !item.read).length;
 
   useEffect(() => {
     if (!activeTopbarMenu) return;
@@ -1570,28 +1542,10 @@ function AppLayout() {
     navigate("/login");
   };
 
-  const persistReadNotificationIds = (ids: string[]) => {
-    const uniqueIds = [...new Set(ids)];
-    setReadNotificationIds(uniqueIds);
-    window.localStorage.setItem(
-      TOPBAR_NOTIFICATION_READ_STORAGE_KEY,
-      JSON.stringify(uniqueIds),
-    );
-  };
-
-  const markNotificationRead = (id: string) => {
-    if (readNotificationIds.includes(id)) return;
-    persistReadNotificationIds([...readNotificationIds, id]);
-  };
-
-  const markAllNotificationsRead = () => {
-    persistReadNotificationIds(notifications.map((item) => item.id));
-  };
-
-  const openNotification = (item: TopbarNotificationItem) => {
-    markNotificationRead(item.id);
+  const openNotification = async (item: CreatorNotification) => {
+    if (!item.read) await markNotificationRead(item.id);
     setActiveTopbarMenu(null);
-    navigate(item.to);
+    navigate(item.deepLink);
   };
 
   const openGuideSection = (to: string) => {
@@ -1705,7 +1659,7 @@ function AppLayout() {
                     <div>
                       <strong>签署前请再次核对</strong>
                       <p>
-                        Invoice 项目、金额、币种和收款信息确认无误后再签署；收款资料变化时请先更新个人档案。
+                        Invoice 金额、币种和收款信息确认无误后再签署；收款资料变化时请先更新个人档案。
                       </p>
                     </div>
                   </aside>
@@ -1759,7 +1713,7 @@ function AppLayout() {
                   <button
                     type="button"
                     disabled={!unreadCount}
-                    onClick={markAllNotificationsRead}
+                    onClick={() => void markAllNotificationsRead()}
                   >
                     全部已读
                   </button>
@@ -1767,7 +1721,7 @@ function AppLayout() {
                 <div className="notification-list">
                   {notifications.length ? (
                     notifications.map((item) => {
-                      const isRead = readNotificationIds.includes(item.id);
+                      const isRead = item.read;
                       const NotificationIcon =
                         item.tone === "danger"
                           ? Info
@@ -1791,9 +1745,9 @@ function AppLayout() {
                           <span className="notification-item-copy">
                             <span>
                               <strong>{item.title}</strong>
-                              <small>{item.time}</small>
+                              <small>{new Date(item.createdAt).toLocaleString("zh-CN", { hour12: false })}</small>
                             </span>
-                            <span>{item.description}</span>
+                            <span>{item.message}</span>
                           </span>
                           {!isRead ? (
                             <i
@@ -1898,7 +1852,6 @@ export function buildLinkedRequestProjects(
     const projectKey = normalizeProjectMatchKey(invoice.projectName);
     const baseContract = contractsByProject.get(projectKey);
     if (!baseContract) return [];
-    const contract = syncContractWithInvoices(baseContract, [invoice]);
     const request = requestsByProject.get(projectKey);
     return [{
       id: request?.id || invoice.projectId,
@@ -1907,7 +1860,7 @@ export function buildLinkedRequestProjects(
       amount: invoice.amount,
       updatedAt: invoice.updatedAt,
       request,
-      contract,
+      contract: baseContract,
       invoice,
     }];
   });
@@ -2021,35 +1974,29 @@ function RequestMiniProgress({ status }: { status: InvoiceStatus }) {
 }
 
 function RequestListPage() {
-  const { invoices, profile } = useApp();
+  const { invoices, profile, tasks } = useApp();
   const [query, setQuery] = useState("");
-  const [status, setStatus] = useState<InvoiceStatus | "ALL">("ALL");
-  const homeItems = useMemo(
-    () => buildLinkedRequestProjects(seedRequests, seedContracts, invoices),
-    [invoices],
+  const [group, setGroup] = useState<CreatorTask["group"] | "ALL">("ALL");
+  const normalizedQuery = normalizeInvoiceSearch(query);
+  const invoiceGroup = (invoice: Invoice): CreatorTask["group"] => {
+    const task = tasks.find((item) => item.resourceId === invoiceInternalIdOf(invoice));
+    return task?.group || (invoice.paymentStatus === "PAID" ? "COMPLETED" : "PROCESSING");
+  };
+  const filtered = useMemo(
+    () => invoices.map(migrateInvoice).filter((invoice) => {
+      const matchesGroup = group === "ALL" || invoiceGroup(invoice) === group;
+      const matchesQuery = !normalizedQuery || normalizeInvoiceSearch(invoiceNumberOf(invoice)).includes(normalizedQuery);
+      return matchesGroup && matchesQuery;
+    }),
+    [group, invoices, normalizedQuery, tasks],
   );
-  const normalizedQuery = normalizeProjectMatchKey(query);
-  const filtered = useMemo(() => homeItems.filter((item) => {
-    const matchesStatus = status === "ALL" || item.invoice.status === status;
-    const matchesQuery = !normalizedQuery || normalizeProjectMatchKey(
-      `${item.projectName} ${item.brand} ${item.id} ${item.contract.id} ${item.invoice.id}`,
-    ).includes(normalizedQuery);
-    return matchesStatus && matchesQuery;
-  }), [homeItems, normalizedQuery, status]);
-  const statusOptions: Array<InvoiceStatus | "ALL"> = [
-    "ALL",
-    "DRAFT_SIGNATURE",
-    "PENDING_REVIEW",
-    "APPROVED",
-    "PAYMENT_FAILED",
-    "PAID",
-  ];
-  const linkedInvoices = homeItems.map((item) => item.invoice);
-  const unsignedInvoices = linkedInvoices.filter((invoice) => invoice.status === "DRAFT_SIGNATURE");
-  const paymentIssueInvoice = linkedInvoices.find((invoice) => invoice.status === "PAYMENT_FAILED");
-  const signatureItems = homeItems.filter((item) => item.invoice.status === "DRAFT_SIGNATURE");
-  const processingItems = homeItems.filter((item) => ["PENDING_REVIEW", "APPROVED", "PAYMENT_FAILED"].includes(item.invoice.status));
-  const paidItems = homeItems.filter((item) => item.invoice.status === "PAID");
+  const groupedTasks = (["TODO", "PROCESSING", "COMPLETED"] as const).map((taskGroup) => ({
+    group: taskGroup,
+    items: tasks.filter((task) => task.group === taskGroup),
+  }));
+  const todoInvoices = invoices.map(migrateInvoice).filter((invoice) => invoiceGroup(invoice) === "TODO");
+  const processingInvoices = invoices.map(migrateInvoice).filter((invoice) => invoiceGroup(invoice) === "PROCESSING");
+  const paidInvoices = invoices.map(migrateInvoice).filter((invoice) => invoice.paymentStatus === "PAID");
   const creatorHandle = profile.social.handle.replace(/^@/, "");
 
   return (
@@ -2059,33 +2006,24 @@ function RequestListPage() {
         <p>欢迎回来，@{creatorHandle}</p>
       </header>
 
-      <section className="request-action-panel">
-        <h2>待我处理</h2>
-        <div className="request-action-list">
-          <article>
-            <span className="request-action-icon purple"><ReceiptText size={21} /></span>
+      <section className="request-task-groups" aria-label="收款任务">
+        {groupedTasks.map((section) => (
+          <article className={`request-task-group task-${section.group.toLowerCase()}`} key={section.group}>
+            <header>
+              <h2>{{ TODO: "待我处理", PROCESSING: "处理中", COMPLETED: "已完成" }[section.group]}</h2>
+              <span>{section.items.length}</span>
+            </header>
             <div>
-              <strong>{unsignedInvoices.length} 份 Invoice 待签署</strong>
-              <p>请尽快签署以推进审批流程</p>
+              {section.items.length ? section.items.map((task) => (
+                <Link to={task.deepLink} key={task.id}>
+                  <span className="request-action-icon purple">{task.type === "CONTRACT_SIGNATURE" ? <FileText size={18} /> : <ReceiptText size={18} />}</span>
+                  <span><strong>{task.title}</strong><small>{task.description}</small></span>
+                  <ChevronRight size={15} />
+                </Link>
+              )) : <p className="request-task-empty">暂无记录</p>}
             </div>
-            <Link to="/invoices?status=DRAFT_SIGNATURE">去签署 <ChevronRight size={15} /></Link>
           </article>
-          <article>
-            <span className="request-action-icon pink"><Pencil size={20} /></span>
-            <div>
-              <strong>{paymentIssueInvoice ? 1 : 0} 项付款资料待修改</strong>
-              <p>完善付款资料以便顺利收款</p>
-            </div>
-            <Link
-              className="pink"
-              to={paymentIssueInvoice
-                ? `/profile?repairInvoice=${paymentIssueInvoice.id}&field=${paymentIssueInvoice.paymentIssue?.fieldKey || "account_number"}#payout-information`
-                : "/profile#payout-information"}
-            >
-              去修改 <ChevronRight size={15} />
-            </Link>
-          </article>
-        </div>
+        ))}
       </section>
 
       <section className="request-money-overview" aria-label="请款金额概览">
@@ -2098,9 +2036,9 @@ function RequestListPage() {
                 当前账号下已匹配合同、但关联 Invoice 仍待你签署的项目金额合计。
               </AmountInfoTooltip>
             </span>
-            <strong>{summarizeRequestAmount(signatureItems)}</strong>
+            <strong>{summarizeRequestAmount(todoInvoices)}</strong>
           </div>
-          <small>{signatureItems.length} 个项目</small>
+          <small>{todoInvoices.length} 份 Invoice</small>
         </article>
         <article>
           <i className="blue" />
@@ -2108,12 +2046,12 @@ function RequestListPage() {
             <span>
               处理中金额
               <AmountInfoTooltip id="pending-arrival-amount-tip" label="处理中金额">
-                关联 Invoice 正在审核、等待付款或发生付款异常的项目金额合计。
+                当前正在审核、等待付款或收款资料复核中的 Invoice 金额合计。
               </AmountInfoTooltip>
             </span>
-            <strong>{summarizeRequestAmount(processingItems)}</strong>
+            <strong>{summarizeRequestAmount(processingInvoices)}</strong>
           </div>
-          <small>{processingItems.length} 个项目</small>
+          <small>{processingInvoices.length} 份 Invoice</small>
         </article>
         <article>
           <i className="green" />
@@ -2124,20 +2062,20 @@ function RequestListPage() {
                 关联 Invoice 已完成付款的项目金额合计。
               </AmountInfoTooltip>
             </span>
-            <strong>{summarizeRequestAmount(paidItems)}</strong>
+            <strong>{summarizeRequestAmount(paidInvoices)}</strong>
           </div>
-          <small>{paidItems.length} 个项目</small>
+          <small>{paidInvoices.length} 份 Invoice</small>
         </article>
       </section>
 
       <section className="content-card request-project-panel">
         <header><h2>请款项目</h2></header>
         <div className="toolbar request-project-toolbar">
-          <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目、品牌或请款编号" /></label>
+          <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Invoice 编号" aria-label="搜索 Invoice 编号" /></label>
           <div className="filter-tabs">
-            {statusOptions.map((value) => (
-              <button type="button" key={value} className={value === status ? "active" : ""} onClick={() => setStatus(value)}>
-                {value === "ALL" ? "全部" : REQUEST_STATUS_FROM_INVOICE[value].label}
+            {(["ALL", "TODO", "PROCESSING", "COMPLETED"] as const).map((value) => (
+              <button type="button" key={value} className={value === group ? "active" : ""} onClick={() => setGroup(value)}>
+                {{ ALL: "全部", TODO: "待我处理", PROCESSING: "处理中", COMPLETED: "已完成" }[value]}
               </button>
             ))}
           </div>
@@ -2146,20 +2084,22 @@ function RequestListPage() {
           <>
             <div className="table-scroll">
               <table className="data-table request-project-table">
-                <thead><tr><th>项目 / 请款编号</th><th>金额</th><th>合同状态</th><th>Invoice 状态</th><th>请款状态</th><th>更新时间</th><th aria-label="请款进度" /><th /></tr></thead>
+                <thead><tr><th>Invoice 编号</th><th>类型</th><th>金额</th><th>审核状态</th><th>付款状态</th><th>更新时间</th><th>下一步</th><th /></tr></thead>
                 <tbody>
-                  {filtered.map((item, index) => {
-                    const meta = REQUEST_STATUS_FROM_INVOICE[item.invoice.status];
+                  {filtered.map((invoice, index) => {
+                    const review = invoiceReviewMeta(invoice);
+                    const payment = invoicePaymentMeta(invoice);
+                    const task = tasks.find((item) => item.resourceId === invoiceInternalIdOf(invoice));
                     return (
-                      <tr className={index === 0 && status === "ALL" && !query ? "request-priority-row" : ""} key={item.id}>
-                        <td><Link className="table-primary" to={`/requests/${item.id}`}><strong>{item.projectName}</strong><small>{item.id} · {item.brand}</small></Link></td>
-                        <td className="amount-cell">{item.amount}</td>
-                        <td><span className="resource-state"><FileText size={15} />{contractStatusLabel[item.contract.status]}</span></td>
-                        <td><span className="resource-state"><ReceiptText size={15} />{INVOICE_STATUS[item.invoice.status].label}</span></td>
-                        <td><StatusBadge label={meta.label} tone={meta.tone} /></td>
-                        <td className="muted-cell"><span className="request-update-time">{item.updatedAt}</span></td>
-                        <td><RequestMiniProgress status={item.invoice.status} /></td>
-                        <td><Link className="icon-link" title="查看项目" to={`/requests/${item.id}`}><ChevronRight size={17} /></Link></td>
+                      <tr className={index === 0 && group === "ALL" && !query ? "request-priority-row" : ""} key={invoiceInternalIdOf(invoice)}>
+                        <td><Link className="table-primary" to={`/invoices/${invoiceNumberOf(invoice)}`}><strong>{invoiceNumberOf(invoice)}</strong><small>{invoice.updatedAt}</small></Link></td>
+                        <td>{invoiceTypeOf(invoice) === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</td>
+                        <td className="amount-cell">{invoice.amount}</td>
+                        <td><StatusBadge label={review.label} tone={review.tone} /></td>
+                        <td><StatusBadge label={payment.label} tone={payment.tone} /></td>
+                        <td className="muted-cell"><span className="request-update-time">{invoice.updatedAt}</span></td>
+                        <td>{task?.group === "TODO" ? task.title.replace(`Invoice ${invoiceNumberOf(invoice)} `, "") : "查看进度"}</td>
+                        <td><Link className="icon-link" title={`查看 Invoice ${invoiceNumberOf(invoice)}`} to={`/invoices/${invoiceNumberOf(invoice)}`}><ChevronRight size={17} /></Link></td>
                       </tr>
                     );
                   })}
@@ -2167,21 +2107,21 @@ function RequestListPage() {
               </table>
             </div>
             <div className="request-mobile-list">
-              {filtered.map((item) => {
-                const meta = REQUEST_STATUS_FROM_INVOICE[item.invoice.status];
+              {filtered.map((invoice) => {
+                const review = invoiceReviewMeta(invoice);
+                const payment = invoicePaymentMeta(invoice);
                 return (
-                  <Link to={`/requests/${item.id}`} className="request-mobile-card" key={item.id}>
-                    <header><div><strong>{item.projectName}</strong><small>{item.id} · {item.brand}</small></div><StatusBadge label={meta.label} tone={meta.tone} /></header>
-                    <div className="request-mobile-amount">{item.amount}</div>
-                    <dl><div><dt>合同</dt><dd>{contractStatusLabel[item.contract.status]}</dd></div><div><dt>Invoice</dt><dd>{INVOICE_STATUS[item.invoice.status].label}</dd></div><div><dt>更新</dt><dd>{item.updatedAt}</dd></div></dl>
-                    <RequestMiniProgress status={item.invoice.status} />
+                  <Link to={`/invoices/${invoiceNumberOf(invoice)}`} className="request-mobile-card" key={invoiceInternalIdOf(invoice)}>
+                    <header><div><strong>{invoiceNumberOf(invoice)}</strong><small>{invoiceTypeOf(invoice) === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</small></div><StatusBadge label={payment.label} tone={payment.tone} /></header>
+                    <div className="request-mobile-amount">{invoice.amount}</div>
+                    <dl><div><dt>审核</dt><dd>{review.label}</dd></div><div><dt>付款</dt><dd>{payment.label}</dd></div><div><dt>更新</dt><dd>{invoice.updatedAt}</dd></div></dl>
                   </Link>
                 );
               })}
             </div>
-            <footer className="request-project-footer">显示 {filtered.length} 个项目，共 {homeItems.length} 个</footer>
+            <footer className="request-project-footer">显示 {filtered.length} 份 Invoice，共 {invoices.length} 份</footer>
           </>
-        ) : <EmptyState title="没有匹配的关联项目" copy="仅展示当前账号中合同与 Invoice 项目名一致的项目。" />}
+        ) : <EmptyState title="没有匹配的收款" copy="请调整 Invoice 编号或任务分组后再试。" />}
       </section>
     </div>
   );
@@ -2284,6 +2224,11 @@ function RequestDetailPage({ adminView = false }: { adminView?: boolean }) {
       ))
     : undefined;
   const backTo = adminView ? "/admin" : "/";
+  if (!adminView) {
+    return linkedInvoice
+      ? <Navigate to={`/invoices/${invoiceNumberOf(linkedInvoice)}`} replace />
+      : <Navigate to="/" replace />;
+  }
   if (adminView && (adminCreator.loading || !adminCreator.detail || !linkedInvoice || !baseContract)) {
     return (
       <AdminBusinessDetailFallback
@@ -2295,7 +2240,7 @@ function RequestDetailPage({ adminView = false }: { adminView?: boolean }) {
     );
   }
   if (!linkedInvoice || !baseContract) return <Navigate to="/" replace />;
-  const linkedContract = syncContractWithInvoices(baseContract, [linkedInvoice]);
+  const linkedContract = baseContract;
   const meta = REQUEST_STATUS_FROM_INVOICE[linkedInvoice.status];
   const progress = buildInvoiceDrivenRequestProgress(linkedInvoice);
   const issues = linkedInvoice.status === "PAYMENT_FAILED" ? (baseRequest?.issues || []) : [];
@@ -2368,42 +2313,36 @@ function RequestDetailPage({ adminView = false }: { adminView?: boolean }) {
 }
 
 function ContractListPage() {
-  const { invoices, session } = useApp();
+  const { contracts } = useApp();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<Contract["status"] | "ALL">("ALL");
-  const tabs: Array<Contract["status"] | "ALL"> = ["ALL", "未请款", "请款中", "已付款"];
-  const contracts = useMemo(
-    () =>
-      (session?.userId === PRIMARY_CREATOR_ID ? seedContracts : []).map(
-        (contract) => syncContractWithInvoices(contract, invoices),
-      ),
-    [invoices, session?.userId],
-  );
+  const tabs: Array<Contract["status"] | "ALL"> = ["ALL", "PENDING_SIGNATURE", "ACTIVE", "EXPIRED"];
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return contracts.filter((contract) => {
       const statusMatches = status === "ALL" || contract.status === status;
       const queryMatches =
         !normalized ||
-        `${contract.projectName}${contract.id}${contract.orderId}${contract.campaignName}${contract.brand}`
+        `${contract.id}${contract.fileName}${contract.amount}`
           .toLowerCase()
           .includes(normalized);
       return statusMatches && queryMatches;
     });
   }, [contracts, query, status]);
   const statusCounts = {
-    未请款: contracts.filter((contract) => contract.status === "未请款").length,
-    请款中: contracts.filter((contract) => contract.status === "请款中").length,
-    已付款: contracts.filter((contract) => contract.status === "已付款").length,
+    PENDING_SIGNATURE: contracts.filter((contract) => contract.status === "PENDING_SIGNATURE").length,
+    ACTIVE: contracts.filter((contract) => contract.status === "ACTIVE").length,
+    EXPIRED: contracts.filter((contract) => contract.status === "EXPIRED").length,
   };
 
   return (
     <div className="page-stack">
       <PageHeading title="合同" subtitle="查看与你相关的合作合同、当前状态和完整合同文件。" />
       <section className="contract-overview" aria-label="合同概览">
-        <article className="tone-peach"><span>未付款</span><strong>{statusCounts.未请款}</strong><small>尚未创建关联 Invoice</small></article>
-        <article className="tone-sun"><span>付款中</span><strong>{statusCounts.请款中}</strong><small>合同已进入审核或付款流程</small></article>
-        <article className="tone-mint"><span>已付款</span><strong>{statusCounts.已付款}</strong><small>合同款项已完成支付</small></article>
+        <article className="tone-neutral"><span>全部合同</span><strong>{contracts.length}</strong><small>当前账号下的所有合同</small></article>
+        <article className="tone-sun"><span>待签署</span><strong>{statusCounts.PENDING_SIGNATURE}</strong><small>等待完成合同签署</small></article>
+        <article className="tone-sky"><span>执行中</span><strong>{statusCounts.ACTIVE}</strong><small>当前处于履约服务周期</small></article>
+        <article className="tone-cloud"><span>已过期</span><strong>{statusCounts.EXPIRED}</strong><small>合同服务周期已结束</small></article>
       </section>
       <section className="contract-list-panel">
         <div className="contract-list-toolbar">
@@ -2411,7 +2350,7 @@ function ContractListPage() {
             <Search size={16} />
             <input
               aria-label="搜索合同"
-              placeholder="搜索合同名称、编号、项目或品牌"
+              placeholder="搜索合同编号"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
@@ -2435,15 +2374,14 @@ function ContractListPage() {
           <>
             <div className="contract-table-scroll">
               <table className="contract-table">
-                <thead><tr><th>合同</th><th>项目 / 品牌</th><th>合同金额</th><th>合同状态</th><th>生效日期</th><th>更新日期</th><th>操作</th></tr></thead>
+                <thead><tr><th>合同编号</th><th>合同金额</th><th>合同状态</th><th>服务周期</th><th>更新日期</th><th>操作</th></tr></thead>
                 <tbody>
                   {filtered.map((contract) => (
                     <tr key={contract.id}>
-                      <td><Link className="contract-table-title" to={`/contracts/${contract.id}`}><strong>{contract.projectName}</strong><small>{contract.id} · {contract.orderId}</small></Link></td>
-                      <td><div className="contract-project-cell"><strong>{contract.campaignName}</strong><small>{contract.brand}</small></div></td>
+                      <td><Link className="contract-table-title" to={`/contracts/${contract.id}`}><strong>{contract.id}</strong><small>{contract.fileName}</small></Link></td>
                       <td className="amount-cell">{contract.amount}</td>
                       <td><StatusBadge label={contractStatusLabel[contract.status]} tone={CONTRACT_STATUS[contract.status].tone} /></td>
-                      <td className="muted-cell">{contract.effectiveDate}</td>
+                      <td className="muted-cell">{contract.servicePeriod}</td>
                       <td className="muted-cell">{contract.updatedAt}</td>
                       <td>
                         <div className="invoice-row-actions contract-row-actions">
@@ -2461,10 +2399,10 @@ function ContractListPage() {
                 <article className="contract-mobile-row" key={contract.id}>
                   <header><span className="resource-icon purple"><FileText size={19} /></span><StatusBadge label={contractStatusLabel[contract.status]} tone={CONTRACT_STATUS[contract.status].tone} /></header>
                   <div>
-                    <Link className="contract-mobile-title" to={`/contracts/${contract.id}`}><strong>{contract.projectName}</strong></Link>
-                    <small>{contract.id} · {contract.orderId}</small>
+                    <Link className="contract-mobile-title" to={`/contracts/${contract.id}`}><strong>{contract.id}</strong></Link>
+                    <small>{contract.fileName}</small>
                   </div>
-                  <dl><div><dt>项目 / 品牌</dt><dd>{contract.campaignName}<small>{contract.brand}</small></dd></div><div><dt>合同金额</dt><dd>{contract.amount}</dd></div><div><dt>生效日期</dt><dd>{contract.effectiveDate}</dd></div></dl>
+                  <dl><div><dt>合同金额</dt><dd>{contract.amount}</dd></div><div><dt>服务周期</dt><dd>{contract.servicePeriod}</dd></div><div><dt>生效日期</dt><dd>{contract.effectiveDate}</dd></div></dl>
                   <footer>
                     <span>{contract.updatedAt}</span>
                     <div className="invoice-row-actions contract-list-mobile-actions">
@@ -2484,19 +2422,18 @@ function ContractListPage() {
 
 function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
   const { id, creatorId } = useParams();
-  const { invoices, session } = useApp();
+  const { contracts, profile, signContract } = useApp();
   const adminCreator = useAdminCreatorDetail(
     adminView ? creatorId : undefined,
   );
   const [obligationTab, setObligationTab] = useState<"FULFILLMENT" | "CLAIM">("FULFILLMENT");
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [signing, setSigning] = useState(false);
+  const [signNotice, setSignNotice] = useState("");
+  const [signNoticeTone, setSignNoticeTone] = useState<"success" | "danger">("success");
   const baseContract = adminView
     ? adminCreator.detail?.contracts.find((item) => item.id === id)
-    : session?.userId === PRIMARY_CREATOR_ID
-      ? seedContracts.find((item) => item.id === id)
-      : undefined;
-  const scopedInvoices = adminView
-    ? adminCreator.detail?.invoices || []
-    : invoices;
+    : contracts.find((item) => item.id === id);
   const backTo = adminView ? "/admin/contracts" : "/contracts";
   if (adminView && (adminCreator.loading || !adminCreator.detail || !baseContract)) {
     return (
@@ -2509,8 +2446,8 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
     );
   }
   if (!baseContract) return <Navigate to="/contracts" replace />;
-  const contract = syncContractWithInvoices(baseContract, scopedInvoices);
-  const statusOrder: Contract["status"][] = ["未请款", "请款中", "已付款"];
+  const contract = baseContract;
+  const statusOrder: Contract["status"][] = ["PENDING_SIGNATURE", "ACTIVE", "EXPIRED"];
   const currentStatusIndex = statusOrder.indexOf(contract.status);
   const obligationGroups = [
     {
@@ -2568,7 +2505,8 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
   return (
     <div className="page-stack">
       <BackLink to={backTo}>返回合同列表</BackLink>
-      <PageHeading title={contract.projectName} subtitle={`${contract.id} · ${contract.orderId} · ${contract.creatorName}`} action={<StatusBadge label={contractStatusLabel[contract.status]} tone={CONTRACT_STATUS[contract.status].tone} />} />
+      <PageHeading title={contract.id} subtitle={`合同文件 · 更新于 ${contract.updatedAt}`} action={<StatusBadge label={contractStatusLabel[contract.status]} tone={CONTRACT_STATUS[contract.status].tone} />} />
+      {signNotice ? <div className={`form-alert ${signNoticeTone}`}><CheckCircle2 size={17} />{signNotice}</div> : null}
       <aside className="contract-source-notice" role="note">
         <span><Info size={16} /></span>
         <div>
@@ -2595,6 +2533,42 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
             );
           })}
         </div>
+        {!adminView && contract.status === "PENDING_SIGNATURE" ? (
+          <div className="contract-sign-panel">
+            <div className="contract-sign-summary">
+              <div><span>合同编号</span><strong>{contract.id}</strong></div>
+              <div><span>合同金额</span><strong>{contract.amount}</strong></div>
+              <div><span>服务周期</span><strong>{contract.servicePeriod}</strong></div>
+              <div><span>付款方式</span><strong>Airwallex 银行转账</strong></div>
+              <div><span>收款账户</span><strong>{maskPayoutIdentifier(profile.payout)}</strong></div>
+              <div><span>主要履约义务</span><strong>{contract.obligations.slice(0, 2).map((item) => item.title).join("、")}</strong></div>
+            </div>
+            <label className="signature-legal-consent">
+              <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />
+              <span><strong>确认条款</strong>我已阅读演示合同及上述摘要，并确认提交本次演示签署记录。该功能不是真实电子签平台，不表示已完成具有法律效力的签署。</span>
+            </label>
+            <button
+              className="primary-button"
+              type="button"
+              disabled={!acknowledged || signing}
+              onClick={async () => {
+                setSigning(true);
+                try {
+                  await signContract(contract.id);
+                  setSignNoticeTone("success");
+                  setSignNotice("合同演示签署记录已保存，状态已更新为执行中");
+                } catch (caught) {
+                  setSignNoticeTone("danger");
+                  setSignNotice(caught instanceof Error ? caught.message : "合同签署失败，请稍后重试");
+                } finally {
+                  setSigning(false);
+                }
+              }}
+            >
+              <PenLine size={16} />{signing ? "签署中" : "确认并签署"}
+            </button>
+          </div>
+        ) : null}
       </section>
       <div className="contract-document-layout">
         <section className="contract-viewer-card">
@@ -2610,12 +2584,12 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
           <iframe
             className="contract-pdf-frame"
             src={`${contract.documentUrl}#page=1&zoom=page-width&toolbar=1&navpanes=0`}
-            title={`${contract.projectName} PDF`}
+            title={`${contract.id} 合同 PDF`}
           />
           <img
             className="contract-pdf-mobile-preview"
             src="/26-kol-standard-terms-template-page-1.png"
-            alt={`${contract.projectName} 首页预览`}
+            alt={`${contract.id} 合同首页预览`}
           />
           <footer className="contract-mobile-actions">
             <a className="primary-button" href={contract.documentUrl} target="_blank" rel="noreferrer">
@@ -2699,7 +2673,9 @@ function ContractDetailPage({ adminView = false }: { adminView?: boolean }) {
 const downloadInvoiceDocument = (invoice?: Invoice) => {
   const anchor = document.createElement("a");
   anchor.href = invoice?.document?.previewUrl || "/INV-20260723-001-Alex-Ruiz.pdf";
-  anchor.download = invoice?.document?.name || `${invoice?.id || "INV-20260723-001"}.pdf`;
+  const mime = invoice?.document?.mimeType || "application/pdf";
+  const extension = mime === "image/png" ? "png" : mime === "image/jpeg" ? "jpg" : "pdf";
+  anchor.download = `${invoice ? invoiceNumberOf(invoice) : "Invoice"}.${extension}`;
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
@@ -2881,7 +2857,7 @@ function SignatureModal({
             <span className="signature-modal-icon"><PenLine size={20} /></span>
             <div>
               <h2 id="signature-modal-title">签署 Invoice</h2>
-              <p>{invoice.id} · {invoice.projectName}</p>
+              <p>{invoiceNumberOf(invoice)} · 交互演示</p>
             </div>
           </div>
           <button type="button" className="icon-button" aria-label="关闭签名窗口" disabled={submitting} onClick={onClose}><X size={18} /></button>
@@ -2951,7 +2927,7 @@ function SignatureModal({
           />
           <span>
             <strong>签署声明</strong>
-            我确认该签名由本人创建或选择，并授权用于签署本 Invoice；该电子签名与本人手写签名具有同等法律效力。确认签署后，签名将写入 Invoice 并提交审核。
+            我确认该签名由本人创建或选择，并同意在本地原型中记录签署动作。本页仅演示业务流程，不是真实电子签服务，不构成具有法律效力的签署。确认后，签名将写入演示 Invoice 并进入审核状态。
           </span>
         </label>
         {error ? <div className="signature-error" role="alert"><Info size={15} />{error}</div> : null}
@@ -2976,23 +2952,18 @@ const fileToDataUrl = (file: File) =>
   });
 
 function InvoiceUploadModal({
-  invoices,
+  invoice,
   profile,
   onClose,
   onUploaded,
 }: {
-  invoices: Invoice[];
+  invoice: Invoice;
   profile: UserProfile;
   onClose(): void;
   onUploaded(invoice: Invoice): void;
 }) {
-  const { uploadInvoice } = useApp();
-  const availableContracts = seedContracts.filter(
-    (contract) =>
-      !invoices.some((invoice) => invoice.projectId === contract.projectId),
-  );
+  const { uploadExternalInvoice, resubmitExternalInvoice } = useApp();
   const payoutAccounts = profile.payoutAccounts.filter(isPayoutAccountUsable);
-  const [projectId, setProjectId] = useState(availableContracts[0]?.projectId || "");
   const [payoutAccountId, setPayoutAccountId] = useState(
     payoutAccounts.find((account) => account.id === profile.defaultPayoutAccountId)?.id ||
       payoutAccounts[0]?.id ||
@@ -3001,17 +2972,17 @@ function InvoiceUploadModal({
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const selectedContract = availableContracts.find(
-    (contract) => contract.projectId === projectId,
-  );
   const selectedAccount = payoutAccounts.find(
     (account) => account.id === payoutAccountId,
   );
+  const migratedInvoice = migrateInvoice(invoice);
+  const isReupload = migratedInvoice.documentState?.kind === "EXTERNAL"
+    && migratedInvoice.documentState.status === "RETURNED_FOR_REUPLOAD";
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!selectedContract || !selectedAccount || !file) {
-      setError("请完成项目、付款账户和 Invoice 文件选择");
+    if (!selectedAccount || !file) {
+      setError("请完成收款账户和 Invoice 文件选择");
       return;
     }
     if (!/application\/pdf|image\/(png|jpeg)/.test(file.type)) {
@@ -3027,15 +2998,11 @@ function InvoiceUploadModal({
     try {
       const previewUrl = await fileToDataUrl(file);
       const [currency = selectedAccount.currency, rawTotal = "0"] =
-        selectedContract.amount.split(/\s+/, 2);
+        migratedInvoice.amount.split(/\s+/, 2);
       const issuedAt = new Date().toISOString().slice(0, 10);
-      const uploaded = await uploadInvoice({
-        projectId: selectedContract.projectId,
-        projectName: selectedContract.projectName,
-        brand: selectedContract.brand,
-        amount: selectedContract.amount,
+      const input: ExternalInvoiceUploadInput = {
+        invoiceId: invoiceInternalIdOf(migratedInvoice),
         payoutAccountId: selectedAccount.id,
-        invoiceType: "EXTERNAL_CONTRACT",
         file: {
           id: `invoice-file-${Date.now()}`,
           name: file.name,
@@ -3053,7 +3020,10 @@ function InvoiceUploadModal({
           invoiceFromMatchesProfile: true,
           billToMatchesComets: true,
         },
-      });
+      };
+      const uploaded = isReupload
+        ? await resubmitExternalInvoice(input)
+        : await uploadExternalInvoice(input);
       onUploaded(uploaded);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "上传失败，请稍后重试");
@@ -3068,19 +3038,14 @@ function InvoiceUploadModal({
         <header>
           <div>
             <span><Upload size={20} /></span>
-            <div><h2 id="invoice-upload-title">上传 Invoice</h2><p>系统将识别 Invoice 内容并生成待确认记录。</p></div>
+            <div><h2 id="invoice-upload-title">{isReupload ? "重新上传 Invoice" : "上传 Invoice"}</h2><p>系统将保留文件版本并模拟 OCR 识别。</p></div>
           </div>
           <button type="button" className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button>
         </header>
         <div className="invoice-upload-fields">
           <label className="field">
-            <span>Project name *</span>
-            <select value={projectId} onChange={(event) => setProjectId(event.target.value)} required>
-              {!availableContracts.length ? <option value="">暂无可上传 Invoice 的合同项目</option> : null}
-              {availableContracts.map((contract) => (
-                <option key={contract.id} value={contract.projectId}>{contract.projectName} · {contract.brand}</option>
-              ))}
-            </select>
+            <span>Invoice 编号</span>
+            <input value={invoiceNumberOf(migratedInvoice)} readOnly />
           </label>
           <label className="field">
             <span>Payment information *</span>
@@ -3112,8 +3077,8 @@ function InvoiceUploadModal({
         {error ? <div className="signature-error" role="alert"><Info size={15} />{error}</div> : null}
         <footer>
           <button type="button" className="secondary-button" onClick={onClose}>取消</button>
-          <button type="submit" className="primary-button" disabled={submitting || !selectedContract || !selectedAccount || !file}>
-            {submitting ? "识别并上传中" : "确认上传"}
+          <button type="submit" className="primary-button" disabled={submitting || !selectedAccount || !file}>
+            {submitting ? "识别并上传中" : isReupload ? "上传新版本" : "确认上传"}
           </button>
         </footer>
       </form>
@@ -3122,40 +3087,30 @@ function InvoiceUploadModal({
 }
 
 function InvoiceListPage() {
-  const { invoices, profile } = useApp();
-  const navigate = useNavigate();
+  const { invoices, tasks } = useApp();
   const location = useLocation();
-  const requestedStatus = new URLSearchParams(location.search).get("status");
-  const initialTab = ["PENDING_CONFIRMATION", "DRAFT_SIGNATURE", "PENDING_REVIEW", "CHANGES_REQUIRED", "APPROVED", "PAYMENT_FAILED", "PAID"].includes(requestedStatus || "")
-    ? (requestedStatus === "DRAFT_SIGNATURE" ? "PENDING_CONFIRMATION" : requestedStatus) as InvoiceStatus
-    : "ALL";
-  const [tab, setTab] = useState<InvoiceStatus | "ALL">(initialTab);
+  const requestedStatus = new URLSearchParams(location.search).get("status") || "";
+  const initialReview = requestedStatus === "DRAFT_SIGNATURE" ? "INTERNAL:WAITING_SIGNATURE" : "ALL";
+  const [reviewFilter, setReviewFilter] = useState(initialReview);
+  const [paymentFilter, setPaymentFilter] = useState<Invoice["paymentStatus"] | "ALL">("ALL");
   const [query, setQuery] = useState("");
-  const [channel, setChannel] = useState<Invoice["channel"] | "ALL">("ALL");
-  const [uploadOpen, setUploadOpen] = useState(false);
-  const channelOptions = [...new Set(invoices.map((invoice) => invoice.channel))];
-  const filtered = filterInvoiceList(invoices, query, tab, channel);
-  const tabs: Array<InvoiceStatus | "ALL"> = ["ALL", "PENDING_CONFIRMATION", "PENDING_REVIEW", "CHANGES_REQUIRED", "APPROVED", "PAYMENT_FAILED", "PAID"];
+  const migratedInvoices = useMemo(() => invoices.map(migrateInvoice), [invoices]);
+  const filtered = useMemo(() => migratedInvoices.filter((invoice) => (
+    (!query.trim() || normalizeInvoiceSearch(invoiceNumberOf(invoice)).includes(normalizeInvoiceSearch(query)))
+    && (reviewFilter === "ALL" || invoiceReviewFilterValue(invoice) === reviewFilter)
+    && (paymentFilter === "ALL" || invoice.paymentStatus === paymentFilter)
+  )), [migratedInvoices, paymentFilter, query, reviewFilter]);
   useEffect(() => {
-    setTab(initialTab);
-  }, [initialTab]);
+    setReviewFilter(initialReview);
+  }, [initialReview]);
   return (
     <div className="page-stack">
       <PageHeading
         title="Invoice"
-        subtitle="上传并核对 Invoice 识别结果，确认付款账户一致后提交审核。"
-        action={<button type="button" className="primary-button invoice-upload-trigger" onClick={() => setUploadOpen(true)}><Upload size={16} />上传 Invoice</button>}
+        subtitle="按 Invoice 编号查看文档审核和付款进度，外部 Invoice 请从对应待办记录进入上传。"
       />
       <section className="content-card">
         <div className="invoice-list-toolbar">
-          <div className="invoice-tabs">
-            {tabs.map((value) => (
-              <button key={value} type="button" className={tab === value ? "active" : ""} onClick={() => setTab(value)}>
-                {value === "ALL" ? "全部" : INVOICE_STATUS[value].label}
-                <span>{invoices.filter((item) => value === "ALL" || item.status === value || (value === "PENDING_CONFIRMATION" && item.status === "DRAFT_SIGNATURE")).length}</span>
-              </button>
-            ))}
-          </div>
           <div className="invoice-toolbar-filters">
             <label className="invoice-search-field">
               <Search size={16} />
@@ -3163,8 +3118,8 @@ function InvoiceListPage() {
                 type="search"
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="搜索 Invoice、关联项目"
-                aria-label="搜索 Invoice 或关联项目"
+                placeholder="搜索 Invoice 编号"
+                aria-label="搜索 Invoice 编号"
               />
               {query ? (
                 <button
@@ -3178,46 +3133,53 @@ function InvoiceListPage() {
               ) : null}
             </label>
             <label className="invoice-channel-filter">
-              <WalletCards size={16} />
+              <FileCheck2 size={16} />
               <select
-                value={channel}
-                onChange={(event) =>
-                  setChannel(event.target.value as Invoice["channel"] | "ALL")
-                }
-                aria-label="筛选付款渠道"
+                value={reviewFilter}
+                onChange={(event) => setReviewFilter(event.target.value)}
+                aria-label="筛选 Invoice 审核状态"
               >
-                <option value="ALL">全部渠道</option>
-                {channelOptions.map((option) => (
-                  <option key={option} value={option}>{option}</option>
-                ))}
+                <option value="ALL">全部审核状态</option>
+                {Object.entries(INTERNAL_REVIEW_META).map(([status, meta]) => <option key={`INTERNAL:${status}`} value={`INTERNAL:${status}`}>内部 · {meta.label}</option>)}
+                {Object.entries(EXTERNAL_COLLECTION_META).map(([status, meta]) => <option key={`EXTERNAL:${status}`} value={`EXTERNAL:${status}`}>外部 · {meta.label}</option>)}
+              </select>
+            </label>
+            <label className="invoice-channel-filter">
+              <WalletCards size={16} />
+              <select value={paymentFilter || "ALL"} onChange={(event) => setPaymentFilter(event.target.value as Invoice["paymentStatus"] | "ALL")} aria-label="筛选付款状态">
+                <option value="ALL">全部付款状态</option>
+                {Object.entries(PAYMENT_STATUS_META).map(([status, meta]) => <option key={status} value={status}>{meta.label}</option>)}
               </select>
             </label>
           </div>
         </div>
         <div className="invoice-list" role="table" aria-label="Invoice 列表">
           <div className="invoice-table-header" role="row">
-            <span role="columnheader">Invoice</span>
-            <span role="columnheader">关联项目</span>
-            <span role="columnheader">渠道</span>
+            <span role="columnheader">Invoice 编号</span>
+            <span role="columnheader">Invoice 类型</span>
             <span role="columnheader">金额</span>
-            <span role="columnheader">状态</span>
-            <span role="columnheader">操作</span>
+            <span role="columnheader">审核状态</span>
+            <span role="columnheader">付款状态</span>
+            <span role="columnheader">更新时间</span>
+            <span role="columnheader">待处理操作</span>
           </div>
           {filtered.map((invoice) => {
-            const meta = INVOICE_STATUS[invoice.status];
+            const review = invoiceReviewMeta(invoice);
+            const payment = invoicePaymentMeta(invoice);
+            const task = tasks.find((item) => item.resourceId === invoiceInternalIdOf(invoice));
             return (
-              <article className="invoice-list-row" role="row" key={invoice.id}>
-                <Link className="invoice-identity" role="cell" to={`/invoices/${invoice.id}`}>
+              <article className="invoice-list-row invoice-centric-row" role="row" key={invoiceInternalIdOf(invoice)}>
+                <Link className="invoice-identity" role="cell" to={`/invoices/${invoiceNumberOf(invoice)}`}>
                   <span className="resource-icon peach"><ReceiptText size={17} /></span>
-                  <span><strong>{invoice.id}</strong><small>{invoice.issuedAt}</small></span>
+                  <span><strong>{invoiceNumberOf(invoice)}</strong><small>{invoice.issuedAt}</small></span>
                 </Link>
-                <div className="invoice-project" role="cell"><strong>{invoice.projectName}</strong><span>{invoice.brand}</span></div>
-                <div className="invoice-channel" role="cell">{invoice.channel}</div>
-                <div className="invoice-amount" role="cell"><strong>{invoice.amount}</strong><span>{invoice.updatedAt}</span></div>
-                <div className="invoice-status-cell" role="cell"><StatusBadge label={meta.label} tone={meta.tone} /></div>
+                <div className="invoice-channel" role="cell">{invoiceTypeOf(invoice) === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</div>
+                <div className="invoice-amount" role="cell"><strong>{invoice.amount}</strong></div>
+                <div className="invoice-status-cell" role="cell"><StatusBadge label={review.label} tone={review.tone} /></div>
+                <div className="invoice-status-cell" role="cell"><StatusBadge label={payment.label} tone={payment.tone} /></div>
+                <div className="invoice-channel" role="cell">{invoice.updatedAt}</div>
                 <div className="invoice-row-actions" role="cell">
-                  <Link to={`/invoices/${invoice.id}`} title={`查看 ${invoice.id}`}><Eye size={15} /><span>查看</span></Link>
-                  <button type="button" title={`下载 ${invoice.id}`} onClick={() => downloadInvoiceDocument(invoice)}><FileDown size={15} /><span>下载</span></button>
+                  <Link to={`/invoices/${invoiceNumberOf(invoice)}`} title={`查看 Invoice ${invoiceNumberOf(invoice)}`}><Eye size={15} /><span>{task?.group === "TODO" ? "去处理" : "查看"}</span></Link>
                 </div>
               </article>
             );
@@ -3225,57 +3187,55 @@ function InvoiceListPage() {
           {!filtered.length ? (
             <EmptyState
               title={query.trim() ? "未找到匹配的 Invoice" : "暂无 Invoice"}
-              copy={query.trim() ? "请尝试搜索其他 Invoice 编号或关联项目。" : "当前筛选条件下没有记录。"}
+              copy={query.trim() ? "请尝试搜索其他 Invoice 编号。" : "当前筛选条件下没有记录。"}
             />
           ) : null}
         </div>
       </section>
-      {uploadOpen ? (
-        <InvoiceUploadModal
-          invoices={invoices}
-          profile={profile}
-          onClose={() => setUploadOpen(false)}
-          onUploaded={(invoice) => {
-            setUploadOpen(false);
-            navigate(`/invoices/${invoice.id}`);
-          }}
-        />
-      ) : null}
     </div>
   );
 }
 
 function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
   const { id, creatorId } = useParams();
-  const { invoices, profile, signInvoice, updateInvoice, selectInvoicePayoutAccount } = useApp();
-  const adminCreator = useAdminCreatorDetail(
-    adminView ? creatorId : undefined,
-  );
+  const {
+    session,
+    invoices,
+    profile,
+    signInternalInvoice,
+    submitInvoiceFeedback,
+    confirmExternalInvoice,
+    correctExternalInvoice,
+    selectInvoicePayoutAccount,
+    submitPaymentAccountCorrection,
+  } = useApp();
+  const adminCreator = useAdminCreatorDetail(adminView ? creatorId : undefined);
   const navigate = useNavigate();
-  const invoice = adminView
-    ? adminCreator.detail?.invoices.find((item) => item.id === id)
-    : invoices.find((item) => item.id === id);
-  const currentProfile = adminCreator.detail?.profile || profile;
+  const invoiceSource = adminView
+    ? adminCreator.detail?.invoices.find((item) => item.id === id || item.invoiceNumber === id)
+    : invoices.find((item) => item.id === id || item.invoiceNumber === id);
+  const invoice = invoiceSource ? migrateInvoice(invoiceSource) : undefined;
+  const currentProfile = normalizePayoutProfile(adminCreator.detail?.profile || profile);
   const backTo = adminView ? "/admin/invoices" : "/invoices";
   const canCreatorAct = !adminView;
   const [signatureOpen, setSignatureOpen] = useState(false);
   const [issueOpen, setIssueOpen] = useState(false);
   const [issueSuccessOpen, setIssueSuccessOpen] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
   const [viewerExpanded, setViewerExpanded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [noticeTone, setNoticeTone] = useState<"success" | "danger">("success");
-  const [issueType, setIssueType] = useState("付款项目有误");
+  const [issueType, setIssueType] = useState("收款信息有误");
   const [submittedIssueType, setSubmittedIssueType] = useState("");
   const [issueDetails, setIssueDetails] = useState("");
-  const [detailTab, setDetailTab] = useState<"SUMMARY" | "PAYOUT" | "PROCESS">("SUMMARY");
+  const [detailTab, setDetailTab] = useState<"SUMMARY" | "PAYOUT" | "PROCESS" | "PAYMENT">("SUMMARY");
+  const [correctionAccountId, setCorrectionAccountId] = useState("");
 
   useEffect(() => {
     if (!viewerExpanded) return;
     const previousOverflow = document.body.style.overflow;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setViewerExpanded(false);
-    };
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setViewerExpanded(false); };
     document.body.style.overflow = "hidden";
     window.addEventListener("keydown", closeOnEscape);
     return () => {
@@ -3285,35 +3245,19 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
   }, [viewerExpanded]);
 
   if (adminView && (adminCreator.loading || !adminCreator.detail || !invoice)) {
-    return (
-      <AdminBusinessDetailFallback
-        backTo={backTo}
-        loading={adminCreator.loading}
-        error={adminCreator.error}
-        resourceName="Invoice"
-      />
-    );
+    return <AdminBusinessDetailFallback backTo={backTo} loading={adminCreator.loading} error={adminCreator.error} resourceName="Invoice" />;
   }
-  if (!invoice) {
-    return (
-      <div className="page-stack">
-        <BackLink to="/invoices">返回 Invoice 列表</BackLink>
-        <EmptyState title="Invoice 不存在" copy="该记录可能已被移除，或当前账号无权查看。" />
-      </div>
-    );
-  }
-  const meta = INVOICE_STATUS[invoice.status];
-  const isAwaitingSignature = shouldShowInvoicePreSigningControls(
-    invoice.status,
-  );
+  if (!invoice) return <div className="page-stack"><BackLink to="/invoices">返回 Invoice 列表</BackLink><EmptyState title="Invoice 不存在" copy="该记录可能已被移除，或当前账号无权查看。" /></div>;
+
+  const number = invoiceNumberOf(invoice);
+  const resourceId = invoiceInternalIdOf(invoice);
+  const review = invoiceReviewMeta(invoice);
+  const payment = invoicePaymentMeta(invoice);
+  const kind = invoiceTypeOf(invoice);
+  const state = invoice.documentState!;
   const paymentIssue = invoice.paymentIssue;
-  const isPaymentRepair = invoice.status === "PAYMENT_FAILED" && Boolean(paymentIssue);
-  const paymentIssueResolved = Boolean(paymentIssue?.resolvedAt);
-  const isPaymentCorrectionReview =
-    invoice.status === "PENDING_REVIEW" &&
-    Boolean(paymentIssue?.resubmittedAt);
-  const [amountCurrency = currentProfile.payout.currency || "USD", amountTotal = "0"] =
-    invoice.amount.split(/\s+/, 2);
+  const repairSubmitted = recoveryStatusIsSubmitted(invoice.paymentRecoveryStatus);
+  const [amountCurrency = currentProfile.payout.currency || "USD", amountTotal = "0"] = invoice.amount.split(/\s+/, 2);
   const extractedData = invoice.extractedData || {
     invoiceFrom: currentProfile.legalName,
     billTo: "COMETS INTERNATIONAL LIMITED",
@@ -3325,31 +3269,28 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
     billToMatchesComets: true,
   };
   const usablePayoutAccounts = currentProfile.payoutAccounts.filter(isPayoutAccountUsable);
-  const selectedPayoutAccount =
-    usablePayoutAccounts.find((account) => account.id === invoice.payoutAccountId) ||
-    usablePayoutAccounts.find((account) => account.id === currentProfile.defaultPayoutAccountId) ||
-    currentProfile.payout;
-  const paymentComparison = compareInvoicePaymentDetails(
-    extractedData.paymentDetails,
-    selectedPayoutAccount,
-  );
-  const invoiceFromMatchesProfile =
-    normalizeInvoiceIdentity(extractedData.invoiceFrom) ===
-    normalizeInvoiceIdentity(currentProfile.legalName);
-  const billToMatchesComets =
-    normalizeInvoiceIdentity(extractedData.billTo) ===
-    normalizeInvoiceIdentity("COMETS INTERNATIONAL LIMITED");
-  const channelId = `${currentProfile.social.platform} · ${currentProfile.social.handle}`;
+  const selectedPayoutAccount = usablePayoutAccounts.find((account) => account.id === invoice.payoutAccountId)
+    || usablePayoutAccounts.find((account) => account.id === currentProfile.defaultPayoutAccountId)
+    || currentProfile.payout;
+  const paymentComparison = compareInvoicePaymentDetails(extractedData.paymentDetails, selectedPayoutAccount);
+  const invoiceFromMatchesProfile = normalizeInvoiceIdentity(extractedData.invoiceFrom) === normalizeInvoiceIdentity(currentProfile.legalName);
+  const billToMatchesComets = normalizeInvoiceIdentity(extractedData.billTo) === normalizeInvoiceIdentity("COMETS INTERNATIONAL LIMITED");
+  const canConfirmExternal = paymentComparison.matches && invoiceFromMatchesProfile && billToMatchesComets;
+  const isAwaitingSignature = state.kind === "INTERNAL" && state.status === "WAITING_SIGNATURE";
+  const canUpload = state.kind === "EXTERNAL" && ["WAITING_UPLOAD", "RETURNED_FOR_REUPLOAD", "RECOGNITION_FAILED"].includes(state.status);
 
-  const transition = async (status: InvoiceStatus, message: string) => {
+  const runAction = async (action: () => Promise<void>, success: string) => {
     setBusy(true);
+    setNotice("");
     try {
-      await updateInvoice(invoice.id, status);
+      await action();
       setNoticeTone("success");
-      setNotice(message);
+      setNotice(success);
+      return true;
     } catch (caught) {
       setNoticeTone("danger");
       setNotice(caught instanceof Error ? caught.message : "操作失败，请稍后重试");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -3358,304 +3299,121 @@ function InvoiceDetailPage({ adminView = false }: { adminView?: boolean }) {
   const sign = async (signature: InvoiceSignature) => {
     setBusy(true);
     try {
-      await signInvoice(invoice.id, signature);
+      await signInternalInvoice(resourceId, signature);
       setNoticeTone("success");
-      setNotice("Invoice 已签署并提交审核");
+      setNotice("Invoice 已签署并进入审核");
     } catch (caught) {
       setNoticeTone("danger");
-      setNotice(caught instanceof Error ? caught.message : "暂时无法完成签署");
+      setNotice(caught instanceof Error ? caught.message : "签署失败，请稍后重试");
+      throw caught;
     } finally {
       setBusy(false);
     }
   };
 
-  const timeline: Array<{
-    label: string;
-    state: "complete" | "current" | "error" | "pending";
-    time: string;
-  }> = [
-    { label: "上传待确认", state: invoice.status === "PENDING_CONFIRMATION" ? "current" : "complete", time: invoice.processHistory?.[0]?.occurredAt ? new Date(invoice.processHistory[0].occurredAt).toLocaleString("zh-CN", { hour12: false }) : invoice.issuedAt },
-    {
-      label: "待审核",
-      state: invoice.status === "PENDING_REVIEW" ? "current" : ["CHANGES_REQUIRED", "APPROVED", "PAYMENT_FAILED", "PAID"].includes(invoice.status) ? "complete" : "pending",
-      time: invoice.status === "PENDING_REVIEW" ? "审核中" : ["CHANGES_REQUIRED", "APPROVED", "PAYMENT_FAILED", "PAID"].includes(invoice.status) ? "已处理" : "待开始",
-    },
-    {
-      label: "待修改",
-      state: invoice.status === "CHANGES_REQUIRED" ? "error" : "pending",
-      time: invoice.status === "CHANGES_REQUIRED" ? invoice.rejectedReason || "审核账号或系统已退回" : "未触发",
-    },
-    {
-      label: "待付款",
-      state: invoice.status === "APPROVED" ? "current" : ["PAYMENT_FAILED", "PAID"].includes(invoice.status) ? "complete" : "pending",
-      time: invoice.status === "APPROVED" ? "等待付款" : ["PAYMENT_FAILED", "PAID"].includes(invoice.status) ? "已进入付款" : "待开始",
-    },
-    {
-      label: invoice.status === "PAYMENT_FAILED" ? "付款异常" : "已付款",
-      state: invoice.status === "PAID" ? "complete" : invoice.status === "PAYMENT_FAILED" ? "error" : "pending",
-      time: invoice.status === "PAID" ? invoice.updatedAt : invoice.status === "PAYMENT_FAILED" ? paymentIssue?.message || "付款处理发生异常" : "待开始",
-    },
-  ];
-
-  const submitIssue = (event: FormEvent<HTMLFormElement>) => {
+  const submitIssue = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setSubmittedIssueType(issueType);
-    setIssueOpen(false);
-    setIssueSuccessOpen(true);
-    setIssueDetails("");
+    try {
+      const succeeded = await runAction(
+        () => submitInvoiceFeedback(resourceId, {
+          issueType,
+          details: issueDetails,
+          submittedBy: session?.userId || currentProfile.id,
+        }),
+        "Invoice 反馈已提交",
+      );
+      if (!succeeded) return;
+      setSubmittedIssueType(issueType);
+      setIssueOpen(false);
+      setIssueSuccessOpen(true);
+      setIssueDetails("");
+    } catch {
+      // Error is rendered by the shared page notice.
+    }
   };
+
+  const paymentTimeline = invoice.paymentStatus === "FAILED"
+    ? [
+        ["付款失败", "error"],
+        ["等待修改收款信息", repairSubmitted ? "complete" : "current"],
+        ["收款资料已提交复核", repairSubmitted ? "current" : "pending"],
+        ["等待重新付款", ["READY_FOR_RETRY", "RETRY_SUBMITTED", "RETRY_SUCCEEDED"].includes(invoice.paymentRecoveryStatus || "") ? "current" : "pending"],
+        ["付款处理中", invoice.paymentRecoveryStatus === "RETRY_SUBMITTED" ? "current" : "pending"],
+        ["付款成功", invoice.paymentRecoveryStatus === "RETRY_SUCCEEDED" ? "complete" : "pending"],
+      ] as const
+    : [
+        ["等待付款", invoice.paymentStatus === "WAITING_PAYMENT" ? "current" : "complete"],
+        ["付款处理中", invoice.paymentStatus === "PROCESSING" ? "current" : invoice.paymentStatus === "PAID" ? "complete" : "pending"],
+        ["付款成功", invoice.paymentStatus === "PAID" ? "complete" : "pending"],
+      ] as const;
 
   return (
     <div className="page-stack">
       <BackLink to={backTo}>返回 Invoice 列表</BackLink>
       <PageHeading
-        title={invoice.id}
-        subtitle={`${channelId} · ${invoice.projectName}`}
+        title={number}
+        subtitle={`${kind === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"} · ${currentProfile.social.platform} ${currentProfile.social.handle} · 更新于 ${invoice.updatedAt}`}
         action={<button type="button" className="secondary-button" onClick={() => downloadInvoiceDocument(invoice)}><Download size={15} />下载 PDF</button>}
       />
       {notice ? <div className={`form-alert ${noticeTone}`}><CheckCircle2 size={17} />{notice}</div> : null}
-      {!invoice.document ? (
-        <div className="invoice-prototype-notice" role="note">
-          <Info size={16} />
-          <p><strong>原型说明</strong>此历史记录仍使用系统示例文件；新上传的 Invoice 将直接展示对应文件及识别结果。</p>
-        </div>
-      ) : null}
+      <div className="invoice-prototype-notice" role="note"><Info size={16} /><p><strong>原型说明</strong>当前文件、OCR、签署、审核和付款进度均为本地 MockApiAdapter 演示，不是真实支付或生产系统记录。</p></div>
       <section className="invoice-detail-metrics" aria-label="Invoice 概览">
-        <article>
-          <span>当前状态</span>
-          <strong><i className={`invoice-metric-accent tone-${meta.tone}`} />{meta.label}</strong>
-          <small>{meta.description}</small>
-        </article>
-        <article>
-          <span>Invoice 金额</span>
-          <strong>{invoice.amount}</strong>
-          <small>{extractedData.currency} · OCR 自动识别</small>
-        </article>
-        <article>
-          <span>Invoice 类型</span>
-          <strong>{invoice.invoiceType === "INTERNAL_CONTRACT" ? "内部合同" : "外部合同"}</strong>
-          <small>{invoice.invoiceType === "INTERNAL_CONTRACT" ? "COMETS 内部项目" : "达人外部合同项目"}</small>
-        </article>
+        <article><span>审核状态</span><strong><i className={`invoice-metric-accent tone-${review.tone}`} />{review.label}</strong><small>{kind === "INTERNAL" ? "内部 Invoice 流程" : "外部 Invoice 收集流程"}</small></article>
+        <article><span>Invoice 金额</span><strong>{invoice.amount}</strong><small>{extractedData.currency} · {kind === "EXTERNAL" ? "OCR 识别" : "系统生成"}</small></article>
+        <article><span>付款状态</span><strong><i className={`invoice-metric-accent tone-${payment.tone}`} />{payment.label}</strong><small>{invoice.paymentExpectedAt ? `预计处理：${invoice.paymentExpectedAt}` : "与 Invoice 审核状态独立"}</small></article>
       </section>
-      {isPaymentRepair && paymentIssue && !paymentIssueResolved ? (
+
+      {invoice.paymentStatus === "FAILED" ? (
         <section className="payment-issue-alert" role="alert">
           <span className="payment-issue-alert-icon"><Info size={18} /></span>
           <div className="payment-issue-alert-content">
-            <div>
-              <strong>付款信息校验未通过</strong>
-              <span>付款流程已暂停，请修正后提交审核</span>
-            </div>
-            <dl>
-              <div><dt>错误字段</dt><dd>{paymentIssue.fieldLabel}</dd></div>
-              <div><dt>当前信息</dt><dd>{paymentIssue.maskedValue}</dd></div>
-            </dl>
-            <p>{paymentIssue.message}</p>
-            <ol>
-              <li>前往个人档案修改上述付款信息</li>
-              <li>完成 Airwallex 校验并保存修改</li>
-              <li>返回本页提交审核</li>
-            </ol>
+            <div><strong>付款失败</strong><span>{repairSubmitted ? "收款资料已提交复核" : "等待修改收款信息"}</span></div>
+            <p>{invoice.paymentFailureReason || paymentIssue?.message || "收款资料未通过付款校验"}</p>
+            {paymentIssue ? <dl><div><dt>错误字段</dt><dd>{paymentIssue.fieldLabel}</dd></div><div><dt>当前信息</dt><dd>{paymentIssue.maskedValue}</dd></div></dl> : null}
           </div>
         </section>
-      ) : isPaymentRepair && paymentIssueResolved ? (
-        <div className="form-alert success">
-          <CheckCircle2 size={17} />
-          <div>
-            <strong>付款信息已更新</strong>
-            <p>错误字段已通过 Airwallex 校验，请点击“提交审核”继续处理。</p>
-          </div>
-        </div>
-      ) : invoice.rejectedReason ? (
-        <div className="form-alert danger"><Info size={17} /><div><strong>处理异常原因</strong><p>{invoice.rejectedReason}</p></div></div>
-      ) : null}
-      {isAwaitingSignature ? (
-        <div className="invoice-verification-notice" role="note">
-          <Info size={18} />
-          <div>
-            <strong>签署前请仔细核对 Invoice 信息</strong>
-            <p>请确认付款项目、收款信息、金额及币种准确无误；如有疑问，请先通过“Invoice 信息有误”反馈，确认无误后再签署。</p>
-            <p className="invoice-verification-responsibility">签署即表示您已确认上述信息。因信息核对疏漏导致的付款失败、退汇及相关手续费等后果，将由您自行承担。</p>
-          </div>
-        </div>
-      ) : null}
+      ) : invoice.rejectedReason ? <div className="form-alert danger"><Info size={17} /><div><strong>退回原因</strong><p>{invoice.rejectedReason}</p></div></div> : null}
+
+      {isAwaitingSignature ? <div className="invoice-verification-notice" role="note"><Info size={18} /><div><strong>签署前请仔细核对 Invoice 信息</strong><p>请确认收款信息、金额及币种准确无误；如有疑问，请先提交信息反馈。</p><p className="invoice-verification-responsibility">本地签署仅用于演示核对和审核流程，不是真实电子签服务。</p></div></div> : null}
+
       <div className="document-layout">
         <section className={`invoice-viewer-card ${viewerExpanded ? "is-expanded" : ""}`}>
           <header className="invoice-viewer-toolbar">
-            <div>
-              <span className="invoice-viewer-icon"><FileText size={18} /></span>
-              <span><strong>Invoice 全文</strong><small>{invoice.document?.name || "INV-20260723-001-Alex-Ruiz.pdf"} · 1页</small></span>
-            </div>
+            <div><span className="invoice-viewer-icon"><FileText size={18} /></span><span><strong>Invoice 全文</strong><small>{number} · {invoice.fileVersions?.length || 1} 个文件版本</small></span></div>
             <div className="invoice-viewer-actions">
-              <button
-                type="button"
-                className="invoice-expand-button"
-                title={viewerExpanded ? "退出放大查看" : "放大查看 Invoice"}
-                aria-pressed={viewerExpanded}
-                onClick={() => setViewerExpanded((expanded) => !expanded)}
-              >
-                {viewerExpanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-                {viewerExpanded ? "退出放大" : "放大查看"}
-              </button>
-              <button
-                type="button"
-                className="invoice-download-button"
-                title="下载可打印 Invoice"
-                onClick={() => downloadInvoiceDocument(invoice)}
-              >
-                <Download size={15} />下载PDF
-              </button>
+              <button type="button" className="invoice-expand-button" title={viewerExpanded ? "退出放大查看" : "放大查看 Invoice"} aria-pressed={viewerExpanded} onClick={() => setViewerExpanded((expanded) => !expanded)}>{viewerExpanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}{viewerExpanded ? "退出放大" : "放大查看"}</button>
+              <button type="button" className="invoice-download-button" title={`下载 Invoice ${number}`} onClick={() => downloadInvoiceDocument(invoice)}><Download size={15} />下载 PDF</button>
             </div>
           </header>
           <div className="invoice-document-stage">
-            <article className={`invoice-paper invoice-source-paper ${invoice.document ? "uploaded-invoice-paper" : ""}`}>
-              {invoice.document?.previewUrl && invoice.document.mimeType === "application/pdf" ? (
-                <iframe className="invoice-uploaded-pdf" src={invoice.document.previewUrl} title={`${invoice.id} Invoice 文件`} />
-              ) : (
-                <img
-                  className="invoice-source-image"
-                  src={invoice.document?.previewUrl || "/INV-20260723-001-Alex-Ruiz-page-1.png"}
-                  alt={`${invoice.id} Invoice 全文`}
-                />
-              )}
-              {invoice.signature ? (
-                <img
-                  className="invoice-source-signature"
-                  src={invoice.signature.dataUrl}
-                  alt={`${invoice.signature.signerName} 的签名`}
-                />
-              ) : null}
-            </article>
+            {invoice.document ? (
+              <article className="invoice-paper invoice-source-paper uploaded-invoice-paper">
+                {invoice.document.previewUrl && invoice.document.mimeType === "application/pdf" ? <iframe className="invoice-uploaded-pdf" src={invoice.document.previewUrl} title={`Invoice ${number} 文件`} /> : <img className="invoice-source-image" src={invoice.document.previewUrl || "/INV-20260723-001-Alex-Ruiz-page-1.png"} alt={`Invoice ${number} 全文`} />}
+                {invoice.signature ? <img className="invoice-source-signature" src={invoice.signature.dataUrl} alt="已保存的签名" /> : null}
+              </article>
+            ) : (
+              <div className="invoice-document-empty"><Upload size={28} /><strong>{state.kind === "EXTERNAL" ? "尚未上传 Invoice 文件" : "正在加载演示 Invoice"}</strong>{canCreatorAct && canUpload ? <button type="button" className="primary-button" onClick={() => setUploadOpen(true)}><Upload size={16} />上传 Invoice</button> : null}</div>
+            )}
           </div>
         </section>
+
         <aside className="document-sidebar">
           <section className="invoice-inspection-card">
             <div className="invoice-inspection-tabs" role="tablist" aria-label="Invoice 详情信息">
-              {([
-                ["SUMMARY", "Invoice 摘要"],
-                ["PAYOUT", `收款账户${paymentComparison.matches ? "" : " · 待处理"}`],
-                ["PROCESS", "处理状态"],
-              ] as const).map(([value, label]) => (
-                <button key={value} type="button" role="tab" aria-selected={detailTab === value} className={detailTab === value ? "active" : ""} onClick={() => setDetailTab(value)}>{label}</button>
-              ))}
+              {([ ["SUMMARY", "Invoice 摘要"], ["PAYOUT", "收款账户"], ["PROCESS", "审核处理"], ["PAYMENT", "付款状态"] ] as const).map(([value, label]) => <button key={value} type="button" role="tab" aria-selected={detailTab === value} className={detailTab === value ? "active" : ""} onClick={() => setDetailTab(value)}>{label}</button>)}
             </div>
-            {detailTab === "SUMMARY" ? (
-              <div className="invoice-summary-panel" role="tabpanel">
-                <header><span className="resource-icon purple"><FileCheck2 size={17} /></span><div><h2>结构化 Invoice 信息</h2><p>系统识别后自动回填，请逐项核对</p></div></header>
-                <dl>
-                  <div><dt>Invoice 编号</dt><dd><strong>{invoice.id}</strong><small>系统生成</small></dd></div>
-                  <div><dt>Invoice From</dt><dd><strong>{extractedData.invoiceFrom}</strong><small className={invoiceFromMatchesProfile ? "match-ok" : "match-error"}>{invoiceFromMatchesProfile ? "与 Real Name 一致" : `与档案 Real Name（${currentProfile.legalName}）不一致`}</small></dd></div>
-                  <div><dt>Bill to</dt><dd><strong>{extractedData.billTo}</strong><small className={billToMatchesComets ? "match-ok" : "match-error"}>{billToMatchesComets ? "COMETS 主体校验通过" : "应为 COMETS INTERNATIONAL LIMITED"}</small></dd></div>
-                  <div><dt>Project</dt><dd><strong>{invoice.projectName}</strong><small>{invoice.projectId}</small></dd></div>
-                  <div><dt>Invoice date</dt><dd><strong>{extractedData.invoiceDate}</strong><small>已同步至 Invoice 日期</small></dd></div>
-                  <div><dt>Currency / Total</dt><dd><strong>{extractedData.currency} {extractedData.total}</strong><small>已同步至币种与金额</small></dd></div>
-                </dl>
-              </div>
-            ) : null}
-            {detailTab === "PAYOUT" ? (
-              <div className="invoice-payout-panel" role="tabpanel">
-                <header>
-                  <div><h2>收款账户比对</h2><p>仅比较 Invoice Payment details 中识别到的字段</p></div>
-                  <StatusBadge label={paymentComparison.matches ? "信息一致" : "账户不匹配"} tone={paymentComparison.matches ? "success" : "danger"} />
-                </header>
-                {canCreatorAct ? (
-                  <label className="field invoice-account-select"><span>付款账户</span><select value={selectedPayoutAccount.id} onChange={async (event) => { await selectInvoicePayoutAccount(invoice.id, event.target.value); setNoticeTone("success"); setNotice("付款账户已更新，系统已重新完成字段比对"); }}>{usablePayoutAccounts.map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency} · {maskPayoutIdentifier(account)}</option>)}</select></label>
-                ) : null}
-                {!paymentComparison.matches ? (
-                  <div className="invoice-account-mismatch" role="alert"><Info size={17} /><div><strong>付款账号不匹配</strong><p>请选择新的付款账户，或更换为与所选账户 Payment information 一致的 Invoice。也可前往个人档案修改付款信息后重新比对。</p>{canCreatorAct ? <div><Link to="/profile#payout-information">前往个人档案</Link><Link to="/invoices">重新上传 Invoice</Link></div> : null}</div></div>
-                ) : (
-                  <div className="invoice-account-match"><CheckCircle2 size={17} /><span>已识别字段均与所选付款账户一致；Invoice 未提供的字段已从该账户补齐。</span></div>
-                )}
-                <dl className="invoice-payment-compare-list">
-                  {Object.entries(paymentComparison.merged).filter(([, value]) => value).map(([key, value]) => {
-                    const compared = paymentComparison.fields.find((field) => field.key === key);
-                    return <div key={key}><dt>{PAYMENT_DETAIL_LABELS[key] || key}<small>{compared ? "Invoice 已识别" : "付款账户补充"}</small></dt><dd><strong>{value}</strong><span className={compared?.matches === false ? "match-error" : "match-ok"}>{compared?.matches === false ? "不一致" : <Check size={12} />}</span></dd></div>;
-                  })}
-                </dl>
-              </div>
-            ) : null}
-            {detailTab === "PROCESS" ? (
-              <div className="invoice-process-panel" role="tabpanel">
-                <header><div><h2>处理状态</h2><p>保留上传、审核、修改与付款的完整记录</p></div><StatusBadge label={meta.label} tone={meta.tone} /></header>
-                <div className="compact-timeline invoice-full-timeline">
-                  {timeline.map((item) => <div className={item.state} key={item.label}><span>{item.state === "complete" ? <Check size={13} /> : item.state === "current" ? <Clock3 size={12} /> : item.state === "error" ? <Info size={13} /> : null}</span><div><strong>{item.label}</strong><small>{item.time}</small></div></div>)}
-                </div>
-                {invoice.processHistory?.length ? <div className="invoice-history-log"><h3>操作记录</h3>{invoice.processHistory.map((event) => <article key={event.id}><span>{event.label}</span><div><strong>{event.actor}</strong><small>{new Date(event.occurredAt).toLocaleString("zh-CN", { hour12: false })}</small>{event.reason ? <p>{event.reason}</p> : null}</div></article>)}</div> : null}
-                {invoice.status === "PENDING_REVIEW" ? <div className="review-note"><Clock3 size={17} /><span>{isPaymentCorrectionReview ? "付款资料修正已提交，审核从资料审核节点重新开始" : "预计 1-2 个工作日内完成审核"}</span></div> : null}
-                {invoice.status === "CHANGES_REQUIRED" ? <div className="payment-repair-note"><Info size={17} /><span>{invoice.rejectedReason || "审核账号或系统要求修改 Invoice 信息"}</span></div> : null}
-                <div className="invoice-action-stack">
-                  {canCreatorAct && invoice.status === "PENDING_CONFIRMATION" ? <button className="primary-button" type="button" disabled={busy || !paymentComparison.matches || !invoiceFromMatchesProfile || !billToMatchesComets} onClick={() => transition("PENDING_REVIEW", "Invoice 已确认并提交审核")}><FileCheck2 size={16} />确认并提交审核</button> : null}
-                  {canCreatorAct && invoice.status === "PAYMENT_FAILED" && !paymentIssueResolved ? <button className="payment-edit-button" type="button" onClick={() => navigate(`/profile?repairInvoice=${invoice.id}&field=${paymentIssue?.fieldKey || "account_number"}#payout-information`)}><Pencil size={16} />修改付款信息</button> : null}
-                  {canCreatorAct && invoice.status === "PAYMENT_FAILED" ? <button className="payment-retry-button" type="button" disabled={busy || !paymentIssueResolved} onClick={() => transition("PENDING_REVIEW", "付款信息已提交审核，当前进入资料审核")}><FileCheck2 size={16} />提交审核</button> : null}
-                  {canCreatorAct && isAwaitingSignature ? <button className="invoice-issue-button" type="button" onClick={() => setIssueOpen(true)}><Info size={16} />Invoice 信息有误</button> : null}
-                  {canCreatorAct && isAwaitingSignature ? <button className="primary-button" disabled={busy} onClick={() => setSignatureOpen(true)}><PenLine size={16} />签署 Invoice</button> : null}
-                  <button className="invoice-action-download-button" type="button" onClick={() => downloadInvoiceDocument(invoice)}><Download size={16} />下载 Invoice</button>
-                </div>
-              </div>
-            ) : null}
+            {detailTab === "SUMMARY" ? <div className="invoice-summary-panel" role="tabpanel"><header><span className="resource-icon purple"><FileCheck2 size={17} /></span><div><h2>Invoice 摘要</h2><p>{kind === "EXTERNAL" ? "OCR 识别结果" : "系统生成信息"}</p></div></header><dl><div><dt>Invoice 编号</dt><dd><strong>{number}</strong></dd></div><div><dt>Invoice 类型</dt><dd><strong>{kind === "INTERNAL" ? "内部 Invoice" : "外部 Invoice"}</strong></dd></div><div><dt>Invoice From</dt><dd><strong>{extractedData.invoiceFrom}</strong><small className={invoiceFromMatchesProfile ? "match-ok" : "match-error"}>{invoiceFromMatchesProfile ? "与 Real Name 一致" : "与档案 Real Name 不一致"}</small></dd></div><div><dt>Bill To</dt><dd><strong>{extractedData.billTo}</strong><small className={billToMatchesComets ? "match-ok" : "match-error"}>{billToMatchesComets ? "主体校验通过" : "应为 COMETS INTERNATIONAL LIMITED"}</small></dd></div><div><dt>Invoice date</dt><dd><strong>{extractedData.invoiceDate}</strong></dd></div><div><dt>Currency / Total</dt><dd><strong>{extractedData.currency} {extractedData.total}</strong></dd></div></dl></div> : null}
+            {detailTab === "PAYOUT" ? <div className="invoice-payout-panel" role="tabpanel"><header><div><h2>收款账户比对</h2><p>仅比较 Invoice 中已识别的收款字段</p></div><StatusBadge label={paymentComparison.matches ? "信息一致" : "账户不匹配"} tone={paymentComparison.matches ? "success" : "danger"} /></header>{canCreatorAct && invoice.paymentStatus !== "FAILED" ? <label className="field invoice-account-select"><span>收款账户</span><select value={selectedPayoutAccount.id} onChange={(event) => void runAction(() => selectInvoicePayoutAccount(resourceId, event.target.value), "收款账户已更新")} >{usablePayoutAccounts.map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency} · {maskPayoutIdentifier(account)}</option>)}</select></label> : null}{!paymentComparison.matches ? <div className="invoice-account-mismatch" role="alert"><Info size={17} /><div><strong>收款账号不匹配</strong><p>请选择其他已验证账户，或更新个人档案后重新核对。</p></div></div> : <div className="invoice-account-match"><CheckCircle2 size={17} /><span>已识别字段均与所选收款账户一致。</span></div>}<dl className="invoice-payment-compare-list">{Object.entries(paymentComparison.merged).filter(([, value]) => value).map(([key, value]) => { const compared = paymentComparison.fields.find((field) => field.key === key); return <div key={key}><dt>{PAYMENT_DETAIL_LABELS[key] || key}</dt><dd><strong>{key === "account_number" ? maskPayoutIdentifier(selectedPayoutAccount) : value}</strong><span className={compared?.matches === false ? "match-error" : "match-ok"}>{compared?.matches === false ? "不一致" : <Check size={12} />}</span></dd></div>; })}</dl></div> : null}
+            {detailTab === "PROCESS" ? <div className="invoice-process-panel" role="tabpanel"><header><div><h2>审核处理状态</h2><p>Invoice 文档状态与付款状态分开记录</p></div><StatusBadge label={review.label} tone={review.tone} /></header>{invoice.rejectedReason ? <div className="payment-repair-note"><Info size={17} /><span>{invoice.rejectedReason}</span></div> : null}<div className="invoice-history-log"><h3>操作记录</h3>{invoice.operationHistory?.map((event) => <article key={event.id}><span>{event.label}</span><div><strong>{event.actor}</strong><small>{new Date(event.occurredAt).toLocaleString("zh-CN", { hour12: false })}</small>{event.reason ? <p>{event.reason}</p> : null}</div></article>)}</div><div className="invoice-action-stack">{canCreatorAct && state.kind === "EXTERNAL" && state.status === "WAITING_CONFIRMATION" ? <button className="primary-button" type="button" disabled={busy || !canConfirmExternal} onClick={() => void runAction(() => confirmExternalInvoice(resourceId), "Invoice 已确认并提交审核")}><FileCheck2 size={16} />确认并提交审核</button> : null}{canCreatorAct && state.kind === "EXTERNAL" && state.status === "RETURNED_FOR_CORRECTION" ? <button className="primary-button" type="button" disabled={busy} onClick={() => void runAction(() => correctExternalInvoice(resourceId, extractedData), "修改已保存，请重新确认")}><Pencil size={16} />修改并重新确认</button> : null}{canCreatorAct && canUpload ? <button className="primary-button" type="button" onClick={() => setUploadOpen(true)}><Upload size={16} />{state.kind === "EXTERNAL" && state.status === "WAITING_UPLOAD" ? "上传 Invoice" : "重新上传文件"}</button> : null}{canCreatorAct && isAwaitingSignature ? <button className="invoice-issue-button" type="button" onClick={() => setIssueOpen(true)}><Info size={16} />Invoice 信息有误</button> : null}{canCreatorAct && isAwaitingSignature ? <button className="primary-button" disabled={busy} onClick={() => setSignatureOpen(true)}><PenLine size={16} />签署 Invoice</button> : null}<button className="invoice-action-download-button" type="button" onClick={() => downloadInvoiceDocument(invoice)}><Download size={16} />下载 Invoice</button></div></div> : null}
+            {detailTab === "PAYMENT" ? <div className="invoice-process-panel" role="tabpanel"><header><div><h2>付款状态</h2><p>{invoice.paymentExpectedAt ? `预计处理时间：${invoice.paymentExpectedAt}` : "进度更新至原 Invoice"}</p></div><StatusBadge label={payment.label} tone={payment.tone} /></header><dl className="invoice-payment-card"><div><dt>Invoice 编号</dt><dd>{number}</dd></div><div><dt>金额</dt><dd>{invoice.amount}</dd></div><div><dt>收款账户</dt><dd>{maskPayoutIdentifier(selectedPayoutAccount)}</dd></div>{invoice.paymentCompletedAt ? <div><dt>完成时间</dt><dd>{invoice.paymentCompletedAt}</dd></div> : null}{invoice.paymentFailureReason ? <div><dt>失败原因</dt><dd>{invoice.paymentFailureReason}</dd></div> : null}</dl><div className="compact-timeline invoice-full-timeline">{paymentTimeline.map(([label, status]) => <div className={status} key={label}><span>{status === "complete" ? <Check size={13} /> : status === "current" ? <Clock3 size={12} /> : status === "error" ? <Info size={13} /> : null}</span><div><strong>{label}</strong></div></div>)}</div>{canCreatorAct && invoice.paymentStatus === "FAILED" && !repairSubmitted ? <div className="invoice-action-stack"><button className="payment-edit-button" type="button" onClick={() => navigate(`/profile?repairInvoice=${number}&field=${paymentIssue?.fieldKey || "account_number"}#payout-information`)}><Pencil size={16} />修改收款信息</button><label className="field invoice-account-select"><span>或选择其他已验证账户</span><select value={correctionAccountId} onChange={(event) => setCorrectionAccountId(event.target.value)}><option value="">请选择</option>{usablePayoutAccounts.filter((account) => account.id !== invoice.payoutAccountId).map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency} · {maskPayoutIdentifier(account)}</option>)}</select></label><button className="payment-retry-button" type="button" disabled={!correctionAccountId || busy} onClick={() => void runAction(() => submitPaymentAccountCorrection(resourceId, { payoutAccountId: correctionAccountId, submittedBy: session?.userId || currentProfile.id }), "收款资料已提交复核")}><FileCheck2 size={16} />提交资料复核</button></div> : null}{repairSubmitted ? <div className="review-note"><Clock3 size={17} /><span>收款资料已提交复核，重新付款将由系统后续处理。</span></div> : null}</div> : null}
           </section>
         </aside>
       </div>
-      {canCreatorAct && signatureOpen ? (
-        <SignatureModal
-          invoice={invoice}
-          signerName={currentProfile.legalName}
-          payoutAccountName={currentProfile.payout.accountHolder || currentProfile.legalName}
-          onClose={() => setSignatureOpen(false)}
-          onConfirm={sign}
-        />
-      ) : null}
-      {canCreatorAct && issueOpen && isAwaitingSignature ? (
-        <div className="invoice-issue-modal-overlay" role="presentation">
-          <form className="invoice-issue-modal" role="dialog" aria-modal="true" aria-labelledby="invoice-issue-title" onSubmit={submitIssue}>
-            <header>
-              <div>
-                <span className="invoice-issue-modal-icon"><Info size={19} /></span>
-                <div><h2 id="invoice-issue-title">反馈 Invoice 信息问题</h2><p>请说明不准确的信息，工作人员会尽快核查。</p></div>
-              </div>
-              <button type="button" className="icon-button" title="关闭" onClick={() => setIssueOpen(false)}><X size={18} /></button>
-            </header>
-            <label className="field">
-              <span>问题类型</span>
-              <select value={issueType} onChange={(event) => setIssueType(event.target.value)}>
-                <option>付款项目有误</option>
-                <option>付款信息有误</option>
-                <option>金额或币种有误</option>
-                <option>其他信息有误</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>问题说明</span>
-              <textarea value={issueDetails} onChange={(event) => setIssueDetails(event.target.value)} placeholder="请描述需要核查或修改的内容" required />
-            </label>
-            <footer>
-              <button type="button" className="secondary-button" onClick={() => setIssueOpen(false)}>取消</button>
-              <button type="submit" className="primary-button" disabled={!issueDetails.trim()}>提交反馈</button>
-            </footer>
-          </form>
-        </div>
-      ) : null}
-      {issueSuccessOpen ? (
-        <div className="profile-save-overlay" role="presentation">
-          <section
-            className="profile-save-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="invoice-issue-success-title"
-            aria-describedby="invoice-issue-success-description"
-          >
-            <span className="profile-save-icon success">
-              <CheckCircle2 size={25} />
-            </span>
-            <h2 id="invoice-issue-success-title">反馈提交成功</h2>
-            <p id="invoice-issue-success-description">
-              “{submittedIssueType}”已提交，工作人员会尽快核查并与您同步处理结果。
-            </p>
-            <button type="button" className="primary-button" onClick={() => setIssueSuccessOpen(false)}>
-              知道了
-            </button>
-          </section>
-        </div>
-      ) : null}
+
+      {canCreatorAct && signatureOpen ? <SignatureModal invoice={invoice} signerName={currentProfile.legalName} payoutAccountName={currentProfile.payout.accountHolder || currentProfile.legalName} onClose={() => setSignatureOpen(false)} onConfirm={sign} /> : null}
+      {canCreatorAct && uploadOpen && state.kind === "EXTERNAL" ? <InvoiceUploadModal invoice={invoice} profile={currentProfile} onClose={() => setUploadOpen(false)} onUploaded={() => { setUploadOpen(false); setNoticeTone("success"); setNotice("文件已上传，OCR 识别结果已生成"); }} /> : null}
+      {canCreatorAct && issueOpen && isAwaitingSignature ? <div className="invoice-issue-modal-overlay" role="presentation"><form className="invoice-issue-modal" role="dialog" aria-modal="true" aria-labelledby="invoice-issue-title" onSubmit={(event) => void submitIssue(event)}><header><div><span className="invoice-issue-modal-icon"><Info size={19} /></span><div><h2 id="invoice-issue-title">反馈 Invoice 信息问题</h2><p>请说明不准确的信息，工作人员会尽快核查。</p></div></div><button type="button" className="icon-button" title="关闭" onClick={() => setIssueOpen(false)}><X size={18} /></button></header><label className="field"><span>问题类型</span><select value={issueType} onChange={(event) => setIssueType(event.target.value)}><option>收款信息有误</option><option>金额或币种有误</option><option>Invoice 主体有误</option><option>其他信息有误</option></select></label><label className="field"><span>问题说明</span><textarea value={issueDetails} onChange={(event) => setIssueDetails(event.target.value)} placeholder="请描述需要核查或修改的内容" required /></label><footer><button type="button" className="secondary-button" onClick={() => setIssueOpen(false)}>取消</button><button type="submit" className="primary-button" disabled={!issueDetails.trim() || busy}>提交反馈</button></footer></form></div> : null}
+      {issueSuccessOpen ? <div className="profile-save-overlay" role="presentation"><section className="profile-save-dialog" role="dialog" aria-modal="true" aria-labelledby="invoice-issue-success-title"><span className="profile-save-icon success"><CheckCircle2 size={25} /></span><h2 id="invoice-issue-success-title">反馈提交成功</h2><p>“{submittedIssueType}”已持久化记录，可在操作历史中查看。</p><button type="button" className="primary-button" onClick={() => setIssueSuccessOpen(false)}>知道了</button></section></div> : null}
     </div>
   );
 }
@@ -3684,7 +3442,7 @@ function ProfilePage() {
     profile,
     invoices,
     saveProfile,
-    resolveInvoicePaymentIssue,
+    submitPaymentAccountCorrection,
   } = useApp();
   const location = useLocation();
   const navigate = useNavigate();
@@ -3699,7 +3457,8 @@ function ProfilePage() {
   const hasRepairContext = Boolean(repairInvoiceId && repairIssue);
   const isRepairFlow = Boolean(
     repairInvoiceId &&
-      repairInvoice?.status === "PAYMENT_FAILED" &&
+      repairInvoice?.paymentStatus === "FAILED" &&
+      repairInvoice?.paymentRecoveryStatus === "AWAITING_CREATOR_UPDATE" &&
       repairIssue &&
       !repairIssue.resolvedAt,
   );
@@ -4032,9 +3791,13 @@ function ProfilePage() {
       await saveProfile(validatedDraft);
       if (profileEditing) setAdminCorrections([]);
       if (isRepairFlow && repairInvoiceId && repairIssue) {
-        await resolveInvoicePaymentIssue(
+        await submitPaymentAccountCorrection(
           repairInvoiceId,
-          schemaValues[repairIssue.fieldKey] || "",
+          {
+            fieldKey: repairIssue.fieldKey,
+            correctedValue: schemaValues[repairIssue.fieldKey] || "",
+            submittedBy: profile.id,
+          },
         );
       }
       await new Promise<void>((resolve) => window.setTimeout(resolve, 650));
@@ -4426,7 +4189,7 @@ function ProfilePage() {
           <span><Info size={18} /></span>
           <div>
             <strong>正在修复 {repairInvoiceId} 的付款信息</strong>
-            <p>发起付款时发现“{repairIssue.fieldLabel}”无法通过校验。请修改标记字段，完成 Airwallex 校验并保存后，再返回 Invoice 提交审核。</p>
+            <p>发起付款时发现“{repairIssue.fieldLabel}”无法通过校验。请修改标记字段并完成 Airwallex 校验；保存成功后系统将自动提交收款资料复核。</p>
           </div>
         </section>
       ) : null}
@@ -5138,7 +4901,7 @@ function ProfilePage() {
                 ? "正在校验个人资料与收款账户，请稍候。"
                 : saveState === "success"
                   ? hasRepairContext
-                    ? "Airwallex 校验已通过，可以返回 Invoice 提交审核。"
+                    ? "Airwallex 校验已通过，收款资料已提交复核。"
                     : "个人档案已保存，最新资料已同步更新。"
                   : saveError || "暂时无法保存，请检查资料后重试。"}
             </p>

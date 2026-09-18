@@ -45,6 +45,46 @@ export type InvoiceStatus =
   | "APPROVED"
   | "PAID";
 
+/**
+ * Creator-facing Invoice document state. Payment execution is intentionally
+ * modelled separately below; a failed transfer must never roll an approved
+ * document back into review.
+ */
+export type InternalInvoiceReviewStatus =
+  | "WAITING_SIGNATURE"
+  | "CREATOR_FEEDBACK"
+  | "UNDER_REVIEW"
+  | "CHANGES_REQUIRED"
+  | "APPROVED";
+
+export type ExternalInvoiceCollectionStatus =
+  | "WAITING_UPLOAD"
+  | "RECOGNIZING"
+  | "WAITING_CONFIRMATION"
+  | "WAITING_MEDIA_REVIEW"
+  | "RETURNED_FOR_CORRECTION"
+  | "RETURNED_FOR_REUPLOAD"
+  | "APPROVED"
+  | "RECOGNITION_FAILED";
+
+export type PaymentStatus =
+  | "WAITING_PAYMENT"
+  | "PROCESSING"
+  | "PAID"
+  | "FAILED";
+
+export type PaymentFailureRecoveryStatus =
+  | "AWAITING_CREATOR_UPDATE"
+  | "CREATOR_UPDATED"
+  | "PENDING_FINANCE_CONFIRMATION"
+  | "READY_FOR_RETRY"
+  | "RETRY_SUBMITTED"
+  | "RETRY_SUCCEEDED";
+
+export type InvoiceDocumentState =
+  | { kind: "INTERNAL"; status: InternalInvoiceReviewStatus }
+  | { kind: "EXTERNAL"; status: ExternalInvoiceCollectionStatus };
+
 export type RequestStatus = InvoiceStatus;
 
 export interface InvoiceSignature {
@@ -54,7 +94,12 @@ export interface InvoiceSignature {
   signedAt: string;
 }
 
-export type InvoiceType = "EXTERNAL_CONTRACT" | "INTERNAL_CONTRACT";
+export type InvoiceType =
+  | "EXTERNAL"
+  | "INTERNAL"
+  /** @deprecated Legacy persisted values are migrated by the adapter. */
+  | "EXTERNAL_CONTRACT"
+  | "INTERNAL_CONTRACT";
 
 export interface InvoiceExtractedData {
   invoiceFrom: string;
@@ -76,6 +121,45 @@ export interface InvoiceProcessEvent {
   reason?: string;
 }
 
+export interface InvoiceFileVersion extends FileRef {
+  version: number;
+  uploadedAt: string;
+  demoHash: string;
+  supersedesFileId?: string;
+}
+
+export interface InvoiceFeedbackRecord {
+  id: string;
+  issueType: string;
+  details: string;
+  invoiceId: string;
+  invoiceVersion: number;
+  submittedAt: string;
+  submittedBy: string;
+}
+
+export type InvoiceOperationType =
+  | "LEGACY_MIGRATED"
+  | "INTERNAL_SIGNED"
+  | "FEEDBACK_SUBMITTED"
+  | "EXTERNAL_FILE_UPLOADED"
+  | "EXTERNAL_RECOGNIZED"
+  | "EXTERNAL_CONFIRMED"
+  | "EXTERNAL_CORRECTED"
+  | "EXTERNAL_RESUBMITTED"
+  | "PAYOUT_ACCOUNT_SELECTED"
+  | "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED"
+  | "PAYMENT_STATUS_UPDATED";
+
+export interface InvoiceOperationEvent {
+  id: string;
+  type: InvoiceOperationType;
+  label: string;
+  actor: string;
+  occurredAt: string;
+  reason?: string;
+}
+
 export interface InvoiceUploadInput {
   projectId: string;
   projectName: string;
@@ -85,6 +169,26 @@ export interface InvoiceUploadInput {
   invoiceType: InvoiceType;
   file: FileRef;
   extractedData: InvoiceExtractedData;
+}
+
+export interface ExternalInvoiceUploadInput {
+  invoiceId: string;
+  payoutAccountId: string;
+  file: FileRef;
+  extractedData: InvoiceExtractedData;
+}
+
+export interface InvoiceFeedbackInput {
+  issueType: string;
+  details: string;
+  submittedBy: string;
+}
+
+export interface PaymentAccountCorrectionInput {
+  payoutAccountId?: string;
+  fieldKey?: string;
+  correctedValue?: string;
+  submittedBy: string;
 }
 
 export interface ApiResult<T> {
@@ -230,6 +334,11 @@ export interface ContractObligation {
   stage: "履约中" | "请款前";
 }
 
+export type ContractLifecycleStatus =
+  | "PENDING_SIGNATURE"
+  | "ACTIVE"
+  | "EXPIRED";
+
 export interface Contract {
   id: string;
   orderId: string;
@@ -241,15 +350,33 @@ export interface Contract {
   amount: string;
   effectiveDate: string;
   servicePeriod: string;
-  status: "未请款" | "请款中" | "已付款";
+  status: ContractLifecycleStatus;
   obligations: ContractObligation[];
   fileName: string;
   documentUrl: string;
   pageCount: number;
   updatedAt: string;
+  signedAt?: string;
+  signatureRecord?: {
+    id: string;
+    actorId: string;
+    actorRole: UserRole;
+    signedAt: string;
+    acknowledgement: string;
+  };
+  history?: Array<{
+    id: string;
+    action: "SIGNED";
+    actorId: string;
+    occurredAt: string;
+  }>;
 }
 
 export interface Invoice {
+  /** Stable internal resource key used by services and relationships. */
+  invoiceId?: string;
+  /** User-visible identifier used in all creator-facing copy and search. */
+  invoiceNumber?: string;
   id: string;
   projectId: string;
   projectName: string;
@@ -278,6 +405,65 @@ export interface Invoice {
     resubmittedAt?: string;
   };
   signature?: InvoiceSignature;
+  documentState?: InvoiceDocumentState;
+  paymentStatus?: PaymentStatus;
+  paymentRecoveryStatus?: PaymentFailureRecoveryStatus;
+  paymentExpectedAt?: string;
+  paymentCompletedAt?: string;
+  paymentFailureReason?: string;
+  fileVersions?: InvoiceFileVersion[];
+  feedbackRecords?: InvoiceFeedbackRecord[];
+  operationHistory?: InvoiceOperationEvent[];
+}
+
+export type CreatorTaskGroup = "TODO" | "PROCESSING" | "COMPLETED";
+
+export type CreatorTaskType =
+  | "CONTRACT_SIGNATURE"
+  | "INTERNAL_INVOICE_SIGNATURE"
+  | "INVOICE_FEEDBACK_PROCESSING"
+  | "EXTERNAL_INVOICE_UPLOAD"
+  | "EXTERNAL_INVOICE_CORRECTION"
+  | "EXTERNAL_INVOICE_REUPLOAD"
+  | "PAYMENT_ACCOUNT_CORRECTION"
+  | "INVOICE_PROCESSING"
+  | "PAYMENT_COMPLETED";
+
+export interface CreatorTask {
+  id: string;
+  type: CreatorTaskType;
+  group: CreatorTaskGroup;
+  resourceId: string;
+  resourceNumber: string;
+  title: string;
+  description: string;
+  deepLink: string;
+  updatedAt: string;
+}
+
+export type CreatorNotificationType =
+  | "CONTRACT_SIGNATURE_REQUIRED"
+  | "INTERNAL_INVOICE_SIGNATURE_REQUIRED"
+  | "INVOICE_FEEDBACK_RECEIVED"
+  | "EXTERNAL_INVOICE_UPLOAD_REQUIRED"
+  | "EXTERNAL_INVOICE_CORRECTION_REQUIRED"
+  | "EXTERNAL_INVOICE_REUPLOAD_REQUIRED"
+  | "INVOICE_SUBMITTED"
+  | "PAYMENT_FAILED"
+  | "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED"
+  | "PAYMENT_PAID";
+
+export interface CreatorNotification {
+  id: string;
+  userId: string;
+  type: CreatorNotificationType;
+  title: string;
+  message: string;
+  deepLink: string;
+  resourceId: string;
+  createdAt: string;
+  read: boolean;
+  tone: "purple" | "amber" | "danger" | "success";
 }
 
 export interface RequestProgressNode {

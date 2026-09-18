@@ -100,7 +100,7 @@ interface ExternalRecordState {
 }
 
 interface AdminStoreState {
-  version: 2;
+  version: 3;
   users: UserAccount[];
   credentials: Record<string, string>;
   profiles: Record<string, UserProfile>;
@@ -146,10 +146,24 @@ const invoiceStatusLabel: Record<Invoice["status"], string> = {
   PAID: "已付款",
 };
 
-const deriveExternalContractStatus = (
-  status: Invoice["status"],
-): Contract["status"] =>
-  status === "PAID" ? "已付款" : "请款中";
+const CONTRACT_LIFECYCLE_STATUSES: Contract["status"][] = [
+  "PENDING_SIGNATURE",
+  "ACTIVE",
+  "EXPIRED",
+];
+
+const isContractLifecycleStatus = (
+  value: unknown,
+): value is Contract["status"] =>
+  typeof value === "string" &&
+  CONTRACT_LIFECYCLE_STATUSES.includes(value as Contract["status"]);
+
+const migrateContractLifecycleStatus = (value: unknown): Contract["status"] => {
+  if (isContractLifecycleStatus(value)) return value;
+  if (value === "未请款") return "PENDING_SIGNATURE";
+  if (value === "请款中" || value === "已付款") return "ACTIVE";
+  return "PENDING_SIGNATURE";
+};
 
 const createCreatorProfile = ({
   id,
@@ -344,6 +358,7 @@ const createSeedExternalContract = ({
   amount,
   effectiveDate,
   servicePeriod,
+  status,
   updatedAt,
 }: {
   creatorId: string;
@@ -355,6 +370,7 @@ const createSeedExternalContract = ({
   amount: string;
   effectiveDate: string;
   servicePeriod: string;
+  status: Contract["status"];
   updatedAt: string;
 }): ExternalRecordState => ({
   creatorId,
@@ -371,7 +387,7 @@ const createSeedExternalContract = ({
     amount,
     effectiveDate,
     servicePeriod,
-    status: "未请款",
+    status,
     updatedAt,
   },
 });
@@ -386,7 +402,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Lumière Paris",
     amount: "EUR 3,600",
     effectiveDate: "2026-07-03",
-    servicePeriod: "2026-07-03 至 2026-08-15",
+    servicePeriod: "2026-07-03 至 2026-10-15",
+    status: "ACTIVE",
     updatedAt: "2026-07-03",
   }),
   createSeedExternalContract({
@@ -398,7 +415,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Maison Élan",
     amount: "EUR 2,400",
     effectiveDate: "2026-07-12",
-    servicePeriod: "2026-07-12 至 2026-08-20",
+    servicePeriod: "2026-07-12 至 2026-10-20",
+    status: "ACTIVE",
     updatedAt: "2026-07-12",
   }),
   createSeedExternalContract({
@@ -409,8 +427,9 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     projectName: "Veloce 城市出行体验",
     brand: "Veloce",
     amount: "EUR 1,800",
-    effectiveDate: "2026-07-26",
-    servicePeriod: "2026-07-26 至 2026-08-31",
+    effectiveDate: "2026-09-24",
+    servicePeriod: "2026-09-24 至 2026-10-31",
+    status: "PENDING_SIGNATURE",
     updatedAt: "2026-07-26",
   }),
   createSeedExternalContract({
@@ -422,7 +441,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Northpeak",
     amount: "GBP 3,200",
     effectiveDate: "2026-06-29",
-    servicePeriod: "2026-06-29 至 2026-08-05",
+    servicePeriod: "2026-06-29 至 2026-10-05",
+    status: "ACTIVE",
     updatedAt: "2026-06-29",
   }),
   createSeedExternalContract({
@@ -435,6 +455,7 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     amount: "GBP 2,750",
     effectiveDate: "2026-07-10",
     servicePeriod: "2026-07-10 至 2026-08-18",
+    status: "EXPIRED",
     updatedAt: "2026-07-10",
   }),
   createSeedExternalContract({
@@ -445,8 +466,9 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     projectName: "SoundWave 无线耳机开箱",
     brand: "SoundWave",
     amount: "GBP 1,950",
-    effectiveDate: "2026-07-21",
-    servicePeriod: "2026-07-21 至 2026-08-28",
+    effectiveDate: "2026-09-21",
+    servicePeriod: "2026-09-21 至 2026-10-28",
+    status: "PENDING_SIGNATURE",
     updatedAt: "2026-07-21",
   }),
   createSeedExternalContract({
@@ -459,6 +481,7 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     amount: "JPY 620,000",
     effectiveDate: "2026-07-05",
     servicePeriod: "2026-07-05 至 2026-08-25",
+    status: "EXPIRED",
     updatedAt: "2026-07-05",
   }),
   createSeedExternalContract({
@@ -470,7 +493,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Kumo Travel",
     amount: "JPY 480,000",
     effectiveDate: "2026-07-19",
-    servicePeriod: "2026-07-19 至 2026-09-05",
+    servicePeriod: "2026-07-19 至 2026-10-05",
+    status: "ACTIVE",
     updatedAt: "2026-07-19",
   }),
   createSeedExternalContract({
@@ -483,6 +507,7 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     amount: "EUR 3,100",
     effectiveDate: "2026-07-14",
     servicePeriod: "2026-07-14 至 2026-08-30",
+    status: "EXPIRED",
     updatedAt: "2026-07-14",
   }),
   createSeedExternalContract({
@@ -493,8 +518,9 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     projectName: "Casa Verde 智能家居体验",
     brand: "Casa Verde",
     amount: "EUR 2,250",
-    effectiveDate: "2026-07-28",
-    servicePeriod: "2026-07-28 至 2026-09-10",
+    effectiveDate: "2026-09-26",
+    servicePeriod: "2026-09-26 至 2026-11-10",
+    status: "PENDING_SIGNATURE",
     updatedAt: "2026-07-28",
   }),
 ];
@@ -640,6 +666,7 @@ const seedExternalBusinessRecords = [
 
 const mergeSeedExternalRecords = (
   storedRecords?: ExternalRecordState[],
+  enforceCanonicalSeedContracts = false,
 ): ExternalRecordState[] => {
   const records = new Map<string, ExternalRecordState>();
   const keyFor = (record: ExternalRecordState) =>
@@ -653,6 +680,29 @@ const mergeSeedExternalRecords = (
       records.set(keyFor(record), clone(record));
     });
   }
+  const canonicalSeedContracts = new Map(
+    seedExternalContractRecords.map((record) => [
+      keyFor(record),
+      record.payload,
+    ]),
+  );
+  records.forEach((record, key) => {
+    if (record.resourceType !== "CONTRACT") return;
+    const canonical = canonicalSeedContracts.get(key);
+    if (canonical && enforceCanonicalSeedContracts) {
+      record.payload = {
+        ...record.payload,
+        effectiveDate: canonical.effectiveDate,
+        servicePeriod: canonical.servicePeriod,
+        status: canonical.status,
+      };
+      return;
+    }
+    record.payload = {
+      ...record.payload,
+      status: migrateContractLifecycleStatus(record.payload.status),
+    };
+  });
   return [...records.values()];
 };
 
@@ -676,7 +726,7 @@ const defaultSettings: AdminSettings = {
 };
 
 const createSeedState = (): AdminStoreState => ({
-  version: 2,
+  version: 3,
   users: clone(seedUsers),
   credentials: {
     "ADMIN-001": ADMIN_DEMO_CREDENTIALS.password,
@@ -825,14 +875,24 @@ export class MockAdminStore {
       > & {
         version?: number;
       };
+      if (parsed.version === 3) {
+        return {
+          ...createSeedState(),
+          ...parsed,
+          version: 3,
+          sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+          invitations: Array.isArray(parsed.invitations) ? parsed.invitations : [],
+          externalRecords: mergeSeedExternalRecords(parsed.externalRecords),
+        };
+      }
       if (parsed.version === 2) {
         return {
           ...createSeedState(),
           ...parsed,
-          version: 2,
+          version: 3,
           sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
           invitations: Array.isArray(parsed.invitations) ? parsed.invitations : [],
-          externalRecords: mergeSeedExternalRecords(parsed.externalRecords),
+          externalRecords: mergeSeedExternalRecords(parsed.externalRecords, true),
         };
       }
       if (parsed.version === 1) {
@@ -840,10 +900,10 @@ export class MockAdminStore {
         return {
           ...createSeedState(),
           ...parsed,
-          version: 2,
+          version: 3,
           users,
           sessions: [],
-          externalRecords: mergeSeedExternalRecords(parsed.externalRecords),
+          externalRecords: mergeSeedExternalRecords(parsed.externalRecords, true),
           invitations: users
             .filter((user) => user.invitationStatus === "PENDING")
             .map((user) => ({
@@ -1280,17 +1340,7 @@ export class MockAdminStore {
         }
       });
     const invoices = [...invoiceMap.values()];
-    const contracts = [...contractMap.values()].map((contract) => {
-      const invoice = invoices.find(
-        (item) =>
-          item.projectId === contract.projectId ||
-          item.projectName.normalize("NFKC").trim() ===
-            contract.projectName.normalize("NFKC").trim(),
-      );
-      return invoice
-        ? { ...contract, status: deriveExternalContractStatus(invoice.status) }
-        : contract;
-    });
+    const contracts = [...contractMap.values()];
     const requestMap = new Map(
       (isPrimaryCreator ? clone(seedRequests) : []).map((request) => [
         request.id,
@@ -1319,7 +1369,7 @@ export class MockAdminStore {
         status: invoice.status,
         contractIds: [contract.id],
         invoiceIds: [invoice.id],
-        contractStatus: deriveExternalContractStatus(invoice.status),
+        contractStatus: contract.status,
         invoiceStatus: invoiceStatusLabel[invoice.status],
         updatedAt: invoice.updatedAt,
         progress: existing?.progress || [],
@@ -1841,6 +1891,36 @@ export class MockAdminStore {
     }
     if (this.state.processedEventIds.includes(event.eventId)) {
       return { accepted: true, duplicate: true };
+    }
+    if (
+      event.resourceType === "CONTRACT" &&
+      !isContractLifecycleStatus(event.payload.status)
+    ) {
+      this.state.syncIssues.unshift({
+        id: `SYNC-ISSUE-${idSuffix()}`,
+        eventId: event.eventId,
+        creatorId: event.creatorId,
+        resourceType: event.resourceType,
+        message: "外部合同事件的生命周期状态无效，本次同步已拒绝。",
+        occurredAt: event.occurredAt,
+      });
+      this.audit(
+        "SYSTEM",
+        "EXTERNAL_DATA_REJECTED",
+        "SYNC",
+        "拒绝合同生命周期状态无效的外部事件",
+        {
+          subjectUserId: event.creatorId,
+          reason: String(event.payload.status || "MISSING_STATUS"),
+        },
+      );
+      this.state.processedEventIds.push(event.eventId);
+      this.save();
+      return {
+        accepted: false,
+        duplicate: false,
+        reason: "INVALID_CONTRACT_STATUS",
+      };
     }
     const creator = this.state.users.find(
       (user) => user.id === event.creatorId && user.role === "CREATOR",
