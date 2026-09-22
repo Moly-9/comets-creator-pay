@@ -65,6 +65,22 @@ export type ExternalInvoiceConfirmedSnapshot = {
   values: Record<ExternalInvoiceFieldKey, string>;
   corrections: ExternalInvoiceCorrection[];
   payoutAccountId: string;
+  effectivePaymentDetails?: Record<string, string>;
+  payoutDifferenceDecision?: "USE_BOUND_ACCOUNT";
+  payoutMismatchFields?: string[];
+  confirmedBy: string;
+  confirmedAt: string;
+};
+
+export type ExternalInvoicePageConfirmation = {
+  fileVersionId: string;
+  recognitionId: string;
+  values: Record<ExternalInvoiceFieldKey, string>;
+  payoutAccountId: string;
+  effectivePaymentDetails?: Record<string, string>;
+  payoutAccountFingerprint?: string;
+  payoutDifferenceDecision?: "USE_BOUND_ACCOUNT";
+  payoutMismatchFields?: string[];
   confirmedBy: string;
   confirmedAt: string;
 };
@@ -79,12 +95,14 @@ export type ExternalInvoiceReviewEvent = {
     | "RECOGNITION_FAILED"
     | "RECOGNITION_CORRECTED"
     | "PAYOUT_ACCOUNT_SELECTED"
+    | "PAGE_CONFIRMED"
     | "SUBMITTED"
     | "RETURNED_FOR_CORRECTION"
     | "RETURNED_FOR_REUPLOAD"
     | "APPROVED"
     | "PAYMENT_STATUS_CHANGED"
-    | "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED";
+    | "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED"
+    | "PAYMENT_RETRY_REQUESTED";
   actor: string;
   occurredAt: string;
   fromStatus?: ExternalInvoiceCollectionStatus;
@@ -100,8 +118,10 @@ export type ExternalInvoiceCommandBase = {
 };
 
 export type UploadExternalInvoiceFileCommand = ExternalInvoiceCommandBase & {
-  payoutAccountId: string;
+  /** Ignored legacy upload parameter; select the account after recognition. */
+  payoutAccountId?: string;
   file: FileRef;
+  fileBlob?: Blob;
 };
 
 export type RetryExternalInvoiceRecognitionCommand = ExternalInvoiceCommandBase & {
@@ -117,7 +137,13 @@ export type SelectExternalInvoicePayoutAccountCommand = ExternalInvoiceCommandBa
 };
 
 export type ConfirmExternalInvoiceCommand = ExternalInvoiceCommandBase & {
-  acknowledgement: true;
+  /** Legacy callers may send this; the two page confirmations are authoritative. */
+  acknowledgement?: boolean;
+};
+
+export type ConfirmExternalInvoicePageCommand = ExternalInvoiceCommandBase & {
+  page: "INVOICE" | "PAYOUT";
+  payoutDifferenceDecision?: "USE_BOUND_ACCOUNT";
 };
 
 export type ResubmitExternalInvoiceCommand = ExternalInvoiceCommandBase & {

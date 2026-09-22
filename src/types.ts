@@ -106,6 +106,8 @@ export interface InvoiceExtractedData {
   invoiceFrom: string;
   billTo: string;
   invoiceDate: string;
+  /** Optional for previously saved Invoice records; required at external Invoice confirmation. */
+  description?: string;
   currency: string;
   total: string;
   paymentDetails: Record<string, string>;
@@ -150,6 +152,7 @@ export type InvoiceOperationType =
   | "EXTERNAL_RESUBMITTED"
   | "PAYOUT_ACCOUNT_SELECTED"
   | "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED"
+  | "PAYMENT_RETRY_REQUESTED"
   | "PAYMENT_STATUS_UPDATED";
 
 export interface InvoiceOperationEvent {
@@ -174,8 +177,10 @@ export interface InvoiceUploadInput {
 
 export interface ExternalInvoiceUploadInput {
   invoiceId: string;
-  payoutAccountId: string;
+  /** Legacy demo adapter only; the current upload flow selects an account after recognition. */
+  payoutAccountId?: string;
   file: FileRef;
+  fileBlob?: Blob;
   extractedData: InvoiceExtractedData;
 }
 
@@ -194,6 +199,16 @@ export interface PaymentAccountCorrectionInput {
   clientRequestId?: string;
 }
 
+export type PaymentRetryMode = "UPDATED_ACCOUNT" | "SWITCH_ACCOUNT" | "CONFIRM_ORIGINAL";
+
+export interface PaymentRetryRequestInput {
+  mode: PaymentRetryMode;
+  payoutAccountId: string;
+  submittedBy: string;
+  expectedVersion: number;
+  clientRequestId: string;
+}
+
 export interface ApiResult<T> {
   data: T;
   message?: string;
@@ -205,6 +220,7 @@ export interface FileRef {
   mimeType: string;
   size: number;
   previewUrl?: string;
+  storageId?: string;
 }
 
 export interface SocialAccount {
@@ -217,11 +233,17 @@ export interface SocialAccount {
   screenshots: FileRef[];
   /** Screenshot evidence keyed by the exact social profile URL. */
   evidenceByProfileUrl?: Record<string, FileRef[]>;
+  /** Per-profile local demonstration result; legacy profiles retain their overall status. */
+  verificationByProfileUrl?: Record<string, { status: "DEMO_VERIFIED"; verifiedAt: string }>;
 }
 
 export interface InvoicePayoutSnapshot {
   provider: PayoutAccount["provider"];
   currency: string;
+  bankCountry?: string;
+  transferMethod?: PayoutAccount["transferMethod"];
+  beneficiaryType?: PayoutAccount["beneficiaryType"];
+  paypalEmail?: string;
   accountName: string;
   accountNumber: string;
   bankName: string;
@@ -288,6 +310,8 @@ export interface AirwallexTransferMethodOption {
   available: boolean;
   estimatedFeeAmount: number;
   feeCurrency: string;
+  arrivalMinBusinessDays: number;
+  arrivalMaxBusinessDays: number;
   recommended: boolean;
 }
 
@@ -325,6 +349,7 @@ export interface AirwallexSchemaField {
   required: boolean;
   placeholder?: string;
   description?: string;
+  example?: string;
   options?: AirwallexSchemaOption[];
   pattern?: string;
   validationMessage?: string;
@@ -391,8 +416,12 @@ export type ContractLifecycleStatus =
   | "ACTIVE"
   | "EXPIRED";
 
+export type ContractType = "INDEPENDENT" | "FRAMEWORK" | "IO";
+
 export interface Contract {
   id: string;
+  /** Immutable owner supplied by the contract system when available. */
+  creatorId?: string;
   orderId: string;
   projectId: string;
   projectName: string;
@@ -402,6 +431,7 @@ export interface Contract {
   amount: string;
   effectiveDate: string;
   servicePeriod: string;
+  contractType: ContractType;
   status: ContractLifecycleStatus;
   obligations: ContractObligation[];
   fileName: string;
@@ -415,6 +445,7 @@ export interface Contract {
     actorRole: UserRole;
     signedAt: string;
     acknowledgement: string;
+    signature?: InvoiceSignature;
   };
   feeBearer?: string;
   paymentChannel?: string;
@@ -434,8 +465,13 @@ export interface Invoice {
   creatorId?: string;
   id: string;
   projectId: string;
+  /** Immutable owning contract. Legacy records without a unique match stay unlinked. */
+  contractId?: string;
+  linkageStatus?: "LINKED" | "NEEDS_REVIEW";
   projectName: string;
   brand: string;
+  /** Creator legal name supplied with the Invoice by the management system. */
+  invoiceFrom?: string;
   channel: "Airwallex";
   amount: string;
   status: InvoiceStatus;
@@ -465,6 +501,13 @@ export interface Invoice {
   documentState?: InvoiceDocumentState;
   paymentStatus?: PaymentStatus;
   paymentRecoveryStatus?: PaymentFailureRecoveryStatus;
+  paymentRetryRequest?: {
+    mode: PaymentRetryMode;
+    payoutAccountId: string;
+    payoutSnapshot: InvoicePayoutSnapshot;
+    requestedBy: string;
+    requestedAt: string;
+  };
   paymentExpectedAt?: string;
   paymentCompletedAt?: string;
   paymentFailureReason?: string;
@@ -475,6 +518,7 @@ export interface Invoice {
   sourceFileVersions?: ExternalInvoiceFileVersion[];
   recognitionSnapshots?: ExternalInvoiceRecognitionSnapshot[];
   confirmedSnapshots?: ExternalInvoiceConfirmedSnapshot[];
+  pageConfirmations?: Partial<Record<"INVOICE" | "PAYOUT", import("./invoices/external/types").ExternalInvoicePageConfirmation>>;
   reviewHistory?: ExternalInvoiceReviewEvent[];
   version?: number;
   createdAt?: string;
@@ -482,6 +526,21 @@ export interface Invoice {
   expectedPaymentAt?: string;
   paidAt?: string;
   processedClientRequestIds?: string[];
+}
+
+/** A transfer execution is independent of the Invoice document and its review history. */
+export interface PaymentAttempt {
+  id: string;
+  invoiceId: string;
+  creatorId: string;
+  sequence: number;
+  channel: "Airwallex" | "PayPal" | "PayerMax";
+  payoutAccountId?: string;
+  payoutSnapshot?: InvoicePayoutSnapshot;
+  status: "PROCESSING" | "FAILED" | "PAID";
+  createdAt: string;
+  updatedAt: string;
+  failureReason?: string;
 }
 
 export type CreatorTaskGroup = "TODO" | "PROCESSING" | "COMPLETED";
@@ -648,6 +707,7 @@ export type AuditAction =
   | "USER_INVITED"
   | "USER_STATUS_CHANGED"
   | "PASSWORD_RESET_SENT"
+  | "PASSWORD_RESET_COMPLETED"
   | "PROFILE_UPDATED"
   | "VERIFICATION_UPDATED"
   | "CORRECTION_CREATED"
@@ -656,7 +716,8 @@ export type AuditAction =
   | "USERS_EXPORTED"
   | "SETTINGS_UPDATED"
   | "EXTERNAL_DATA_SYNCED"
-  | "EXTERNAL_DATA_REJECTED";
+  | "EXTERNAL_DATA_REJECTED"
+  | "CREATOR_BUSINESS_ACTION";
 
 export interface AuditEvent {
   id: string;
@@ -665,7 +726,7 @@ export interface AuditEvent {
   subjectUserId?: string;
   subjectName?: string;
   action: AuditAction;
-  module: "AUTH" | "USER" | "PROFILE" | "SECURITY" | "SETTINGS" | "SYNC";
+  module: "AUTH" | "USER" | "PROFILE" | "SECURITY" | "SETTINGS" | "SYNC" | "CONTRACT" | "INVOICE" | "PAYMENT";
   summary: string;
   reason?: string;
   occurredAt: string;
@@ -704,6 +765,11 @@ export interface ExternalBusinessEvent<T = Record<string, unknown>> {
   version: number;
   occurredAt: string;
   payload: T;
+}
+
+export interface ExternalContractPayload extends Record<string, unknown> {
+  contractType?: ContractType;
+  status: ContractLifecycleStatus;
 }
 
 export interface AdminUserDetail {

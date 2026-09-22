@@ -5,6 +5,7 @@ import {
   ADMIN_DEMO_CREDENTIALS,
   CREATOR_DEMO_CREDENTIALS,
   MockAdminStore,
+  adminStore,
 } from "./admin-store";
 import {
   ADMIN_PAGE_SIZES,
@@ -15,6 +16,7 @@ import {
 import { contractStatusLabel } from "./contract-status";
 import {
   buildLinkedRequestProjects,
+  bankProviderAfterChannelSelection,
   canVisitOnboardingStep,
   clearOnboardingDraft,
   filterInvoiceList,
@@ -22,8 +24,13 @@ import {
   onboardingDraftStorageKey,
   readOnboardingDraft,
   shouldShowInvoicePreSigningControls,
+  payoutDisplayGroup,
+  profileContactErrorMessage,
+  preferredProfilePayoutAccount,
+  shouldShowSocialEvidence,
   syncRequestWithInvoices,
   validateRegistration,
+  validateDemoInvitation,
   validateSocialVerification,
   writeOnboardingDraft,
 } from "./App";
@@ -31,11 +38,15 @@ import {
   buildCreatorNotifications,
   buildCreatorTasks,
   invoiceInternalIdOf,
+  invoiceLifecycleTimeline,
   invoiceNumberOf,
   migrateInvoice,
 } from "./creator-workflow";
+import { failedPaymentSnapshot } from "./payment-relations";
+import { DEMO_INVITATION_CODE, DEMO_SOCIAL_SCREENSHOT, DEMO_SOCIAL_URL, demonstrationRegistrationValues, fillEmptyFields } from "./registration-demo";
 import {
   buildAirwallexMockSchema,
+  fillAirwallexDemoValues,
   buildAirwallexMockTransferMethods,
   buildProfileSupplementalFields,
   compareInvoicePaymentDetails,
@@ -47,8 +58,10 @@ import {
   MockApiAdapter,
   normalizeAirwallexFormSchema,
   normalizeAirwallexSchemaValue,
+  profileSchemaFieldRequirement,
   payoutAccountPaymentDetails,
   reconcileAirwallexSchemaValues,
+  resolveAirwallexTransferMethod,
   sanitizeEnglishAccountName,
   summarizeAmountsByCurrency,
   sortInvoices,
@@ -59,6 +72,80 @@ import {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("creator profile display and payout examples", () => {
+  it("uses the profile-specific legal-name wording without changing the stored field", () => {
+    const error = "请完成必填字段：真实姓名 / Real Name";
+    expect(profileContactErrorMessage(error)).toBe("请完成必填字段：真实姓名/公司名 / Real Name/Company Name");
+    expect(initialProfile.legalName).toBe("Léa Martin");
+  });
+
+  it("hides verified evidence without mutating saved screenshots, while preserving correction materials", () => {
+    const social = structuredClone(initialProfile.social);
+    expect(shouldShowSocialEvidence("VERIFIED")).toBe(false);
+    expect(shouldShowSocialEvidence("CHANGES_REQUESTED")).toBe(true);
+    expect(shouldShowSocialEvidence("PENDING")).toBe(true);
+    expect(social).toEqual(initialProfile.social);
+  });
+
+  it("groups bank providers without rewriting the stored default account", () => {
+    const savedDefault = initialProfile.defaultPayoutAccountId;
+    expect(payoutDisplayGroup("AIRWALLEX")).toBe("BANK_TRANSFER");
+    expect(payoutDisplayGroup("PAYERMAX")).toBe("BANK_TRANSFER");
+    expect(payoutDisplayGroup("PAYPAL")).toBe("PAYPAL");
+    expect(bankProviderAfterChannelSelection("PAYERMAX", "PAYPAL")).toBe("PAYERMAX");
+    expect(bankProviderAfterChannelSelection("PAYERMAX", "AIRWALLEX")).toBe("AIRWALLEX");
+    expect(bankProviderAfterChannelSelection("AIRWALLEX", "PAYERMAX")).toBe("PAYERMAX");
+    expect(initialProfile.defaultPayoutAccountId).toBe(savedDefault);
+    const paypal = initialProfile.payoutAccounts.find((account) => account.channel === "PAYPAL")!;
+    const alternateDefault = { ...initialProfile, payout: paypal, defaultPayoutAccountId: paypal.id };
+    expect(preferredProfilePayoutAccount(alternateDefault).channel).toBe("AIRWALLEX");
+    expect(alternateDefault.defaultPayoutAccountId).toBe(paypal.id);
+  });
+
+  it("provides independent, format-compatible examples for country-specific Schema and supplements", () => {
+    for (const [country, currency, length] of [["US", "USD", 10], ["JP", "JPY", 7], ["GB", "GBP", 8]] as const) {
+      const condition = { bankCountryCode: country, accountCurrency: currency, entityType: "PERSONAL" as const, transferMethod: "LOCAL" as const };
+      const schema = buildAirwallexMockSchema(condition);
+      expect(schema.fields.every((field) => Boolean(field.example))).toBe(true);
+      const account = schema.fields.find((field) => field.key === "account_number")!;
+      expect(account.example).toHaveLength(length);
+      expect(account.example).toMatch(new RegExp(account.pattern!));
+      expect(schema.fields.find((field) => field.key === "account_type")?.example).toBe(schema.fields.find((field) => field.key === "account_type")?.options?.[0].label);
+      expect(schema.fields.find((field) => field.key === "swift_code")?.example).toContain(country);
+    }
+    const french = buildAirwallexMockSchema({ bankCountryCode: "FR", accountCurrency: "EUR", entityType: "COMPANY", transferMethod: "LOCAL" });
+    const exampleValues = Object.fromEntries(french.fields.map((field) => [field.key, (field.type === "SELECT" ? field.options?.[0].value : field.example) || ""]));
+    expect(validateAirwallexSchemaValues(french, exampleValues)).toEqual({});
+    const emptyValues = Object.fromEntries(french.fields.map((field) => [field.key, ""]));
+    validateAirwallexSchemaValues(french, emptyValues);
+    expect(emptyValues.account_number).toBe("");
+    const supplements = buildProfileSupplementalFields({ ...initialProfile, payout: { ...initialProfile.payout, bankCountry: "US", currency: "USD", beneficiaryType: "COMPANY", transferMethod: "LOCAL" } });
+    expect(supplements.every((field) => Boolean(field.example))).toBe(true);
+    expect(supplements.find((field) => field.key === "business_registration_number")?.example).toBe("AB12345678");
+    expect(supplements.find((field) => field.key === "iban")?.example).toContain("不适用");
+  });
+
+  it("separates enforced Schema requirements from non-mandatory supplemental guidance", () => {
+    for (const country of ["FR", "JP", "US", "GB"]) {
+      for (const entityType of ["PERSONAL", "COMPANY"] as const) {
+        const condition = { bankCountryCode: country, accountCurrency: country === "JP" ? "JPY" : country === "US" ? "USD" : country === "GB" ? "GBP" : "EUR", entityType, transferMethod: "LOCAL" as const };
+        const schema = buildAirwallexMockSchema(condition);
+        expect(schema.fields.every((field) => profileSchemaFieldRequirement(field).length > 0 && Boolean(field.example))).toBe(true);
+        expect(profileSchemaFieldRequirement(schema.fields.find((field) => field.key === "account_name")!)).toContain("仅支持英文字母");
+        const accountType = schema.fields.find((field) => field.key === "account_type");
+        if (accountType) expect(profileSchemaFieldRequirement(accountType)).toContain("有效选项");
+        const supplements = buildProfileSupplementalFields({ ...initialProfile, payout: { ...initialProfile.payout, bankCountry: country, currency: condition.accountCurrency, beneficiaryType: entityType, transferMethod: "LOCAL" } });
+        expect(supplements.every((field) => Boolean(field.guidance) && Boolean(field.example))).toBe(true);
+        if (country === "FR" || country === "GB") {
+          expect(schema.fields.find((field) => field.key === "iban")?.required).toBe(true);
+        } else {
+          expect(supplements.find((field) => field.key === "iban")?.guidance).toContain("可留空");
+        }
+      }
+    }
+  });
 });
 
 describe("onboarding navigation and draft persistence", () => {
@@ -138,6 +225,8 @@ describe("Airwallex transfer method pricing", () => {
         available: true,
         estimatedFeeAmount: 5,
         feeCurrency: "EUR",
+        arrivalMinBusinessDays: 1,
+        arrivalMaxBusinessDays: 3,
         recommended: false,
       },
       {
@@ -146,11 +235,43 @@ describe("Airwallex transfer method pricing", () => {
         available: true,
         estimatedFeeAmount: 5,
         feeCurrency: "EUR",
+        arrivalMinBusinessDays: 0,
+        arrivalMaxBusinessDays: 2,
         recommended: false,
       },
     ]);
     expect(methods.map((method) => method.value)).toEqual(["LOCAL", "SWIFT"]);
     expect(methods[0].recommended).toBe(true);
+  });
+
+  it("carries estimated business-day ranges with the scenario prices", () => {
+    const methods = buildAirwallexMockTransferMethods({
+      bankCountryCode: "JP",
+      accountCurrency: "JPY",
+      entityType: "PERSONAL",
+    });
+    expect(methods.find((method) => method.value === "LOCAL")).toMatchObject({
+      arrivalMinBusinessDays: 0,
+      arrivalMaxBusinessDays: 2,
+      feeCurrency: "JPY",
+    });
+    expect(methods.find((method) => method.value === "SWIFT")).toMatchObject({
+      arrivalMinBusinessDays: 1,
+      arrivalMaxBusinessDays: 3,
+      feeCurrency: "JPY",
+    });
+  });
+
+  it("preserves a saved choice but recommends the cheapest on a new scenario", () => {
+    const methods = buildAirwallexMockTransferMethods({
+      bankCountryCode: "FR",
+      accountCurrency: "USD",
+      entityType: "COMPANY",
+    });
+    expect(methods[0].value).toBe("SWIFT");
+    expect(resolveAirwallexTransferMethod(methods, "LOCAL", true)?.value).toBe("LOCAL");
+    expect(resolveAirwallexTransferMethod(methods, "LOCAL", false)?.value).toBe("SWIFT");
+    expect(resolveAirwallexTransferMethod(methods.map((method) => ({ ...method, available: false })), "LOCAL", true)).toBeUndefined();
   });
 });
 
@@ -294,6 +415,22 @@ describe("administrator RBAC and account operations", () => {
     expect(store.restoreSession(creator.sessionId)).toBeUndefined();
   });
 
+  it("changes account status without requiring a reason and keeps a complete audit", () => {
+    const store = new MockAdminStore(false);
+
+    store.setStatus(["CREATOR-001"], "DISABLED", "ADMIN-001");
+
+    expect(store.getUserDetail("CREATOR-001").account.status).toBe("DISABLED");
+    expect(store.listAudits()[0]).toMatchObject({
+      actorId: "ADMIN-001",
+      subjectUserId: "CREATOR-001",
+      action: "USER_STATUS_CHANGED",
+      before: { status: "ACTIVE" },
+      after: { status: "DISABLED" },
+      occurredAt: expect.any(String),
+    });
+  });
+
   it("rejects administrator mutations from a creator actor", () => {
     const store = new MockAdminStore(false);
 
@@ -334,6 +471,31 @@ describe("administrator RBAC and account operations", () => {
         .listAudits()
         .some((event) => event.action === "SENSITIVE_DATA_REVEALED"),
     ).toBe(true);
+  });
+
+  it("does not expose or claim a value for an unfilled payout field", () => {
+    const store = new MockAdminStore(false);
+    const before = store.listAudits().length;
+    expect(store.revealSensitive("CREATOR-002", "accountNumber", "核对空字段", "ADMIN-001")).toBe("");
+    expect(store.listAudits()).toHaveLength(before + 1);
+    expect(() => store.revealSensitive("CREATOR-002", "accountNumber", " ", "ADMIN-001")).toThrow("必须填写原因");
+    expect(store.listAudits()).toHaveLength(before + 1);
+    expect(() => store.revealSensitive("CREATOR-002", "accountNumber", "核对", "CREATOR-001")).toThrow("没有执行此操作的权限");
+    expect(store.listAudits()).toHaveLength(before + 1);
+  });
+
+  it("persists only a safe, creator-owned business action without banking details", () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", { localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    } });
+    const store = new MockAdminStore(true);
+    store.recordCreatorAction("CREATOR-001", "INVOICE", "提交 Invoice INV-20260920-00001 审核");
+    expect(() => store.recordCreatorAction("ADMIN-001", "INVOICE", "提交审核")).toThrow("不是达人");
+    const restored = new MockAdminStore(true).listAudits().find((event) => event.summary.includes("INV-20260920-00001"));
+    expect(restored).toMatchObject({ actorId: "CREATOR-001", subjectUserId: "CREATOR-001", action: "CREATOR_BUSINESS_ACTION", module: "INVOICE" });
+    expect(JSON.stringify(restored)).not.toContain("FR7630006");
   });
 
   it("auto-resolves returned fields after the creator saves valid profile data", () => {
@@ -380,7 +542,7 @@ describe("administrator RBAC and account operations", () => {
 });
 
 describe("external business data adapter contract", () => {
-  it("seeds contract counts for every creator managed in user management", () => {
+  it("seeds active contracts only for creators who completed initial verification", () => {
     const store = new MockAdminStore(false);
     const creators = store.listUsers({ role: "CREATOR" });
     const creatorIds = new Set(creators.map((creator) => creator.id));
@@ -393,13 +555,11 @@ describe("external business data adapter contract", () => {
       {},
     );
 
-    expect(aggregate.contracts).toHaveLength(18);
+    expect(aggregate.contracts).toHaveLength(13);
     expect(contractCounts).toEqual({
       "CREATOR-001": 8,
-      "CREATOR-002": 3,
       "CREATOR-003": 3,
       "CREATOR-004": 2,
-      "CREATOR-005": 2,
     });
     expect(
       aggregate.contracts.every((item) => creatorIds.has(item.creator.id)),
@@ -408,16 +568,16 @@ describe("external business data adapter contract", () => {
       aggregate.contracts.filter(
         (item) => item.record.status === "PENDING_SIGNATURE",
       ),
-    ).toHaveLength(5);
+    ).toHaveLength(3);
     expect(
       aggregate.contracts.filter((item) => item.record.status === "ACTIVE"),
-    ).toHaveLength(7);
+    ).toHaveLength(5);
     expect(
       aggregate.contracts.filter((item) => item.record.status === "EXPIRED"),
-    ).toHaveLength(6);
+    ).toHaveLength(5);
   });
 
-  it("seeds contract-linked Invoices for every creator in user management", () => {
+  it("seeds contract-linked Invoices only for verified or correcting creators", () => {
     const store = new MockAdminStore(false);
     const creators = store.listUsers({ role: "CREATOR" });
     const aggregate = store.listAllBusinessData();
@@ -429,17 +589,15 @@ describe("external business data adapter contract", () => {
       {},
     );
 
-    expect(aggregate.invoices).toHaveLength(12);
+    expect(aggregate.invoices).toHaveLength(14);
     expect(invoiceCounts).toEqual({
-      "CREATOR-001": 5,
-      "CREATOR-002": 2,
+      "CREATOR-001": 10,
       "CREATOR-003": 2,
       "CREATOR-004": 2,
-      "CREATOR-005": 1,
     });
     expect(
-      creators.every((creator) =>
-        aggregate.invoices.some((item) => item.creator.id === creator.id),
+      creators.filter((creator) => creator.verificationStatus === "PENDING").every((creator) =>
+        !aggregate.invoices.some((item) => item.creator.id === creator.id),
       ),
     ).toBe(true);
 
@@ -454,7 +612,7 @@ describe("external business data adapter contract", () => {
       expect(matchingContract).toBeDefined();
       expect(invoice.creator.name).toBe(matchingContract?.creator.name);
       expect(invoice.record.brand).toBe(matchingContract?.record.brand);
-      expect(invoice.record.amount).toBe(matchingContract?.record.amount);
+      expect(invoice.record.amount).toMatch(/^[A-Z]{3} [\d,.]+$/);
     }
   });
 
@@ -471,7 +629,7 @@ describe("external business data adapter contract", () => {
         ),
     );
 
-    expect(contractOnlyRecords).toHaveLength(6);
+    expect(contractOnlyRecords).toHaveLength(4);
     for (const contract of contractOnlyRecords) {
       expect(
         aggregate.requests.some(
@@ -536,6 +694,33 @@ describe("external business data adapter contract", () => {
     ).toBe(true);
   });
 
+  it("quarantines pending creators' records and rejects new business events until verification", () => {
+    const store = new MockAdminStore(false);
+    for (const id of ["CREATOR-002", "CREATOR-005"]) {
+      const detail = store.getUserDetail(id);
+      expect(detail.contracts).toEqual([]);
+      expect(detail.invoices).toEqual([]);
+      expect(detail.requests).toEqual([]);
+    }
+    const pendingEvent = {
+      eventId: "evt-pending-creator",
+      creatorId: "CREATOR-002",
+      externalRecordId: "CON-NEW-PENDING",
+      resourceType: "CONTRACT" as const,
+      version: 1,
+      occurredAt: "2026-09-20T10:00:00+08:00",
+      payload: { projectName: "待认证项目", brand: "Brand", amount: "EUR 100", status: "ACTIVE" },
+    };
+    expect(store.upsertExternalEvent(pendingEvent)).toMatchObject({ accepted: false, reason: "UNVERIFIED_CREATOR" });
+    expect(store.listSyncIssues().some((issue) => issue.eventId === pendingEvent.eventId)).toBe(true);
+    store.updateVerification("CREATOR-002", "VERIFIED", "ADMIN-001");
+    expect(store.getUserDetail("CREATOR-002").contracts).toEqual([]);
+    expect(store.upsertExternalEvent({ ...pendingEvent, eventId: "evt-verified-creator", version: 2 })).toMatchObject({ accepted: true });
+    expect(store.getUserDetail("CREATOR-002").contracts.map((item) => item.id)).toContain("CON-NEW-PENDING");
+    store.updateVerification("CREATOR-002", "PENDING", "ADMIN-001");
+    expect(store.getUserDetail("CREATOR-002").contracts).toEqual([]);
+  });
+
   it("rejects an unknown contract lifecycle without overwriting the record", () => {
     const store = new MockAdminStore(false);
     const before = store
@@ -569,6 +754,67 @@ describe("external business data adapter contract", () => {
         .listSyncIssues()
         .some((issue) => issue.eventId === "evt-contract-invalid-lifecycle"),
     ).toBe(true);
+  });
+
+  it("defaults existing contracts to standalone and accepts every supported synced contract type", () => {
+    expect(contracts.every((contract) => contract.contractType === "INDEPENDENT")).toBe(true);
+    const store = new MockAdminStore(false);
+    store.updateVerification("CREATOR-002", "VERIFIED", "ADMIN-001");
+
+    for (const [index, contractType] of (["FRAMEWORK", "IO"] as const).entries()) {
+      expect(store.upsertExternalEvent({
+        eventId: `evt-contract-type-${contractType}`,
+        creatorId: "CREATOR-002",
+        externalRecordId: `CON-TYPE-${index}`,
+        resourceType: "CONTRACT",
+        version: 1,
+        occurredAt: "2026-09-21T10:00:00+08:00",
+        payload: {
+          projectName: `Contract type ${contractType}`,
+          brand: "COMETS Demo",
+          amount: "EUR 100",
+          status: "ACTIVE",
+          contractType,
+        },
+      })).toEqual({ accepted: true, duplicate: false });
+    }
+
+    const syncedTypes = store.getUserDetail("CREATOR-002").contracts
+      .filter((contract) => contract.id.startsWith("CON-TYPE-"))
+      .map((contract) => contract.contractType);
+    expect(syncedTypes).toEqual(expect.arrayContaining(["FRAMEWORK", "IO"]));
+  });
+
+  it("rejects an invalid contract type without overwriting the stored contract", () => {
+    const store = new MockAdminStore(false);
+    store.updateVerification("CREATOR-002", "VERIFIED", "ADMIN-001");
+    const originalEvent = {
+      eventId: "evt-valid-contract-type",
+      creatorId: "CREATOR-002",
+      externalRecordId: "CON-TYPE-STABLE",
+      resourceType: "CONTRACT" as const,
+      version: 1,
+      occurredAt: "2026-09-21T10:00:00+08:00",
+      payload: {
+        projectName: "Stable type contract",
+        brand: "COMETS Demo",
+        amount: "EUR 200",
+        status: "ACTIVE",
+        contractType: "FRAMEWORK",
+      },
+    };
+    expect(store.upsertExternalEvent(originalEvent)).toMatchObject({ accepted: true });
+    const before = store.getUserDetail("CREATOR-002").contracts
+      .find((contract) => contract.id === originalEvent.externalRecordId);
+
+    expect(store.upsertExternalEvent({
+      ...originalEvent,
+      eventId: "evt-invalid-contract-type",
+      version: 2,
+      payload: { ...originalEvent.payload, projectName: "Should not overwrite", contractType: "MASTER" },
+    })).toEqual({ accepted: false, duplicate: false, reason: "INVALID_CONTRACT_TYPE" });
+    expect(store.getUserDetail("CREATOR-002").contracts
+      .find((contract) => contract.id === originalEvent.externalRecordId)).toEqual(before);
   });
 
   it("migrates v2 contract states while preserving registered users and sessions", () => {
@@ -636,10 +882,11 @@ describe("external business data adapter contract", () => {
     expect(store.listUsers().map((user) => user.id)).toContain("CREATOR-099");
     expect(store.restoreSession("stored-session")?.userId).toBe("CREATOR-099");
     expect(store.getUserDetail("CREATOR-099").contracts[0].status).toBe("ACTIVE");
-    expect(JSON.parse(storage.get(ADMIN_STORE_KEY) || "{}").version).toBe(3);
+    expect(store.getUserDetail("CREATOR-099").contracts[0].contractType).toBe("INDEPENDENT");
+    expect(JSON.parse(storage.get(ADMIN_STORE_KEY) || "{}").version).toBe(5);
   });
 
-  it("replaces legacy lifecycle values on known seed contracts during v2 migration", () => {
+  it("archives a pending creator's v2 contract without exposing it after migration", () => {
     const storage = new Map<string, string>();
     storage.set(
       ADMIN_STORE_KEY,
@@ -673,18 +920,48 @@ describe("external business data adapter contract", () => {
     });
 
     const store = new MockAdminStore(true);
-    const contract = store
-      .getUserDetail("CREATOR-002")
-      .contracts.find((item) => item.id === "CON-260703-CD-01");
-
-    expect(contract).toMatchObject({
-      status: "ACTIVE",
-      effectiveDate: "2026-07-03",
-      servicePeriod: "2026-07-03 至 2026-10-15",
+    expect(store.getUserDetail("CREATOR-002").contracts).toEqual([]);
+    const persisted = JSON.parse(storage.get(ADMIN_STORE_KEY) || "{}");
+    expect(persisted.archivedExternalRecords.find((record: { externalRecordId: string }) => record.externalRecordId === "CON-260703-CD-01").payload).toMatchObject({
+      status: "未请款",
+      contractType: "INDEPENDENT",
     });
+    expect(new MockAdminStore(true).getUserDetail("CREATOR-002").contracts).toEqual([]);
   });
 
-  it("keeps a v3 externally synchronized seed-contract lifecycle after reload", () => {
+  it("quarantines legacy v3 Invoice snapshots across reload and later verification", () => {
+    const storage = new Map<string, string>();
+    storage.set(ADMIN_STORE_KEY, JSON.stringify({
+      version: 3,
+      externalRecords: [{
+        creatorId: "CREATOR-005",
+        externalRecordId: "INV-LEGACY-ALEX",
+        resourceType: "INVOICE",
+        version: 3,
+        occurredAt: "2026-08-01T10:00:00+08:00",
+        payload: { projectName: "旧项目", brand: "Demo", amount: "USD 500", status: "PAID" },
+      }],
+    }));
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+      },
+    });
+
+    const migrated = new MockAdminStore(true);
+    expect(migrated.getUserDetail("CREATOR-005").invoices).toEqual([]);
+    const snapshot = JSON.parse(storage.get(ADMIN_STORE_KEY) || "{}");
+    expect(snapshot.version).toBe(5);
+    expect(snapshot.archivedExternalRecords).toEqual(expect.arrayContaining([
+      expect.objectContaining({ externalRecordId: "INV-LEGACY-ALEX", version: 3 }),
+    ]));
+    const reloaded = new MockAdminStore(true);
+    reloaded.updateVerification("CREATOR-005", "VERIFIED", "ADMIN-001");
+    expect(new MockAdminStore(true).getUserDetail("CREATOR-005").invoices).toEqual([]);
+  });
+
+  it("keeps a newly synced contract after verification and reload without restoring archived seed data", () => {
     const storage = new Map<string, string>();
     vi.stubGlobal("window", {
       localStorage: {
@@ -694,6 +971,7 @@ describe("external business data adapter contract", () => {
     });
 
     const store = new MockAdminStore(true);
+    store.updateVerification("CREATOR-002", "VERIFIED", "ADMIN-001");
     expect(
       store.upsertExternalEvent({
         eventId: "evt-contract-lifecycle-persistence",
@@ -727,10 +1005,12 @@ describe("external business data adapter contract", () => {
       servicePeriod: "2026-07-03 至 2026-09-01",
       updatedAt: "2026-09-18",
     });
+    expect(reloadedStore.getUserDetail("CREATOR-002").contracts).toHaveLength(1);
   });
 
   it("projects accepted external records into the creator detail view", () => {
     const store = new MockAdminStore(false);
+    store.updateVerification("CREATOR-002", "VERIFIED", "ADMIN-001");
     store.upsertExternalEvent({
       eventId: "evt-contract-linked-1",
       creatorId: "CREATOR-002",
@@ -755,6 +1035,7 @@ describe("external business data adapter contract", () => {
       occurredAt: "2026-08-02T10:02:00+08:00",
       payload: {
         projectId: "PROJECT-EXT-1",
+        contractId: "CON-EXT-LINKED-1",
         projectName: "Creator External Campaign",
         brand: "COMETS Demo",
         amount: "USD 1,500",
@@ -777,6 +1058,7 @@ describe("external business data adapter contract", () => {
 
   it("aggregates existing business records across every creator", () => {
     const store = new MockAdminStore(false);
+    store.updateVerification("CREATOR-002", "VERIFIED", "ADMIN-001");
     store.upsertExternalEvent({
       eventId: "evt-contract-admin-aggregate",
       creatorId: "CREATOR-002",
@@ -801,6 +1083,7 @@ describe("external business data adapter contract", () => {
       occurredAt: "2026-08-02T10:02:00+08:00",
       payload: {
         projectId: "PROJECT-ADMIN-AGGREGATE",
+        contractId: "CON-ADMIN-AGGREGATE",
         projectName: "管理员聚合项目",
         brand: "COMETS Demo",
         amount: "USD 1,800",
@@ -901,26 +1184,29 @@ describe("external business data adapter contract", () => {
 });
 
 describe("creator data isolation", () => {
-  it("does not expose Léa Martin business data to another creator", async () => {
+  it("reads a correcting creator's records without exposing Léa Martin's records", async () => {
     const adapter = new MockApiAdapter();
 
     const [contractResult, invoiceResult, requestResult] = await Promise.all([
-      adapter.contracts.list("CREATOR-002"),
-      adapter.invoices.list("CREATOR-002"),
-      adapter.requests.list("CREATOR-002"),
+      adapter.contracts.list("CREATOR-003"),
+      adapter.invoices.list("CREATOR-003"),
+      adapter.requests.list("CREATOR-003"),
     ]);
 
-    expect(contractResult.data).toEqual([]);
-    expect(invoiceResult.data).toEqual([]);
-    expect(requestResult.data).toEqual([]);
+    expect(contractResult.data.length).toBeGreaterThan(0);
+    expect(invoiceResult.data.length).toBeGreaterThan(0);
+    expect(contractResult.data.every((contract) => contract.creatorId === "CREATOR-003")).toBe(true);
+    expect(invoiceResult.data.every((invoice) => invoice.creatorId === "CREATOR-003")).toBe(true);
+    expect(requestResult.data.every((request) => request.invoiceIds.every((id) => invoiceResult.data.some((invoice) => invoice.id === id)))).toBe(true);
+    expect(contractResult.data.some((contract) => contract.id === contracts[0].id)).toBe(false);
   });
 });
 
 describe("linked request projects", () => {
-  it("matches the current account contracts and invoices by normalized project name", () => {
+  it("includes only backend-linked Invoices under active contracts", () => {
     const result = buildLinkedRequestProjects(requests, contracts, invoices);
 
-    expect(result).toHaveLength(5);
+    expect(result).toHaveLength(7);
     expect(result.every((item) => item.contract.projectName === item.invoice.projectName)).toBe(true);
     expect(new Set(result.map((item) => item.invoice.id)).size).toBe(result.length);
   });
@@ -1014,7 +1300,7 @@ describe("contract lifecycle data", () => {
     const contractProjects = new Set(contracts.map((contract) => contract.projectName));
 
     expect(contracts).toHaveLength(8);
-    expect(invoices).toHaveLength(5);
+    expect(invoices).toHaveLength(10);
     expect([...invoiceProjects].every((project) => contractProjects.has(project))).toBe(true);
     expect(contracts.filter((contract) => contract.status === "PENDING_SIGNATURE")).toHaveLength(2);
     expect(contracts.filter((contract) => contract.status === "ACTIVE")).toHaveLength(3);
@@ -1052,11 +1338,11 @@ describe("contract lifecycle data", () => {
     }
   });
 
-  it("keeps Invoice, request project, and contract ownership one-to-one", () => {
-    expect(new Set(invoices.map((invoice) => invoice.projectId)).size).toBe(invoices.length);
-    expect(new Set(invoices.map((invoice) => invoice.projectName)).size).toBe(invoices.length);
-    expect(requests).toHaveLength(invoices.length);
-    expect(contracts).toHaveLength(invoices.length + 3);
+  it("groups multiple Invoices under one contract and request project", () => {
+    expect(new Set(invoices.map((invoice) => invoice.projectId)).size).toBe(5);
+    expect(new Set(invoices.map((invoice) => invoice.projectName)).size).toBe(5);
+    expect(requests).toHaveLength(5);
+    expect(contracts).toHaveLength(requests.length + 3);
 
     const linkedInvoiceIds = requests.flatMap((request) => request.invoiceIds);
     expect(new Set(linkedInvoiceIds).size).toBe(invoices.length);
@@ -1068,7 +1354,7 @@ describe("contract lifecycle data", () => {
       expect(request).toMatchObject({
         projectName: invoice.projectName,
         brand: invoice.brand,
-        invoiceIds: [invoice.id],
+        invoiceIds: expect.arrayContaining([invoice.id]),
       });
       expect(contract).toMatchObject({
         projectName: invoice.projectName,
@@ -1087,8 +1373,8 @@ describe("contract lifecycle data", () => {
       if (!invoices.some((invoice) => invoice.projectId === contract.projectId)) {
         expect(matches).toHaveLength(0);
       } else {
-        expect(matches).toHaveLength(1);
-        expect(matches[0].projectId).toBe(contract.projectId);
+        expect(matches.length).toBeGreaterThanOrEqual(1);
+        expect(matches.every((invoice) => invoice.projectId === contract.projectId)).toBe(true);
       }
     }
   });
@@ -1108,6 +1394,86 @@ describe("contract lifecycle data", () => {
 });
 
 describe("invoice ordering", () => {
+  it("adds the independent demo cases to old local data without resetting prior progress", async () => {
+    const storage = new Map<string, string>();
+    const oldData = invoices.filter((invoice) => !["INV-20260920-00002", "INV-20260920-00003", "INV-20260921-00001"].includes(invoice.id))
+      .map((invoice) => invoice.id === "INV-20260718-00001"
+        ? { ...invoice, documentState: { kind: "EXTERNAL" as const, status: "WAITING_MEDIA_REVIEW" as const }, status: "PENDING_REVIEW" as const }
+        : invoice);
+    storage.set("comets-creator-invoices-v2", JSON.stringify(oldData));
+    vi.stubGlobal("window", { localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => { storage.set(key, value); },
+      removeItem: (key: string) => { storage.delete(key); },
+    } });
+
+    const adapter = new MockApiAdapter();
+    const loaded = (await adapter.invoices.list("CREATOR-001")).data;
+    expect(loaded.find((invoice) => invoice.id === "INV-20260718-00001")?.documentState?.status).toBe("WAITING_MEDIA_REVIEW");
+    const upload = loaded.filter((invoice) => invoice.id === "INV-20260920-00002");
+    const failed = loaded.filter((invoice) => invoice.id === "INV-20260920-00003");
+    const freshUpload = loaded.filter((invoice) => invoice.id === "INV-20260921-00001");
+    expect(upload).toHaveLength(1);
+    expect(upload[0]).toMatchObject({ invoiceId: "invoice-creator-001-external-demo-upload-20260920", creatorId: "CREATOR-001", contractId: "CON-260718-KOL-05", documentState: { kind: "EXTERNAL", status: "WAITING_UPLOAD" } });
+    expect(upload[0].document).toBeUndefined();
+    expect(upload[0].payoutAccountId).toBeUndefined();
+    expect(buildCreatorTasks(contracts, loaded).some((task) => task.resourceNumber === upload[0].invoiceNumber && task.type === "EXTERNAL_INVOICE_UPLOAD")).toBe(true);
+    expect(freshUpload).toHaveLength(1);
+    expect(freshUpload[0]).toMatchObject({ invoiceId: "invoice-creator-001-external-demo-upload-20260921", creatorId: "CREATOR-001", contractId: "CON-260718-KOL-05", documentState: { kind: "EXTERNAL", status: "WAITING_UPLOAD" } });
+    expect(freshUpload[0].document).toBeUndefined();
+    expect(freshUpload[0].payoutAccountId).toBeUndefined();
+    expect(buildCreatorTasks(contracts, loaded).some((task) => task.resourceNumber === freshUpload[0].invoiceNumber && task.type === "EXTERNAL_INVOICE_UPLOAD")).toBe(true);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ invoiceId: "invoice-creator-001-external-demo-failed-20260920", creatorId: "CREATOR-001", contractId: "CON-260711-KOL-04", documentState: { kind: "EXTERNAL", status: "APPROVED" }, paymentStatus: "FAILED", paymentRecoveryStatus: "AWAITING_CREATOR_UPDATE" });
+    const attempts = (await adapter.payments.listAttempts(failed[0].invoiceId!, "CREATOR-001")).data;
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({ status: "FAILED", payoutAccountId: "payout-awx-fr-primary" });
+    expect(failedPaymentSnapshot(failed[0], attempts)).toMatchObject({ source: "ATTEMPT", snapshot: { accountNumber: "FR7630006000011234567890189" } });
+    expect(buildCreatorTasks(contracts, loaded).some((task) => task.resourceNumber === failed[0].invoiceNumber && task.type === "PAYMENT_ACCOUNT_CORRECTION")).toBe(true);
+    expect(invoiceLifecycleTimeline(failed[0])).toEqual(expect.arrayContaining([["审核通过", "complete"], ["付款失败", "error"]]));
+
+    const changed = loaded.map((invoice) => invoice.id === freshUpload[0].id
+      ? { ...invoice, documentState: { kind: "EXTERNAL" as const, status: "WAITING_CONFIRMATION" as const } }
+      : invoice);
+    storage.set("comets-creator-invoices-v2", JSON.stringify(changed));
+    const reloaded = (await new MockApiAdapter().invoices.list("CREATOR-001")).data;
+    expect(reloaded.filter((invoice) => invoice.id === freshUpload[0].id)).toHaveLength(1);
+    expect(reloaded.find((invoice) => invoice.id === freshUpload[0].id)?.documentState?.status).toBe("WAITING_CONFIRMATION");
+  });
+
+  it("corrects only untouched demo timestamps from the initial local fixture", async () => {
+    const storage = new Map<string, string>();
+    storage.set("comets-creator-invoices-v2", JSON.stringify(invoices.map((invoice) => {
+      if (invoice.id === "INV-20260920-00002") return { ...invoice, updatedAt: "2026-09-20T09:30:00.000Z" };
+      if (invoice.id === "INV-20260920-00003") return { ...invoice, updatedAt: "2026-09-20T10:40:00.000Z", payoutSnapshot: { ...invoice.payoutSnapshot!, capturedAt: "2026-09-20T10:20:00.000Z" } };
+      return invoice;
+    })));
+    vi.stubGlobal("window", { localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => { storage.set(key, value); },
+    } });
+    const result = (await new MockApiAdapter().invoices.list()).data;
+    expect(result.find((invoice) => invoice.id === "INV-20260920-00002")?.updatedAt).toBe("2026-09-20T03:30:00.000Z");
+    expect(result.find((invoice) => invoice.id === "INV-20260920-00003")?.payoutSnapshot?.capturedAt).toBe("2026-09-20T04:20:00.000Z");
+  });
+
+  it("adds a fresh upload task without resetting a previously uploaded local Invoice", async () => {
+    const storage = new Map<string, string>();
+    const previouslyUploaded = invoices.map((invoice) => invoice.id === "INV-20260718-00001"
+      ? { ...invoice, documentState: { kind: "EXTERNAL" as const, status: "WAITING_CONFIRMATION" as const } }
+      : invoice).filter((invoice) => invoice.id !== "INV-20260920-00001");
+    storage.set("comets-creator-invoices-v2", JSON.stringify(previouslyUploaded));
+    vi.stubGlobal("window", { localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => { storage.set(key, value); },
+      removeItem: (key: string) => { storage.delete(key); },
+    } });
+    const adapter = new MockApiAdapter();
+    const result = (await adapter.invoices.list()).data;
+    expect(result.find((invoice) => invoice.id === "INV-20260718-00001")?.documentState?.status).toBe("WAITING_CONFIRMATION");
+    expect(result.find((invoice) => invoice.id === "INV-20260920-00001")?.documentState?.status).toBe("WAITING_UPLOAD");
+  });
+
   it("generates the unified date-and-sequence invoice number", () => {
     expect(createInvoiceId("2026-08-21", [
       { ...invoices[0], id: "INV-20260821-00001" },
@@ -1124,6 +1490,10 @@ describe("invoice ordering", () => {
     expect(result.matches).toBe(true);
     expect(result.fields).toHaveLength(2);
     expect(result.merged.bank_name).toBe(account.bankName);
+    const incomplete = compareInvoicePaymentDetails({ account_name: "", bank_name: "   ", account_number: account.accountNumber }, account);
+    expect(incomplete.fields).toHaveLength(1);
+    expect(incomplete.merged.account_name).toBe(account.accountHolder);
+    expect(incomplete.merged.bank_name).toBe(account.bankName);
     expect(compareInvoicePaymentDetails({ account_number: "wrong" }, account).matches).toBe(false);
   });
 
@@ -1161,7 +1531,7 @@ describe("invoice ordering", () => {
       expect.arrayContaining([
         "Invoice INV-20260727-00001 等待签署",
         "Invoice INV-20260718-00001 待上传",
-        "Invoice INV-20260728-00001 付款失败，请修正收款信息",
+        "Invoice INV-20260728-00001 付款失败，请核对收款账户",
         "Invoice INV-20260625-00001 已完成付款",
       ]),
     );
@@ -1176,7 +1546,7 @@ describe("invoice ordering", () => {
       "INV-20260728-00001",
     );
     expect(filterInvoiceList(invoices, "Mellow Home", "ALL")).toHaveLength(0);
-    expect(filterInvoiceList(invoices, "2100", "ALL")).toHaveLength(0);
+    expect(filterInvoiceList(invoices, "860", "ALL")).toHaveLength(0);
     expect(filterInvoiceList(invoices, "付款异常", "ALL")).toHaveLength(0);
     expect(filterInvoiceList(invoices, "", "ALL", "PayPal")).toHaveLength(0);
   });
@@ -1289,8 +1659,70 @@ describe("invoice ordering", () => {
     expect(after.data.filter((item) => invoiceInternalIdOf(item) === invoiceInternalIdOf(result.data))).toHaveLength(1);
   });
 
+  it("accepts an explicit unchanged-account retry request without executing payment", async () => {
+    const adapter = new MockApiAdapter();
+    const auditBefore = adminStore.listAudits().length;
+    const invoice = (await adapter.invoices.getExternalInvoice("INV-20260728-00001", "CREATOR-001")).data!;
+    const before = (await adapter.payments.listAttempts(invoice.invoiceId!, "CREATOR-001")).data;
+    const input = { mode: "CONFIRM_ORIGINAL" as const, payoutAccountId: invoice.payoutAccountId!, submittedBy: "CREATOR-001", expectedVersion: invoice.version!, clientRequestId: "retry:unchanged" };
+    const result = await adapter.payments.requestPaymentRetry(invoice.invoiceId!, input);
+    expect(adminStore.listAudits()).toHaveLength(auditBefore + 1);
+    expect(adminStore.listAudits()[0]).toMatchObject({ actorId: "CREATOR-001", module: "PAYMENT", action: "CREATOR_BUSINESS_ACTION" });
+    expect(result.data.documentState).toEqual({ kind: "EXTERNAL", status: "APPROVED" });
+    expect(result.data.paymentStatus).toBe("FAILED");
+    expect(result.data.paymentRecoveryStatus).toBe("PENDING_FINANCE_CONFIRMATION");
+    expect(result.data.paymentRetryRequest).toMatchObject({ mode: "CONFIRM_ORIGINAL", payoutAccountId: invoice.payoutAccountId });
+    expect(result.data.paymentIssue?.resolvedAt).toBeUndefined();
+    expect((await adapter.payments.listAttempts(invoice.invoiceId!, "CREATOR-001")).data).toEqual(before);
+    const duplicate = await adapter.payments.requestPaymentRetry(invoice.invoiceId!, input);
+    expect(duplicate.data.version).toBe(result.data.version);
+    expect(adminStore.listAudits()).toHaveLength(auditBefore + 1);
+    await expect(adapter.payments.requestPaymentRetry(invoice.invoiceId!, { ...input, expectedVersion: result.data.version!, clientRequestId: "retry:again" })).rejects.toThrow("不能申请");
+  });
+
+  it("separates a saved profile change from the retry request and records the new snapshot", async () => {
+    const adapter = new MockApiAdapter();
+    const invoice = (await adapter.invoices.getExternalInvoice("INV-20260728-00001", "CREATOR-001")).data!;
+    const profile = (await adapter.profile.get()).data;
+    const changedNumber = "FR7630006000011234567890197";
+    const changed = { ...profile.payout, accountNumber: changedNumber, schemaValues: { ...profile.payout.schemaValues, account_number: changedNumber } };
+    await adapter.profile.save({ ...profile, payout: changed, payoutAccounts: profile.payoutAccounts.map((account) => account.id === changed.id ? changed : account) });
+    expect((await adapter.invoices.getExternalInvoice(invoice.invoiceId!, "CREATOR-001")).data?.paymentRecoveryStatus).toBe("AWAITING_CREATOR_UPDATE");
+    expect((await adapter.payments.listAttempts(invoice.invoiceId!, "CREATOR-001")).data[0].payoutSnapshot?.accountNumber).toBe(invoice.payoutSnapshot?.accountNumber);
+    await expect(adapter.payments.requestPaymentRetry(invoice.invoiceId!, { mode: "CONFIRM_ORIGINAL", payoutAccountId: changed.id, submittedBy: "CREATOR-001", expectedVersion: invoice.version!, clientRequestId: "retry:wrong-mode" })).rejects.toThrow("已变化");
+    const requested = await adapter.payments.requestPaymentRetry(invoice.invoiceId!, { mode: "UPDATED_ACCOUNT", payoutAccountId: changed.id, submittedBy: "CREATOR-001", expectedVersion: invoice.version!, clientRequestId: "retry:updated" });
+    expect(requested.data.paymentRetryRequest?.payoutSnapshot.accountNumber).toBe(changedNumber);
+    expect((await adapter.payments.listAttempts(invoice.invoiceId!, "CREATOR-001")).data[0].payoutSnapshot?.accountNumber).toBe(invoice.payoutSnapshot?.accountNumber);
+    expect(requested.data.reviewHistory?.at(-1)?.action).toBe("PAYMENT_RETRY_REQUESTED");
+    expect(requested.data.paymentStatus).toBe("FAILED");
+  });
+
+  it("rejects cross-creator, stale, unavailable, and falsely switched retry requests", async () => {
+    const adapter = new MockApiAdapter();
+    const invoice = (await adapter.invoices.getExternalInvoice("INV-20260728-00001", "CREATOR-001")).data!;
+    const input = { mode: "SWITCH_ACCOUNT" as const, payoutAccountId: "missing", submittedBy: "CREATOR-001", expectedVersion: invoice.version!, clientRequestId: "retry:invalid" };
+    await expect(adapter.payments.requestPaymentRetry(invoice.invoiceId!, { ...input, submittedBy: "CREATOR-OTHER" })).rejects.toThrow("无权访问");
+    await expect(adapter.payments.requestPaymentRetry(invoice.invoiceId!, { ...input, expectedVersion: 999 })).rejects.toThrow("已更新");
+    await expect(adapter.payments.requestPaymentRetry(invoice.invoiceId!, input)).rejects.toThrow("已验证且可用");
+    await expect(adapter.payments.requestPaymentRetry(invoice.invoiceId!, { ...input, payoutAccountId: invoice.payoutAccountId! })).rejects.toThrow("已变化");
+  });
+
+  it("stages a verified alternate account only when the creator submits the retry request", async () => {
+    const adapter = new MockApiAdapter();
+    const invoice = (await adapter.invoices.getExternalInvoice("INV-20260728-00001", "CREATOR-001")).data!;
+    const profile = (await adapter.profile.get()).data;
+    const alternate = { ...profile.payoutAccounts.find((account) => account.provider === "PayPal")!, status: "VALIDATED" as const };
+    await adapter.profile.save({ ...profile, payoutAccounts: profile.payoutAccounts.map((account) => account.id === alternate.id ? alternate : account) });
+    expect((await adapter.invoices.getExternalInvoice(invoice.invoiceId!, "CREATOR-001")).data?.payoutAccountId).toBe(invoice.payoutAccountId);
+    const requested = await adapter.payments.requestPaymentRetry(invoice.invoiceId!, { mode: "SWITCH_ACCOUNT", payoutAccountId: alternate.id, submittedBy: "CREATOR-001", expectedVersion: invoice.version!, clientRequestId: "retry:switch" });
+    expect(requested.data.payoutAccountId).toBe(alternate.id);
+    expect(requested.data.paymentRetryRequest?.payoutSnapshot.provider).toBe("PayPal");
+    expect(requested.data.paymentStatus).toBe("FAILED");
+  });
+
   it("persists an internal signature, enters review, and rejects a duplicate signature", async () => {
     const adapter = new MockApiAdapter();
+    const beforeAuditCount = adminStore.listAudits().length;
     const signature = {
       method: "DRAWN" as const,
       dataUrl: "data:image/png;base64,c2lnbmF0dXJl",
@@ -1301,9 +1733,45 @@ describe("invoice ordering", () => {
     expect(result.data.documentState).toEqual({ kind: "INTERNAL", status: "UNDER_REVIEW" });
     expect(result.data.paymentStatus).toBe("WAITING_PAYMENT");
     expect(result.data.operationHistory?.at(-1)?.type).toBe("INTERNAL_SIGNED");
+    expect(adminStore.listAudits()).toHaveLength(beforeAuditCount + 1);
+    expect(adminStore.listAudits()[0]).toMatchObject({ action: "CREATOR_BUSINESS_ACTION", actorId: "CREATOR-001", module: "INVOICE" });
     await expect(
       adapter.invoices.signInternalInvoice("invoice-creator-001-internal-001", signature),
-    ).rejects.toThrow("只有待签署的 Comets内部合同可以签署");
+    ).rejects.toThrow("只有待签署的 Comets内部invoice可以签署");
+    expect(adminStore.listAudits()).toHaveLength(beforeAuditCount + 1);
+  });
+
+  it("captures the current default account when signing and preserves it after profile edits", async () => {
+    const adapter = new MockApiAdapter();
+    const profile = structuredClone((await adapter.profile.get()).data);
+    const updatedAccountNumber = "FR7630006000011234567890197";
+    const updatedProfile = {
+      ...profile,
+      payout: { ...profile.payout, accountNumber: updatedAccountNumber, schemaValues: { ...profile.payout.schemaValues, account_number: updatedAccountNumber } },
+      payoutAccounts: profile.payoutAccounts.map((account) => account.id === profile.defaultPayoutAccountId
+        ? { ...account, accountNumber: updatedAccountNumber, schemaValues: { ...account.schemaValues, account_number: updatedAccountNumber } }
+        : account),
+    };
+    await adapter.profile.save(updatedProfile);
+    const signed = await adapter.invoices.signInternalInvoice("invoice-creator-001-internal-001", {
+      method: "DRAWN",
+      dataUrl: "data:image/png;base64,c2lnbmF0dXJl",
+      signerName: "Léa Martin",
+      signedAt: "2026-07-27T14:45:00.000Z",
+    });
+    expect(signed.data.payoutAccountId).toBe(profile.defaultPayoutAccountId);
+    expect(signed.data.payoutSnapshot?.accountNumber).toBe(updatedAccountNumber);
+
+    const nextProfile = structuredClone((await adapter.profile.get()).data);
+    await adapter.profile.save({
+      ...nextProfile,
+      payout: { ...nextProfile.payout, accountNumber: "FR7630006000011234567890189", schemaValues: { ...nextProfile.payout.schemaValues, account_number: "FR7630006000011234567890189" } },
+      payoutAccounts: nextProfile.payoutAccounts.map((account) => account.id === nextProfile.defaultPayoutAccountId
+        ? { ...account, accountNumber: "FR7630006000011234567890189", schemaValues: { ...account.schemaValues, account_number: "FR7630006000011234567890189" } }
+        : account),
+    });
+    const after = (await adapter.invoices.list()).data.find((item) => invoiceInternalIdOf(item) === "invoice-creator-001-internal-001");
+    expect(after?.payoutSnapshot?.accountNumber).toBe(updatedAccountNumber);
   });
 
   it("persists creator feedback and moves the internal Invoice into feedback processing", async () => {
@@ -1461,25 +1929,49 @@ describe("invoice ordering", () => {
 describe("creator invoice-centric workflow", () => {
   it("signs a pending contract only once and rejects administrator signing", async () => {
     const adapter = new MockApiAdapter();
+    const signature = { method: "DRAWN" as const, dataUrl: "data:image/png;base64,dGVzdA==", signerName: "Léa Martin", signedAt: "2026-09-19T10:00:00.000Z" };
     await expect(
       adapter.contracts.signContract("CON-260727-KOL-02", {
         userId: "ADMIN-001",
         role: "ADMIN",
-      }),
+      }, signature),
     ).rejects.toThrow("管理员只读视图不能替达人签署合同");
 
     const signed = await adapter.contracts.signContract("CON-260727-KOL-02", {
       userId: "CREATOR-001",
       role: "CREATOR",
-    });
+    }, signature);
     expect(signed.data.status).toBe("ACTIVE");
-    expect(signed.data.signatureRecord).toMatchObject({ actorRole: "CREATOR" });
+    expect(signed.data.signatureRecord).toMatchObject({ actorRole: "CREATOR", signature: { method: "DRAWN", dataUrl: signature.dataUrl } });
+    expect((await adapter.contracts.get("CON-260727-KOL-02")).data?.signatureRecord?.signature?.dataUrl).toBe(signature.dataUrl);
     await expect(
       adapter.contracts.signContract("CON-260727-KOL-02", {
         userId: "CREATOR-001",
         role: "CREATOR",
-      }),
+      }, signature),
     ).rejects.toThrow("只有待签署合同可以签署");
+  });
+
+  it("persists the contract signature across reload without creating an Invoice", async () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+      },
+    });
+    const adapter = new MockApiAdapter();
+    const before = (await adapter.invoices.list()).data.length;
+    await expect(adapter.contracts.signContract("CON-260727-KOL-02", { userId: "CREATOR-001", role: "CREATOR" }, {
+      method: "DRAWN", dataUrl: "", signerName: "Léa Martin", signedAt: new Date().toISOString(),
+    })).rejects.toThrow("请完成签名");
+    await adapter.contracts.signContract("CON-260727-KOL-02", { userId: "CREATOR-001", role: "CREATOR" }, {
+      method: "GENERATED", dataUrl: "data:image/png;base64,dGVzdA==", signerName: "Léa Martin", signedAt: new Date().toISOString(),
+    });
+    const restored = new MockApiAdapter();
+    expect((await restored.contracts.get("CON-260727-KOL-02")).data?.signatureRecord?.signature?.method).toBe("GENERATED");
+    expect((await restored.invoices.list()).data).toHaveLength(before);
   });
 
   it("aggregates stable tasks with resource IDs, invoice-number copy, and deep links", () => {
@@ -1494,11 +1986,11 @@ describe("creator invoice-centric workflow", () => {
         status: "PENDING_REVIEW",
       },
     ]);
-    const uploadTask = tasks.find((task) => task.type === "EXTERNAL_INVOICE_UPLOAD");
+    const uploadTask = tasks.find((task) => task.type === "EXTERNAL_INVOICE_UPLOAD" && task.resourceNumber === "INV-20260920-00001");
     expect(uploadTask).toMatchObject({
-      resourceId: "invoice-creator-001-external-003",
-      resourceNumber: "INV-20260718-00001",
-      deepLink: "/invoices/INV-20260718-00001",
+      resourceId: "invoice-creator-001-external-demo-20260920",
+      resourceNumber: "INV-20260920-00001",
+      deepLink: "/invoices/INV-20260920-00001",
     });
     expect(tasks.some((task) => task.group === "TODO")).toBe(true);
     expect(tasks.some((task) => task.group === "PROCESSING")).toBe(true);
@@ -1563,20 +2055,20 @@ describe("request and invoice consistency", () => {
     expect(syncRequestWithInvoices(request, invoices).status).toBe("PAYMENT_FAILED");
   });
 
-  it("returns the request to payment processing after payout information is repaired", () => {
+  it("retains the other unsigned Invoice when a failed payout is repaired", () => {
     const request = requests.find((item) => item.id === "REQ-260728-MH-JULY")!;
     const resubmitted = invoices.map((invoice) =>
-      invoice.id === "INV-20260728-00001"
+      ["INV-20260728-00001", "INV-20260920-00003"].includes(invoice.id)
         ? { ...invoice, status: "APPROVED" as const }
         : invoice,
     );
     const synced = syncRequestWithInvoices(request, resubmitted);
-    expect(synced.status).toBe("APPROVED");
+    expect(synced.status).toBe("DRAFT_SIGNATURE");
+    expect(synced.amount).toBe("USD 3,730");
     expect(synced.contractStatus).toBe(request.contractStatus);
     expect(synced.issues).toHaveLength(0);
-    expect(synced.progress[1].state).toBe("complete");
-    expect(synced.progress[2].state).toBe("complete");
-    expect(synced.progress[3].state).toBe("current");
+    expect(synced.progress[1].state).toBe("current");
+    expect(synced.progress[2].state).toBe("pending");
   });
 });
 
@@ -1584,7 +2076,7 @@ describe("registration validation", () => {
   const validValues = {
     email: "creator@example.com",
     password: "Creator2026",
-    invitationCode: "",
+    invitationCode: DEMO_INVITATION_CODE,
   };
 
   it("rejects an invalid email address", () => {
@@ -1631,6 +2123,41 @@ describe("registration validation", () => {
     expect(validateRegistration(validValues, false)).toContain("服务协议");
   });
 
+  it("requires the same demonstration invitation for email and Google registration", () => {
+    expect(validateRegistration({ ...validValues, invitationCode: "" }, true)).toContain("请输入邀请码");
+    expect(validateRegistration({ ...validValues, invitationCode: "BAD" }, true)).toContain("邀请码无效");
+    expect(validateDemoInvitation("BAD", true)).toContain("邀请码无效");
+    expect(validateDemoInvitation(DEMO_INVITATION_CODE, false)).toContain("服务协议");
+    expect(validateDemoInvitation(DEMO_INVITATION_CODE, true)).toBe("");
+    const store = new MockAdminStore(false);
+    expect(() => store.register("Invalid", "invalid@example.com", "Creator2026", "BAD")).toThrow("邀请码无效");
+  });
+
+  it("fills only empty demonstration fields without persisting credentials or bypassing verification", () => {
+    const values = fillEmptyFields({ email: "own@example.com", password: "", invitationCode: "" }, demonstrationRegistrationValues());
+    expect(values.email).toBe("own@example.com");
+    expect(values.password).toBe("Creator2026");
+    expect(values.invitationCode).toBe(DEMO_INVITATION_CODE);
+    expect(DEMO_SOCIAL_SCREENSHOT.previewUrl).toMatch(/\.svg$/);
+    expect(DEMO_SOCIAL_SCREENSHOT.name).toContain("演示");
+    expect(validateSocialVerification([DEMO_SOCIAL_URL], [DEMO_SOCIAL_SCREENSHOT])).toBe("");
+  });
+
+  it("generates valid Airwallex examples for the active scenario and preserves edits", () => {
+    for (const [bankCountryCode, accountCurrency] of [["FR", "EUR"], ["GB", "GBP"], ["US", "USD"], ["JP", "JPY"]] as const) {
+      for (const entityType of ["PERSONAL", "COMPANY"] as const) {
+        for (const transferMethod of ["LOCAL", "SWIFT"] as const) {
+          const condition = { bankCountryCode, accountCurrency, entityType, transferMethod };
+          const schema = buildAirwallexMockSchema(condition);
+          const demo = fillAirwallexDemoValues(schema, condition, { account_name: "Own Name" });
+          expect(demo.account_name).toBe("Own Name");
+          expect(validateAirwallexSchemaValues(schema, demo)).toEqual({});
+          expect(fillAirwallexDemoValues(schema, condition, demo)).toEqual(demo);
+        }
+      }
+    }
+  });
+
   it("accepts a complete registration form", () => {
     expect(validateRegistration(validValues, true)).toBe("");
   });
@@ -1638,20 +2165,21 @@ describe("registration validation", () => {
   it("returns a recoverable error when the email is already registered", () => {
     const store = new MockAdminStore(false);
     expect(() =>
-      store.register("Duplicate Creator", CREATOR_DEMO_CREDENTIALS.email, "Creator2026"),
+      store.register("Duplicate Creator", CREATOR_DEMO_CREDENTIALS.email, "Creator2026", DEMO_INVITATION_CODE),
     ).toThrow("该邮箱已注册");
   });
 
   it("keeps the store usable after a duplicate registration attempt", () => {
     const store = new MockAdminStore(false);
     expect(() =>
-      store.register("Duplicate Creator", CREATOR_DEMO_CREDENTIALS.email, "Creator2026"),
+      store.register("Duplicate Creator", CREATOR_DEMO_CREDENTIALS.email, "Creator2026", DEMO_INVITATION_CODE),
     ).toThrow("该邮箱已注册");
 
     const session = store.register(
       "Retry Creator",
       "retry.creator@example.com",
       "Creator2026",
+      DEMO_INVITATION_CODE,
     );
     expect(session.role).toBe("CREATOR");
     expect(session.email).toBe("retry.creator@example.com");

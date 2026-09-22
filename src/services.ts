@@ -29,15 +29,28 @@ import {
   createInvoicePayoutSnapshot,
   ensureInvoicePayoutSnapshot,
   getSocialAccountName,
+  payoutAccountChangedSinceSnapshot,
 } from "./creator-display";
+import { aggregateRequestProjects, assertAttemptAllowed, failedPaymentSnapshot, legacyPaymentAttempt, linkInvoicesToContracts } from "./payment-relations";
+import { managementCreatorDetail, maskedCreatorDetail, maskSnapshot } from "./mock/users";
+import { attemptsByCreator } from "./mock/payments";
 import {
   assertCreatorOwnsInvoice,
   assertExpectedVersion,
+  canCorrectExternalInvoice,
+  currentExternalCorrection,
+  payoutAccountFingerprint,
   recognitionFieldsFromExtracted,
   validateExternalInvoiceConfirmation,
 } from "./invoices/external/workflow";
+import { MockAiRecognitionAdapter, demoInvoiceValues, type ExternalInvoiceRecognitionAdapter } from "./invoices/external/recognition";
+import { dataUrlToBlob, fileStorageMessage, readInvoiceFile, removeInvoiceFile, saveInvoiceFile } from "./invoices/external/file-store";
+import { type AddSocialAccountInput, SocialAccountError, validateSocialAccountAddition } from "./social-accounts";
+import { removeSocialScreenshot, saveSocialScreenshot } from "./social-file-store";
+import { normalizeSocialEvidence } from "./creator-display";
 import type {
   ConfirmExternalInvoiceCommand,
+  ConfirmExternalInvoicePageCommand,
   CorrectExternalInvoiceRecognitionCommand,
   ExternalInvoiceCommandBase,
   ExternalInvoiceReviewEvent,
@@ -60,6 +73,7 @@ import type {
   ApiResult,
   AuditEvent,
   Contract,
+  ContractType,
   CreatorNotification,
   CreatorTask,
   CorrectionRequest,
@@ -68,12 +82,14 @@ import type {
   ExternalBusinessEvent,
   ExternalSyncIssue,
   Invoice,
+  PaymentAttempt,
   InvoiceSignature,
   InvoiceStatus,
   InvoiceExtractedData,
   InvoiceFeedbackInput,
   InvoiceUploadInput,
   PaymentAccountCorrectionInput,
+  PaymentRetryRequestInput,
   PayoutAccount,
   RequestProject,
   SensitiveFieldKey,
@@ -86,7 +102,15 @@ import type {
 const INVOICE_STORAGE_KEY = "comets-creator-invoices-v2";
 const PROFILE_STORAGE_KEY = "comets-creator-profile-v2";
 const CONTRACT_STORAGE_KEY = "comets-creator-contracts-v1";
+const PAYMENT_ATTEMPT_STORAGE_KEY = "comets-creator-payment-attempts-v1";
 const CREATOR_NOTIFICATION_STORAGE_KEY = "comets-creator-notifications-v2";
+
+const CONTRACT_TYPES: ContractType[] = ["INDEPENDENT", "FRAMEWORK", "IO"];
+
+const normalizeContractType = (value: unknown): ContractType =>
+  typeof value === "string" && CONTRACT_TYPES.includes(value as ContractType)
+    ? (value as ContractType)
+    : "INDEPENDENT";
 
 const wait = (duration = 240) =>
   new Promise<void>((resolve) => globalThis.setTimeout(resolve, duration));
@@ -403,11 +427,25 @@ export interface ProfileSupplementalField {
   type: "INPUT" | "SELECT";
   options?: Array<{ label: string; value: string }>;
   fullWidth?: boolean;
+  example?: string;
+  guidance?: string;
 }
 
 export interface AuthService {
   login(email: string, password: string): Promise<ApiResult<Session>>;
-  register(name: string, email: string, password: string): Promise<ApiResult<Session>>;
+  register(name: string, email: string, password: string, invitationCode: string): Promise<ApiResult<Session>>;
+  requestPasswordReset(email: string): Promise<ApiResult<{
+    accepted: true;
+    retryAfterSeconds: number;
+    maskedEmail: string;
+    demoToken?: string;
+  }>>;
+  verifyPasswordReset(token: string): Promise<ApiResult<{
+    valid: boolean;
+    maskedEmail?: string;
+    reason?: "EXPIRED" | "USED" | "INVALID";
+  }>>;
+  completePasswordReset(token: string, newPassword: string): Promise<ApiResult<{ completed: true }>>;
   restore(sessionId: string): Promise<ApiResult<Session | undefined>>;
   logout(sessionId: string): Promise<ApiResult<{ revoked: true }>>;
   completeOnboarding(
@@ -420,6 +458,7 @@ export interface AuthService {
 export interface ProfileService {
   get(userId?: string): Promise<ApiResult<UserProfile>>;
   save(profile: UserProfile): Promise<ApiResult<UserProfile>>;
+  addSocialAccount(input: AddSocialAccountInput): Promise<ApiResult<UserProfile>>;
 }
 
 export interface RequestProjectService {
@@ -433,12 +472,14 @@ export interface ContractService {
   signContract(
     id: string,
     actor: Pick<Session, "userId" | "role">,
+    signature: InvoiceSignature,
   ): Promise<ApiResult<Contract>>;
 }
 
 export interface InvoiceService {
   list(creatorId?: string): Promise<ApiResult<Invoice[]>>;
   get(id: string, creatorId?: string): Promise<ApiResult<Invoice | undefined>>;
+  getDocumentFile(id: string, creatorId: string): Promise<Blob | undefined>;
   signInternalInvoice(
     invoiceId: string,
     signature: InvoiceSignature,
@@ -462,6 +503,7 @@ export interface InvoiceService {
   correctExternalInvoiceRecognition(input: CorrectExternalInvoiceRecognitionCommand): Promise<ApiResult<Invoice>>;
   selectExternalInvoicePayoutAccount(input: SelectExternalInvoicePayoutAccountCommand): Promise<ApiResult<Invoice>>;
   confirmExternalInvoice(input: ConfirmExternalInvoiceCommand): Promise<ApiResult<Invoice>>;
+  confirmExternalInvoicePage(input: ConfirmExternalInvoicePageCommand): Promise<ApiResult<Invoice>>;
   resubmitExternalInvoice(input: ResubmitExternalInvoiceCommand): Promise<ApiResult<Invoice>>;
   listExternalInvoiceHistory(invoiceId: string, creatorId: string): Promise<ApiResult<ExternalInvoiceReviewEvent[]>>;
 }
@@ -471,10 +513,16 @@ export interface TaskService {
 }
 
 export interface PaymentService {
+  listAttempts(invoiceId: string, creatorId: string): Promise<ApiResult<PaymentAttempt[]>>;
+  listCreatorAttempts(creatorId: string): Promise<ApiResult<PaymentAttempt[]>>;
+  /** Mock system-side confirmation: a creator cannot directly execute a transfer. */
+  approveCorrectionAndRetry(invoiceId: string, actor: "SYSTEM"): Promise<ApiResult<PaymentAttempt>>;
+  recordAttemptResult(attemptId: string, status: "FAILED" | "PAID", actor: "SYSTEM", reason?: string): Promise<ApiResult<PaymentAttempt>>;
   submitAccountCorrection(
     invoiceId: string,
     input: PaymentAccountCorrectionInput,
   ): Promise<ApiResult<Invoice>>;
+  requestPaymentRetry(invoiceId: string, input: PaymentRetryRequestInput): Promise<ApiResult<Invoice>>;
 }
 
 export interface PayoutService {
@@ -505,7 +553,7 @@ export interface AdminUserService {
     ids: string[],
     status: AccountStatus,
     actorId: string,
-    reason: string,
+    reason?: string,
   ): Promise<ApiResult<UserAccount[]>>;
   updateProfile(
     id: string,
@@ -583,6 +631,15 @@ export interface ExternalBusinessDataAdapter {
 }
 
 export interface Services {
+  creatorScope: {
+    read(sessionId: string, creatorId: string): Promise<ApiResult<{
+      detail: AdminUserDetail;
+      attempts: PaymentAttempt[];
+      tasks: CreatorTask[];
+    }>>;
+    assertWrite(sessionId: string, creatorId: string): void;
+    assertInvoiceWrite(sessionId: string, creatorId: string, invoiceId: string): void;
+  };
   auth: AuthService;
   profile: ProfileService;
   requests: RequestProjectService;
@@ -627,8 +684,14 @@ export const payoutAccountPaymentDetails = (account: PayoutAccount) => ({
   account_number: account.accountNumber,
   bank_name: account.bankName,
   bank_address: account.schemaValues.bank_street_address || "",
+  bank_country: account.bankCountry,
   swift_code: account.swiftCode,
   iban: account.schemaValues.iban || "",
+  transfer_method: account.transferMethod,
+  beneficiary_type: account.beneficiaryType,
+  paypal_email: account.accountEmail || "",
+  provider: account.provider,
+  payment_method: account.provider === "PayPal" ? "PayPal" : "Bank Transfer",
 });
 
 const normalizePaymentDetail = (value: string) =>
@@ -639,8 +702,10 @@ export const compareInvoicePaymentDetails = (
   account: PayoutAccount,
 ) => {
   const accountDetails = payoutAccountPaymentDetails(account);
+  // Empty/unrecognized fields inherit the selected account without rewriting AI output.
+  const supplied = Object.fromEntries(Object.entries(recognized).filter(([key, value]) => key in accountDetails && value.trim()));
   const compared = Object.entries(recognized)
-    .filter(([, value]) => value.trim())
+    .filter(([key, value]) => key in accountDetails && value.trim())
     .map(([key, value]) => ({
       key,
       recognizedValue: value,
@@ -652,7 +717,7 @@ export const compareInvoicePaymentDetails = (
   return {
     matches: compared.every((field) => field.matches),
     fields: compared,
-    merged: { ...accountDetails, ...recognized },
+    merged: { ...accountDetails, ...supplied },
   };
 };
 
@@ -720,6 +785,59 @@ const LOCAL_CURRENCY_BY_COUNTRY: Record<string, string> = {
   HK: "HKD",
 };
 
+// Mock-only examples: never derive them from the creator's saved account values.
+const exampleIbanFor = (countryCode: string) => {
+  if (countryCode === "FR") return "FR7630006000011234567890189";
+  if (countryCode === "GB") return "GB82WEST12345698765432";
+  return "不适用：该国家/地区无需 IBAN";
+};
+
+const payoutExampleFor = (key: string, condition: AirwallexSchemaCondition): string | undefined => {
+  const country = condition.bankCountryCode;
+  if (key === "account_number") {
+    if (condition.transferMethod === "LOCAL" && condition.accountCurrency === LOCAL_CURRENCY_BY_COUNTRY[country]) {
+      return { GB: "12345678", JP: "1234567", US: "1234567890" }[country] || "123456789012";
+    }
+    return "123456789012";
+  }
+  if (key === "iban") return exampleIbanFor(country);
+  if (key === "swift_code") return `EXAM${country}${country === "US" ? "33" : "PP"}`;
+  if (key === "bank_street_address") return ({
+    FR: "10 Rue Exemple, Paris 75001, France",
+    JP: "1-2-3 Chiyoda, Tokyo 100-0001, Japan",
+    US: "123 Example Street, New York, NY 10001",
+    GB: "10 Example Street, London SW1A 1AA",
+    AU: "10 Example Street, Sydney NSW 2000",
+    SG: "10 Example Road, Singapore 018956",
+    HK: "10 Example Road, Central, Hong Kong",
+  })[country] || "10 Example Street, Paris 75001, France";
+  return {
+    account_name: "Alex Morgan", bank_name: "Example Bank",
+    routing_number: "021000021", bank_code: "0001", branch_code: "001",
+    primary_routing_code: "123456",
+    beneficiary_id_number: "AB1234567", business_registration_number: "AB12345678",
+  }[key] || (key === "bank_city" ? ({ JP: "Tokyo", US: "New York", GB: "London", AU: "Sydney", SG: "Singapore", HK: "Hong Kong" })[country] || "Paris"
+    : key === "bank_state_province" ? ({ JP: "Tokyo", US: "NY", GB: "Greater London", AU: "NSW", SG: "Central", HK: "Central" })[country] || "Île-de-France"
+      : key === "bank_postal_code" ? ({ JP: "100-0001", US: "10001", GB: "SW1A 1AA", AU: "2000", SG: "018956", HK: "000000" })[country] || "75001" : undefined);
+};
+
+/** Prototype examples follow the currently loaded form schema, without touching entered values. */
+export const fillAirwallexDemoValues = (
+  schema: AirwallexFormSchema,
+  condition: AirwallexSchemaCondition,
+  current: Record<string, string>,
+): Record<string, string> => {
+  const next = { ...current };
+  for (const field of schema.fields) {
+    if (next[field.key]?.trim()) continue;
+    const example = field.type === "SELECT"
+      ? field.options?.[0]?.value
+      : payoutExampleFor(field.key, condition);
+    if (example) next[field.key] = example;
+  }
+  return next;
+};
+
 export const sortAirwallexTransferMethods = (
   methods: AirwallexTransferMethodOption[],
 ) => {
@@ -742,6 +860,16 @@ export const sortAirwallexTransferMethods = (
   }));
 };
 
+export const resolveAirwallexTransferMethod = (
+  methods: AirwallexTransferMethodOption[],
+  currentValue: AirwallexTransferMethodOption["value"],
+  preserveCurrent: boolean,
+): AirwallexTransferMethodOption | undefined => {
+  const current = methods.find((method) => method.value === currentValue && method.available);
+  const recommended = methods.find((method) => method.recommended && method.available);
+  return preserveCurrent && current ? current : recommended || current;
+};
+
 export const buildAirwallexMockTransferMethods = (
   condition: AirwallexTransferMethodCondition,
 ): AirwallexTransferMethodOption[] => {
@@ -756,6 +884,8 @@ export const buildAirwallexMockTransferMethods = (
       available: Boolean(localCurrency),
       estimatedFeeAmount: (usesLocalCurrency ? 1 : 10) + entitySurcharge,
       feeCurrency: condition.accountCurrency,
+      arrivalMinBusinessDays: 0,
+      arrivalMaxBusinessDays: 2,
       recommended: false,
     },
     {
@@ -764,6 +894,8 @@ export const buildAirwallexMockTransferMethods = (
       available: true,
       estimatedFeeAmount: (usesLocalCurrency ? 7.5 : 6) + entitySurcharge,
       feeCurrency: condition.accountCurrency,
+      arrivalMinBusinessDays: 1,
+      arrivalMaxBusinessDays: 3,
       recommended: false,
     },
   ]);
@@ -967,8 +1099,43 @@ export const buildAirwallexMockSchema = (
     fields: [
       ...requiredFields,
       ...(condition.transferMethod === "LOCAL" ? localFields : []),
-    ],
+    ].map((field) => ({
+      ...field,
+      example: field.type === "SELECT"
+        ? field.options?.[0]?.label
+        : payoutExampleFor(field.key, condition),
+    })),
   };
+};
+
+export const profileSchemaFieldRequirement = (field: AirwallexSchemaField) => {
+  if (field.type === "SELECT") return "请从当前场景提供的有效选项中选择";
+  return (field.description || field.validationMessage || field.placeholder || "请按照当前付款场景的字段要求填写")
+    .replace(/^格式要求：/, "");
+};
+
+const profileSupplementalGuidance = (
+  key: string,
+  countryCode: string,
+): string => {
+  if (key === "iban" && !["FR", "GB"].includes(countryCode)) {
+    return "当前国家/地区通常无需 IBAN，无此号码可留空";
+  }
+  return ({
+    account_type: "按开户行确认的账户类型选择",
+    primary_routing_code_type: "按开户行提供的路由代码类型选择",
+    primary_routing_code: "按开户行提供的路由代码填写",
+    branch_code: "按开户行提供的分行代码填写",
+    swift_code: "如开户行提供 SWIFT / BIC，可填写对应代码",
+    iban: "如开户行提供 IBAN，可填写完整号码",
+    bank_street_address: "按开户行实际街道地址填写",
+    bank_city: "按开户行实际所在城市填写",
+    bank_state_province: "按开户行实际所在州或省填写",
+    bank_postal_code: "按开户行实际邮政编码填写",
+    id_document_type: "按本人有效证件类型选择",
+    beneficiary_id_number: "按所选证件上的号码填写",
+    business_registration_number: "按企业登记证明上的号码填写",
+  } satisfies Record<string, string>)[key] || "根据开户行或主体资料填写";
 };
 
 const AIRWALLEX_REQUIRED_FIELD_KEYS = [
@@ -1049,7 +1216,14 @@ export const buildProfileSupplementalFields = (
   const hasPrimaryRoutingCode =
     registeredKeys.has("routing_number") || registeredKeys.has("bank_code");
 
-  return [
+  const condition: AirwallexSchemaCondition = {
+    bankCountryCode: inferAirwallexCountryCode(profile.payout.bankCountry),
+    accountCurrency: profile.payout.currency,
+    entityType: profile.payout.beneficiaryType,
+    transferMethod: profile.payout.transferMethod,
+  };
+
+  return ([
     ...(!registeredKeys.has("account_type")
       ? [{
           key: "account_type",
@@ -1150,7 +1324,13 @@ export const buildProfileSupplementalFields = (
           label: "企业注册号 / Business registration number",
           type: "INPUT" as const,
         }]),
-  ];
+  ] as ProfileSupplementalField[]).map((field) => ({
+    ...field,
+    guidance: profileSupplementalGuidance(field.key, condition.bankCountryCode),
+    example: field.type === "SELECT"
+      ? field.options?.find((option) => field.key === "primary_routing_code_type" && option.value === ({ JP: "BANK_CODE", US: "ABA", GB: "SORT_CODE", AU: "BSB" } as Record<string, string>)[condition.bankCountryCode])?.label || field.options?.[0]?.label
+      : payoutExampleFor(field.key, condition),
+  }));
 };
 
 const profileSchemaValue = (profile: UserProfile, key: string) => {
@@ -1200,13 +1380,80 @@ export const validateRequiredProfileFields = (profile: UserProfile) => {
 };
 
 export class MockApiAdapter implements Services {
+  constructor(private readonly aiRecognition: ExternalInvoiceRecognitionAdapter = new MockAiRecognitionAdapter()) {
+    this.invoiceData = linkInvoicesToContracts(this.invoiceData, this.contractData, PRIMARY_CREATOR_ID);
+    adminStore.syncProfile(this.profileData, false);
+  }
   private invoiceData = this.readInvoices();
   private contractData = this.readContracts();
   private profileData = this.readProfile();
+  private paymentAttemptData = this.readPaymentAttempts();
   private creatorNotificationData = this.readCreatorNotifications();
 
-  constructor() {
-    adminStore.syncProfile(this.profileData, false);
+  private authorizedCreator(sessionId: string, creatorId: string, write = false): Session {
+    const session = adminStore.restoreSession(sessionId);
+    if (!session) throw new Error("登录会话已失效，请重新登录");
+    const account = adminStore.listUsers({ role: "CREATOR" }).find((item) => item.id === creatorId);
+    if (!account) throw new Error("达人不存在或无权查看");
+    if (session.role === "CREATOR" && session.userId !== creatorId) throw new Error("无权查看其他达人的资料");
+    if (write && (session.role !== "CREATOR" || session.userId !== creatorId)) throw new Error("管理员只读模式不能执行达人操作");
+    return session;
+  }
+
+  creatorScope: Services["creatorScope"] = {
+    assertWrite: (sessionId, creatorId) => { this.authorizedCreator(sessionId, creatorId, true); },
+    assertInvoiceWrite: (sessionId, creatorId, invoiceId) => {
+      this.authorizedCreator(sessionId, creatorId, true);
+      const invoices = creatorId === PRIMARY_CREATOR_ID ? this.invoiceData : adminStore.getUserDetail(creatorId).invoices;
+      if (!invoices.some((item) => item.id === invoiceId || item.invoiceId === invoiceId || item.invoiceNumber === invoiceId)) {
+        throw new Error("当前账号无权操作该 Invoice");
+      }
+    },
+    read: async (sessionId, creatorId) => {
+      const session = this.authorizedCreator(sessionId, creatorId);
+      await wait(80);
+      // Revalidate after asynchronous work, so disabling an account revokes access immediately.
+      this.authorizedCreator(sessionId, creatorId);
+      const detail = adminStore.getUserDetail(creatorId, creatorId === PRIMARY_CREATOR_ID ? {
+        contracts: this.contractData,
+        invoices: this.invoiceData,
+        profile: this.profileData,
+      } : undefined);
+      const attempts = attemptsByCreator(detail.invoices, creatorId === PRIMARY_CREATOR_ID ? this.paymentAttemptData : [], creatorId);
+      return { data: {
+        detail: session.role === "ADMIN" ? maskedCreatorDetail(detail) : detail,
+        attempts: session.role === "ADMIN" ? attempts.map((attempt) => ({
+          ...attempt,
+          payoutSnapshot: attempt.payoutSnapshot && maskSnapshot(attempt.payoutSnapshot),
+        })) : attempts,
+        tasks: buildCreatorTasks(detail.contracts, detail.invoices),
+      } };
+    },
+  };
+
+  private readPaymentAttempts(): PaymentAttempt[] {
+    const invoiceAttempts = this.invoiceData.flatMap((invoice) => legacyPaymentAttempt(invoice));
+    const failure = this.invoiceData.find((invoice) => invoice.id === "INV-20260728-00001");
+    if (failure) {
+      const current = invoiceAttempts.find((attempt) => attempt.invoiceId === invoiceInternalIdOf(failure));
+      if (current) {
+        current.sequence = 2;
+        invoiceAttempts.push({ ...structuredClone(current), id: `${current.id}:first`, sequence: 1, updatedAt: "2026-07-28T12:00:00.000Z", failureReason: "首次转账未通过银行账户校验" });
+      }
+    }
+    if (typeof window === "undefined") return invoiceAttempts;
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(PAYMENT_ATTEMPT_STORAGE_KEY) || "[]") as PaymentAttempt[];
+      const byId = new Map(invoiceAttempts.map((attempt) => [attempt.id, attempt]));
+      stored.forEach((attempt) => byId.set(attempt.id, attempt));
+      return [...byId.values()].filter((attempt) => this.invoiceData.some((invoice) => invoiceInternalIdOf(invoice) === attempt.invoiceId));
+    } catch {
+      return invoiceAttempts;
+    }
+  }
+
+  private persistPaymentAttempts() {
+    if (typeof window !== "undefined") window.localStorage.setItem(PAYMENT_ATTEMPT_STORAGE_KEY, JSON.stringify(this.paymentAttemptData));
   }
 
   private migratePayoutAccounts(profile: UserProfile) {
@@ -1240,7 +1487,11 @@ export class MockApiAdapter implements Services {
   private prepareInvoiceData(items: Invoice[]) {
     const prepared = sortInvoices(this.attachPayoutSnapshots(items));
     if (typeof window !== "undefined") {
-      window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(prepared));
+      try {
+        window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(prepared));
+      } catch {
+        // Preserve existing legacy JSON. Async migration will move embedded files first.
+      }
     }
     return prepared;
   }
@@ -1274,10 +1525,19 @@ export class MockApiAdapter implements Services {
             storedInvoice
             && storedInvoice.payoutAccountId !== invoice.payoutAccountId,
           );
+          // Correct timestamps from the first local-only demo fixture, but never reset an interacted record.
+          const pristineDemoTimestamp = (storedInvoice?.version || 1) === 1 && (
+            (invoice.id === "INV-20260920-00002" && storedInvoice?.updatedAt === "2026-09-20T09:30:00.000Z")
+            || (invoice.id === "INV-20260920-00003" && storedInvoice?.updatedAt === "2026-09-20T10:40:00.000Z")
+          );
           return {
             ...structuredClone(invoice),
             ...storedInvoice,
-            payoutSnapshot: storedInvoice?.payoutSnapshot
+            updatedAt: pristineDemoTimestamp || storedInvoice?.updatedAt === "2026-09-20T09:00:00.000Z"
+              ? invoice.updatedAt : storedInvoice?.updatedAt || invoice.updatedAt,
+            payoutSnapshot: pristineDemoTimestamp && invoice.id === "INV-20260920-00003"
+              ? invoice.payoutSnapshot
+              : storedInvoice?.payoutSnapshot
               || (payoutAccountChanged ? undefined : invoice.payoutSnapshot),
             projectId: invoice.projectId,
             projectName: invoice.projectName,
@@ -1304,13 +1564,21 @@ export class MockApiAdapter implements Services {
       if (!stored) return structuredClone(seedContracts);
       const storedContracts = JSON.parse(stored) as Contract[];
       const storedById = new Map(storedContracts.map((contract) => [contract.id, contract]));
-      return seedContracts.map((contract) => ({
+      const migratedContracts = seedContracts.map((contract) => ({
         ...structuredClone(contract),
         ...storedById.get(contract.id),
         projectId: contract.projectId,
         projectName: contract.projectName,
         brand: contract.brand,
+        contractType: normalizeContractType(
+          storedById.get(contract.id)?.contractType ?? contract.contractType,
+        ),
       }));
+      window.localStorage.setItem(
+        CONTRACT_STORAGE_KEY,
+        JSON.stringify(migratedContracts),
+      );
+      return migratedContracts;
     } catch {
       return structuredClone(seedContracts);
     }
@@ -1337,6 +1605,72 @@ export class MockApiAdapter implements Services {
     this.refreshCreatorNotifications();
   }
 
+  /** Upgrade old embedded documents without discarding the original JSON until every byte is safely stored. */
+  private async migrateEmbeddedInvoiceFiles() {
+    if (typeof window === "undefined" || typeof indexedDB === "undefined") return;
+    const candidate = structuredClone(this.invoiceData);
+    const written: string[] = [];
+    try {
+      for (const invoice of candidate) {
+        const refs = [invoice.document, ...(invoice.sourceFileVersions || []), ...(invoice.fileVersions || [])];
+        for (const ref of refs) {
+          if (!ref?.previewUrl?.startsWith("data:")) continue;
+          const storageId = ref.storageId || `legacy:${invoiceInternalIdOf(invoice)}:${ref.id}`;
+          if (!written.includes(storageId)) {
+            await saveInvoiceFile(storageId, await dataUrlToBlob(ref.previewUrl));
+            written.push(storageId);
+          }
+          ref.storageId = storageId;
+          delete ref.previewUrl;
+        }
+      }
+      if (!written.length) return;
+      window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(candidate));
+      this.invoiceData = candidate;
+    } catch {
+      await Promise.allSettled(written.map(removeInvoiceFile));
+      // Keep the complete legacy record; a later visit can retry migration.
+    }
+  }
+
+  /** Upgrade pending records created by the earlier empty mock; keep the original snapshot for audit. */
+  private migrateEmptyDemoRecognition() {
+    const candidate = structuredClone(this.invoiceData);
+    let changed = false;
+    for (const invoice of candidate) {
+      const original = invoice.recognitionSnapshots?.at(-1);
+      const file = invoice.sourceFileVersions?.at(-1);
+      if (invoice.documentState?.kind !== "EXTERNAL" || invoice.documentState.status !== "WAITING_CONFIRMATION"
+        || !original || !file || original.fileVersionId !== file.fileVersionId
+        || original.engineVersion !== "mock-ai-v1" || invoice.confirmedSnapshots?.length
+        || [original.fields.PUBLISHER, original.fields.ADVERTISER, original.fields.INVOICE_DATE, original.fields.AMOUNT, original.fields.CURRENCY]
+          .some((value) => value?.trim())) continue;
+      const extractedData = demoInvoiceValues({
+        invoice,
+        profile: this.profileData,
+        account: this.profileData.payoutAccounts.find((item) => item.id === invoice.payoutAccountId),
+      });
+      invoice.extractedData = extractedData;
+      invoice.recognitionSnapshots = [...invoice.recognitionSnapshots!, {
+        recognitionId: `recognition:demo:${invoiceInternalIdOf(invoice)}:${file.fileVersionId}`,
+        fileVersionId: file.fileVersionId,
+        engineVersion: "mock-ai-v2",
+        recognizedAt: new Date().toISOString(),
+        fields: recognitionFieldsFromExtracted(invoiceNumberOf(invoice), extractedData),
+        extractedData,
+      }];
+      invoice.pageConfirmations = {};
+      invoice.version = (invoice.version || 1) + 1;
+      changed = true;
+    }
+    if (!changed) return;
+    if (typeof window !== "undefined") {
+      try { window.localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(candidate)); }
+      catch { return; }
+    }
+    this.invoiceData = candidate;
+  }
+
   private persistContracts() {
     if (typeof window !== "undefined") {
       window.localStorage.setItem(CONTRACT_STORAGE_KEY, JSON.stringify(this.contractData));
@@ -1349,10 +1683,14 @@ export class MockApiAdapter implements Services {
     this.creatorNotificationData = buildCreatorNotifications(this.contractData, this.invoiceData)
       .map((item) => ({ ...item, read: readById.get(item.id) ?? false }));
     if (typeof window !== "undefined") {
-      window.localStorage.setItem(
-        CREATOR_NOTIFICATION_STORAGE_KEY,
-        JSON.stringify(this.creatorNotificationData),
-      );
+      try {
+        window.localStorage.setItem(
+          CREATOR_NOTIFICATION_STORAGE_KEY,
+          JSON.stringify(this.creatorNotificationData),
+        );
+      } catch {
+        // Notification storage must not undo a committed Invoice file/metadata pair.
+      }
     }
   }
 
@@ -1427,23 +1765,6 @@ export class MockApiAdapter implements Services {
     return structuredClone(invoice);
   }
 
-  private mockRecognizedData(invoice: Invoice) {
-    const expected = invoice.expectedValues!;
-    const account = this.profileData.payoutAccounts.find(
-      (candidate) => candidate.id === invoice.payoutAccountId,
-    );
-    return {
-      invoiceFrom: expected.creatorLegalName,
-      billTo: expected.billTo,
-      invoiceDate: new Date().toISOString().slice(0, 10),
-      currency: expected.currency,
-      total: expected.amount,
-      paymentDetails: account ? payoutAccountPaymentDetails(account) : {},
-      invoiceFromMatchesProfile: true,
-      billToMatchesComets: true,
-    } satisfies InvoiceExtractedData;
-  }
-
   private uploadExternalFile(
     input: ExternalInvoiceUploadInput,
     requiredStatus: "WAITING_UPLOAD" | "RETURNED_FOR_REUPLOAD" | "RECOGNITION_FAILED",
@@ -1501,7 +1822,7 @@ export class MockApiAdapter implements Services {
     this.recordInvoiceOperation(
       invoice,
       "EXTERNAL_RECOGNIZED",
-      `OCR 识别完成 · 文件版本 v${version}`,
+      `模拟 AI 识别完成 · 文件版本 v${version}`,
       "系统",
     );
     this.persistInvoices();
@@ -1513,7 +1834,7 @@ export class MockApiAdapter implements Services {
       invoice.documentState?.kind !== "EXTERNAL"
       || invoice.documentState.status !== "WAITING_CONFIRMATION"
     ) throw new Error("当前 Invoice 不能确认");
-    if (!invoice.extractedData) throw new Error("Invoice 尚未生成 OCR 识别结果");
+    if (!invoice.extractedData) throw new Error("Invoice 尚未生成 AI 识别结果");
     const account = this.profileData.payoutAccounts.find(
       (candidate) => candidate.id === invoice.payoutAccountId,
     );
@@ -1534,9 +1855,6 @@ export class MockApiAdapter implements Services {
     }
     if (normalizePaymentDetail(extracted.billTo) !== normalizePaymentDetail("COMETS INTERNATIONAL LIMITED")) {
       throw new Error("Bill To 必须为 COMETS INTERNATIONAL LIMITED");
-    }
-    if (!compareInvoicePaymentDetails(extracted.paymentDetails, account).matches) {
-      throw new Error("Invoice 收款信息与所选账户不一致");
     }
   }
 
@@ -1581,9 +1899,22 @@ export class MockApiAdapter implements Services {
       await wait();
       return { data: adminStore.login(email, password) };
     },
-    register: async (name, email, password) => {
+    register: async (name, email, password, invitationCode) => {
       await wait();
-      return { data: adminStore.register(name, email, password) };
+      return { data: adminStore.register(name, email, password, invitationCode) };
+    },
+    requestPasswordReset: async (email) => {
+      await wait();
+      return { data: adminStore.requestPasswordReset(email) };
+    },
+    verifyPasswordReset: async (token) => {
+      await wait(80);
+      return { data: adminStore.verifyPasswordReset(token) };
+    },
+    completePasswordReset: async (token, newPassword) => {
+      await wait();
+      adminStore.completePasswordReset(token, newPassword);
+      return { data: { completed: true }, message: "密码已更新" };
     },
     restore: async (sessionId) => {
       await wait(40);
@@ -1613,6 +1944,7 @@ export class MockApiAdapter implements Services {
     },
     save: async (profile) => {
       await wait();
+      const previousProfile = adminStore.getProfile(profile.id);
       const payoutProfile = normalizePayoutProfile(profile);
       const payoutAccounts = payoutProfile.payoutAccounts.map((account) => {
         if (account.provider !== "Airwallex") return account;
@@ -1642,12 +1974,62 @@ export class MockApiAdapter implements Services {
       if (!isEnglishAccountName(accountName)) {
         throw new Error("收款账户名仅支持英文字母和空格");
       }
-      this.profileData = structuredClone(normalizedProfile);
-      adminStore.syncProfile(this.profileData);
-      if (typeof window !== "undefined" && normalizedProfile.id === "CREATOR-001") {
+      if (normalizedProfile.id === PRIMARY_CREATOR_ID) this.profileData = structuredClone(normalizedProfile);
+      adminStore.syncProfile(normalizedProfile);
+      if (JSON.stringify(previousProfile) !== JSON.stringify(normalizedProfile)) {
+        adminStore.recordCreatorAction(normalizedProfile.id, "PROFILE", "保存个人档案或收款账户资料");
+      }
+      if (typeof window !== "undefined" && normalizedProfile.id === PRIMARY_CREATOR_ID) {
         window.localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(this.profileData));
       }
-      return { data: structuredClone(this.profileData), message: "个人档案已保存" };
+      return { data: structuredClone(normalizedProfile), message: "个人档案已保存" };
+    },
+    addSocialAccount: async (input) => {
+      const actor = browserSession();
+      this.authorizedCreator(actor.sessionId, input.creatorId, true);
+      const previous = adminStore.getProfile(input.creatorId);
+      if (!previous) throw new SocialAccountError("profileUnavailable");
+      const url = validateSocialAccountAddition(previous.social, input);
+      const storedIds: string[] = [];
+      try {
+        const screenshots = [];
+        for (const file of input.screenshots) {
+          const id = `social:${input.creatorId}:${crypto.randomUUID()}`;
+          await saveSocialScreenshot(id, file);
+          storedIds.push(id);
+          screenshots.push({ id, storageId: id, name: file.name, mimeType: file.type, size: file.size });
+        }
+        // A disabled account or another tab may have changed the profile while bytes were saved.
+        this.authorizedCreator(actor.sessionId, input.creatorId, true);
+        const latest = adminStore.getProfile(input.creatorId);
+        if (!latest) throw new SocialAccountError("profileUnavailable");
+        validateSocialAccountAddition(latest.social, input);
+        const evidenceByProfileUrl = normalizeSocialEvidence(latest.social);
+        evidenceByProfileUrl[url] = screenshots;
+        const nextProfile: UserProfile = {
+          ...latest,
+          social: {
+            ...latest.social,
+            profileUrls: [...(latest.social.profileUrls?.length ? latest.social.profileUrls : [latest.social.profileUrl]).filter(Boolean), url],
+            evidenceByProfileUrl,
+            verificationByProfileUrl: {
+              ...latest.social.verificationByProfileUrl,
+              [url]: { status: "DEMO_VERIFIED", verifiedAt: new Date().toISOString() },
+            },
+          },
+        };
+        adminStore.syncProfile(nextProfile, false);
+        if (input.creatorId === PRIMARY_CREATOR_ID) {
+          this.profileData = structuredClone(nextProfile);
+          if (typeof window !== "undefined") window.localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(nextProfile));
+        }
+        adminStore.recordCreatorAction(input.creatorId, "PROFILE", "添加社媒主页并完成本地演示验证");
+        return { data: structuredClone(nextProfile) };
+      } catch (error) {
+        await Promise.allSettled(storedIds.map((id) => removeSocialScreenshot(id)));
+        if (error instanceof SocialAccountError) throw error;
+        throw new SocialAccountError("storageFailed");
+      }
     },
   };
 
@@ -1660,6 +2042,7 @@ export class MockApiAdapter implements Services {
     | "correctExternalInvoiceRecognition"
     | "selectExternalInvoicePayoutAccount"
     | "confirmExternalInvoice"
+    | "confirmExternalInvoicePage"
     | "resubmitExternalInvoice"
     | "listExternalInvoiceHistory"
   > = {
@@ -1668,18 +2051,20 @@ export class MockApiAdapter implements Services {
       return {
         data:
           creatorId === PRIMARY_CREATOR_ID
-            ? structuredClone(seedRequests)
-            : [],
+            ? structuredClone(aggregateRequestProjects(seedRequests, this.contractData, this.invoiceData))
+            : structuredClone(adminStore.getUserDetail(creatorId).requests),
       };
     },
     get: async (id, creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
-      if (creatorId !== PRIMARY_CREATOR_ID) return { data: undefined };
-      const item = seedRequests.find((entry) => entry.id === id);
+      if (creatorId !== PRIMARY_CREATOR_ID) return { data: structuredClone(adminStore.getUserDetail(creatorId).requests.find((request) => request.id === id)) };
+      const item = aggregateRequestProjects(seedRequests, this.contractData, this.invoiceData).find((entry) => entry.id === id);
       return { data: item ? structuredClone(item) : undefined };
     },
     listExternalInvoices: async (creatorId) => {
       await wait(80);
+      await this.migrateEmbeddedInvoiceFiles();
+      this.migrateEmptyDemoRecognition();
       return {
         data: creatorId === PRIMARY_CREATOR_ID
           ? structuredClone(this.invoiceData.filter((item) => item.documentState?.kind === "EXTERNAL"))
@@ -1688,6 +2073,8 @@ export class MockApiAdapter implements Services {
     },
     getExternalInvoice: async (invoiceId, creatorId) => {
       await wait(80);
+      await this.migrateEmbeddedInvoiceFiles();
+      this.migrateEmptyDemoRecognition();
       const invoice = this.findInvoice(invoiceId);
       if (!invoice || invoice.documentState?.kind !== "EXTERNAL") return { data: undefined };
       if ((invoice.creatorId || PRIMARY_CREATOR_ID) !== creatorId) return { data: undefined };
@@ -1695,6 +2082,7 @@ export class MockApiAdapter implements Services {
     },
     uploadExternalInvoiceFile: async (input) => {
       await wait(240);
+      await this.migrateEmbeddedInvoiceFiles();
       const { invoice, duplicate } = this.externalCommandInvoice(input);
       if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
       const state = invoice.documentState!;
@@ -1710,16 +2098,26 @@ export class MockApiAdapter implements Services {
       if (input.file.size <= 0 || input.file.size > 5 * 1024 * 1024) {
         throw new Error("文件大小必须在 5MB 以内");
       }
-      const account = this.profileData.payoutAccounts.find((item) => item.id === input.payoutAccountId);
-      if (!account || !isPayoutAccountUsable(account)) throw new Error("请选择已验证且可用的收款账户");
       const previous = invoice.sourceFileVersions?.at(-1);
       const version = (previous?.version || 0) + 1;
       const uploadedAt = new Date().toISOString();
       const fileVersionId = `file:${invoiceInternalIdOf(invoice)}:v${version}`;
-      invoice.sourceFileVersions = [
-        ...(invoice.sourceFileVersions || []),
+      const candidate = structuredClone(invoice);
+      const storageId = input.fileBlob ? fileVersionId : undefined;
+      if (input.fileBlob) {
+        try {
+          await saveInvoiceFile(fileVersionId, input.fileBlob);
+        } catch {
+          throw new Error(fileStorageMessage());
+        }
+      }
+      const savedFile = { ...structuredClone(input.file), storageId };
+      // Legacy service fixtures may provide a tiny Data URL instead of a Blob.
+      if (storageId) delete savedFile.previewUrl;
+      candidate.sourceFileVersions = [
+        ...(candidate.sourceFileVersions || []),
         {
-          ...structuredClone(input.file),
+          ...savedFile,
           id: fileVersionId,
           fileVersionId,
           fileName: input.file.name,
@@ -1730,25 +2128,36 @@ export class MockApiAdapter implements Services {
           supersedesFileVersionId: previous?.fileVersionId,
         },
       ];
-      invoice.fileVersions = invoice.sourceFileVersions.map((file) => ({
+      candidate.fileVersions = candidate.sourceFileVersions.map((file) => ({
         ...file,
         demoHash: file.fileHash,
         supersedesFileId: file.supersedesFileVersionId,
       }));
-      invoice.document = structuredClone(input.file);
-      invoice.payoutAccountId = account.id;
-      invoice.payoutSnapshot = createInvoicePayoutSnapshot(account, uploadedAt);
-      invoice.extractedData = undefined;
-      invoice.confirmedSnapshots = [];
+      candidate.document = savedFile;
+      candidate.payoutAccountId = undefined;
+      candidate.payoutSnapshot = undefined;
+      candidate.extractedData = undefined;
+      // Keep prior corrections for audit; only the current recognition may supply editable values.
+      candidate.pageConfirmations = {};
       const fromStatus = state.status;
-      invoice.documentState = { kind: "EXTERNAL", status: "RECOGNIZING" };
-      const data = this.finishExternalCommand(invoice, input.clientRequestId, {
-        action: "FILE_UPLOADED",
-        actor: input.creatorId,
-        fromStatus,
-        toStatus: "RECOGNIZING",
-      });
-      return { data, message: "文件已上传，正在识别 Invoice 信息" };
+      candidate.documentState = { kind: "EXTERNAL", status: "RECOGNIZING" };
+      const index = this.invoiceData.indexOf(invoice);
+      this.invoiceData[index] = candidate;
+      let uploaded: Invoice;
+      try {
+        uploaded = this.finishExternalCommand(candidate, input.clientRequestId, {
+          action: "FILE_UPLOADED",
+          actor: input.creatorId,
+          fromStatus,
+          toStatus: "RECOGNIZING",
+        });
+      } catch {
+        this.invoiceData[index] = invoice;
+        if (storageId) await removeInvoiceFile(storageId).catch(() => undefined);
+        throw new Error(fileStorageMessage());
+      }
+      adminStore.recordCreatorAction(input.creatorId, "INVOICE", `上传 Invoice ${invoiceNumberOf(uploaded)}`);
+      return { data: uploaded, message: "文件已上传，正在识别 Invoice 信息" };
     },
     retryExternalInvoiceRecognition: async (input) => {
       await wait(420);
@@ -1762,10 +2171,10 @@ export class MockApiAdapter implements Services {
       const fromStatus = invoice.documentState.status;
       if (input.simulateFailure) {
         invoice.documentState = { kind: "EXTERNAL", status: "RECOGNITION_FAILED" };
-        invoice.returnReason = "Mock OCR 无法识别当前文件，请重新识别或上传清晰文件。";
+        invoice.returnReason = "模拟 AI 无法识别当前文件，请重新识别或上传清晰文件。";
         const data = this.finishExternalCommand(invoice, input.clientRequestId, {
           action: "RECOGNITION_FAILED",
-          actor: "Mock OCR",
+          actor: "模拟 AI",
           fromStatus,
           toStatus: "RECOGNITION_FAILED",
           reason: invoice.returnReason,
@@ -1773,14 +2182,18 @@ export class MockApiAdapter implements Services {
         this.refreshCreatorNotifications();
         return { data, message: "识别失败" };
       }
-      const extractedData = this.mockRecognizedData(invoice);
+      const extractedData = await this.aiRecognition.recognize(file, {
+        invoice,
+        profile: this.profileData,
+        account: this.profileData.payoutAccounts.find((item) => item.id === invoice.payoutAccountId),
+      });
       invoice.extractedData = extractedData;
       invoice.recognitionSnapshots = [
         ...(invoice.recognitionSnapshots || []),
         {
           recognitionId: `recognition:${invoiceInternalIdOf(invoice)}:${file.version}`,
           fileVersionId: file.fileVersionId,
-          engineVersion: "mock-ocr-v1",
+          engineVersion: "mock-ai-v1",
           recognizedAt: new Date().toISOString(),
           fields: recognitionFieldsFromExtracted(invoiceNumberOf(invoice), extractedData),
           extractedData,
@@ -1790,7 +2203,7 @@ export class MockApiAdapter implements Services {
       invoice.returnReason = undefined;
       const data = this.finishExternalCommand(invoice, input.clientRequestId, {
         action: "RECOGNITION_SUCCEEDED",
-        actor: "Mock OCR",
+        actor: "模拟 AI",
         fromStatus,
         toStatus: "WAITING_CONFIRMATION",
       });
@@ -1801,22 +2214,41 @@ export class MockApiAdapter implements Services {
       await wait(160);
       const { invoice, duplicate } = this.externalCommandInvoice(input);
       if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
-      if (!invoice.documentState || invoice.documentState.kind !== "EXTERNAL" || ![
-        "WAITING_CONFIRMATION",
-        "RETURNED_FOR_CORRECTION",
-      ].includes(invoice.documentState.status)) throw new Error("当前状态不允许修改识别结果");
+      if (!invoice.documentState || invoice.documentState.kind !== "EXTERNAL" || !canCorrectExternalInvoice(invoice.documentState.status)) throw new Error("当前状态不允许修改识别结果");
       const recognition = invoice.recognitionSnapshots?.at(-1);
       const file = invoice.sourceFileVersions?.at(-1);
       if (!recognition || !file) throw new Error("缺少识别结果或文件版本");
       const now = new Date().toISOString();
-      const corrections = Object.entries(input.values).filter(([, value]) => value !== undefined).map(([field, value]) => ({
+      const currentCorrection = currentExternalCorrection(invoice);
+      const previousValues = currentCorrection?.values || recognition.fields;
+      const corrections = Object.entries(input.values).filter(([field, value]) => value !== undefined && value !== previousValues[field as keyof typeof previousValues]).map(([field, value]) => ({
         field: field as keyof typeof recognition.fields,
         recognizedValue: recognition.fields[field as keyof typeof recognition.fields],
         confirmedValue: String(value ?? ""),
         correctedBy: input.creatorId,
         correctedAt: now,
       }));
-      const values = { ...recognition.fields, ...input.values };
+      const values = { ...previousValues, ...input.values };
+      if (corrections.length) {
+        invoice.pageConfirmations = {
+          ...invoice.pageConfirmations,
+          ...(corrections.some((item) => item.field !== "PAYMENT_ACCOUNT") ? { INVOICE: undefined } : {}),
+        };
+      }
+      let paymentDetails: Record<string, string> = {};
+      try { paymentDetails = JSON.parse(values.PAYMENT_ACCOUNT || "{}"); }
+      catch { throw new Error("收款信息格式不正确，请重新核对"); }
+      invoice.extractedData = {
+        invoiceFrom: values.PUBLISHER,
+        billTo: values.ADVERTISER,
+        invoiceDate: values.INVOICE_DATE,
+        description: values.DESCRIPTION,
+        currency: values.CURRENCY,
+        total: values.AMOUNT,
+        paymentDetails,
+        invoiceFromMatchesProfile: normalizePaymentDetail(values.PUBLISHER) === normalizePaymentDetail(this.profileData.legalName),
+        billToMatchesComets: normalizePaymentDetail(values.ADVERTISER) === normalizePaymentDetail("COMETS INTERNATIONAL LIMITED"),
+      };
       invoice.confirmedSnapshots = [
         ...(invoice.confirmedSnapshots || []),
         {
@@ -1824,7 +2256,7 @@ export class MockApiAdapter implements Services {
           recognitionId: recognition.recognitionId,
           fileVersionId: file.fileVersionId,
           values,
-          corrections,
+          corrections: [...(currentCorrection?.corrections || []), ...corrections],
           payoutAccountId: invoice.payoutAccountId || "",
           confirmedBy: input.creatorId,
           confirmedAt: now,
@@ -1838,13 +2270,16 @@ export class MockApiAdapter implements Services {
         fromStatus: "RETURNED_FOR_CORRECTION",
         toStatus: "WAITING_CONFIRMATION",
       });
+      if (corrections.length) {
+        adminStore.recordCreatorAction(input.creatorId, "INVOICE", `修改 Invoice ${invoiceNumberOf(data)} 信息`);
+      }
       return { data, message: "识别结果已修正" };
     },
     selectExternalInvoicePayoutAccount: async (input) => {
       await wait(160);
       const { invoice, duplicate } = this.externalCommandInvoice(input);
       if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
-      if (!["WAITING_UPLOAD", "WAITING_CONFIRMATION", "RETURNED_FOR_CORRECTION", "RETURNED_FOR_REUPLOAD", "RECOGNITION_FAILED"].includes(invoice.documentState!.status)) {
+      if (!["WAITING_CONFIRMATION", "RETURNED_FOR_CORRECTION"].includes(invoice.documentState!.status)) {
         throw new Error("当前状态不允许更换收款账户");
       }
       const account = this.profileData.payoutAccounts.find((item) => item.id === input.payoutAccountId);
@@ -1853,26 +2288,74 @@ export class MockApiAdapter implements Services {
       const fromStatus = invoice.documentState!.status as ExternalInvoiceCollectionStatus;
       invoice.payoutAccountId = account.id;
       invoice.payoutSnapshot = createInvoicePayoutSnapshot(account);
+      invoice.pageConfirmations = { ...invoice.pageConfirmations, PAYOUT: undefined };
       const data = this.finishExternalCommand(invoice, input.clientRequestId, {
         action: "PAYOUT_ACCOUNT_SELECTED",
         actor: input.creatorId,
         fromStatus,
         toStatus: fromStatus,
       });
+      adminStore.recordCreatorAction(input.creatorId, "INVOICE", `选择 Invoice ${invoiceNumberOf(data)} 收款账户`);
       return { data, message: "收款账户已更新" };
+    },
+    confirmExternalInvoicePage: async (input) => {
+      await wait(100);
+      const { invoice, duplicate } = this.externalCommandInvoice(input);
+      if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      if (input.page !== "INVOICE" && input.page !== "PAYOUT") throw new Error("核对页不存在");
+      if (invoice.documentState?.status !== "WAITING_CONFIRMATION") throw new Error("当前状态不能确认本页");
+      const recognition = invoice.recognitionSnapshots?.at(-1);
+      const file = invoice.sourceFileVersions?.at(-1);
+      if (!recognition || !file || recognition.fileVersionId !== file.fileVersionId) throw new Error("当前文件没有有效模拟识别值");
+      const account = this.profileData.payoutAccounts.find((item) => item.id === invoice.payoutAccountId);
+      const issues = validateExternalInvoiceConfirmation({ invoice, profile: this.profileData, account });
+      const relevant = issues.filter((issue) => input.page === "INVOICE"
+        ? issue.field !== "PAYOUT_ACCOUNT"
+        : issue.field === "PAYOUT_ACCOUNT");
+      if (relevant.length) throw new Error(relevant.map((item) => item.message).join("；"));
+      if (invoice.pageConfirmations?.[input.page]?.fileVersionId === file.fileVersionId
+        && invoice.pageConfirmations[input.page]?.recognitionId === recognition.recognitionId
+        && (input.page !== "PAYOUT" || invoice.pageConfirmations.PAYOUT?.payoutAccountFingerprint === (account ? payoutAccountFingerprint(account) : undefined))) throw new Error("本页已确认；修改字段后才能重新确认");
+      invoice.pageConfirmations = {
+        ...invoice.pageConfirmations,
+        [input.page]: {
+          fileVersionId: file.fileVersionId,
+          recognitionId: recognition.recognitionId,
+          values: structuredClone(currentExternalCorrection(invoice)?.values || recognition.fields),
+          payoutAccountId: invoice.payoutAccountId || "",
+          ...(input.page === "PAYOUT" && account ? {
+            effectivePaymentDetails: payoutAccountPaymentDetails(account),
+            payoutAccountFingerprint: payoutAccountFingerprint(account),
+          } : {}),
+          confirmedBy: input.creatorId,
+          confirmedAt: new Date().toISOString(),
+        },
+      };
+      const data = this.finishExternalCommand(invoice, input.clientRequestId, {
+        action: "PAGE_CONFIRMED", actor: input.creatorId,
+        fromStatus: "WAITING_CONFIRMATION", toStatus: "WAITING_CONFIRMATION",
+        reason: input.page === "INVOICE" ? "Invoice 信息已确认" : "收款信息已确认",
+      });
+      adminStore.recordCreatorAction(input.creatorId, "INVOICE", `确认 ${invoiceNumberOf(data)} 的${input.page === "INVOICE" ? "Invoice 信息" : "收款信息"}`);
+      return { data, message: "本页已确认" };
     },
     confirmExternalInvoice: async (input) => {
       await wait(180);
       const { invoice, duplicate } = this.externalCommandInvoice(input);
       if (duplicate) return { data: structuredClone(invoice), message: "重复请求已忽略" };
-      if (input.acknowledgement !== true) throw new Error("请先确认 Invoice 核对声明");
       if (invoice.documentState?.status !== "WAITING_CONFIRMATION") throw new Error("当前 Invoice 不能提交审核");
       const account = this.profileData.payoutAccounts.find((item) => item.id === invoice.payoutAccountId);
       const issues = validateExternalInvoiceConfirmation({ invoice, profile: this.profileData, account });
       if (issues.length) throw new Error(issues.map((issue) => issue.message).join("；"));
       const recognition = invoice.recognitionSnapshots!.at(-1)!;
       const file = invoice.sourceFileVersions!.at(-1)!;
-      const current = invoice.confirmedSnapshots?.at(-1);
+      if (["INVOICE", "PAYOUT"].some((page) => {
+        const record = invoice.pageConfirmations?.[page as "INVOICE" | "PAYOUT"];
+        return record?.fileVersionId !== file.fileVersionId || record?.recognitionId !== recognition.recognitionId
+          || (page === "PAYOUT" && (record?.payoutAccountId !== invoice.payoutAccountId
+            || record?.payoutAccountFingerprint !== (account ? payoutAccountFingerprint(account) : undefined)));
+      })) throw new Error("请先分别确认 Invoice 信息与收款信息");
+      const current = currentExternalCorrection(invoice);
       invoice.confirmedSnapshots = [
         ...(invoice.confirmedSnapshots || []),
         {
@@ -1882,10 +2365,12 @@ export class MockApiAdapter implements Services {
           values: current?.values || recognition.fields,
           corrections: current?.corrections || [],
           payoutAccountId: invoice.payoutAccountId!,
+          effectivePaymentDetails: payoutAccountPaymentDetails(account!),
           confirmedBy: input.creatorId,
           confirmedAt: new Date().toISOString(),
         },
       ];
+      invoice.payoutSnapshot = createInvoicePayoutSnapshot(account!);
       invoice.documentState = { kind: "EXTERNAL", status: "WAITING_MEDIA_REVIEW" };
       const data = this.finishExternalCommand(invoice, input.clientRequestId, {
         action: "SUBMITTED",
@@ -1893,6 +2378,7 @@ export class MockApiAdapter implements Services {
         fromStatus: "WAITING_CONFIRMATION",
         toStatus: "WAITING_MEDIA_REVIEW",
       });
+      adminStore.recordCreatorAction(input.creatorId, "INVOICE", `提交 Invoice ${invoiceNumberOf(data)} 审核`);
       this.refreshCreatorNotifications();
       return { data, message: "Invoice 已提交审核" };
     },
@@ -1920,20 +2406,24 @@ export class MockApiAdapter implements Services {
   contracts: ContractService = {
     list: async (creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
+      await this.migrateEmbeddedInvoiceFiles();
+      this.migrateEmptyDemoRecognition();
       return {
         data:
           creatorId === PRIMARY_CREATOR_ID
             ? structuredClone(this.contractData)
-            : [],
+            : structuredClone(adminStore.getUserDetail(creatorId).contracts),
       };
     },
     get: async (id, creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
-      if (creatorId !== PRIMARY_CREATOR_ID) return { data: undefined };
+      await this.migrateEmbeddedInvoiceFiles();
+      this.migrateEmptyDemoRecognition();
+      if (creatorId !== PRIMARY_CREATOR_ID) return { data: structuredClone(adminStore.getUserDetail(creatorId).contracts.find((contract) => contract.id === id)) };
       const item = this.contractData.find((entry) => entry.id === id);
       return { data: item ? structuredClone(item) : undefined };
     },
-    signContract: async (id, actor) => {
+    signContract: async (id, actor, signature) => {
       await wait();
       if (actor.role !== "CREATOR") {
         throw new Error("管理员只读视图不能替达人签署合同");
@@ -1946,6 +2436,11 @@ export class MockApiAdapter implements Services {
       if (contract.status !== "PENDING_SIGNATURE") {
         throw new Error("只有待签署合同可以签署");
       }
+      if (!signature?.dataUrl?.startsWith("data:image/png;base64,")
+        || !["DRAWN", "GENERATED"].includes(signature.method)
+        || !signature.signerName?.trim()) {
+        throw new Error("请完成签名并确认签署声明");
+      }
       const signedAt = new Date().toISOString();
       contract.status = "ACTIVE";
       contract.signedAt = signedAt;
@@ -1956,6 +2451,7 @@ export class MockApiAdapter implements Services {
         actorRole: actor.role,
         signedAt,
         acknowledgement: "已确认演示合同摘要并提交签署记录",
+        signature: structuredClone({ ...signature, signedAt }),
       };
       contract.history = [
         ...(contract.history || []),
@@ -1967,23 +2463,33 @@ export class MockApiAdapter implements Services {
         },
       ];
       this.persistContracts();
+      this.invoiceData = linkInvoicesToContracts(this.invoiceData, this.contractData, PRIMARY_CREATOR_ID);
+      this.persistInvoices();
+      adminStore.recordCreatorAction(actor.userId, "CONTRACT", `签署合同 ${contract.id}`);
       return { data: structuredClone(contract), message: "合同签署记录已保存" };
     },
   };
 
   invoices: InvoiceService = {
+    getDocumentFile: async (id, creatorId) => {
+      if (creatorId !== PRIMARY_CREATOR_ID) return undefined;
+      const invoice = this.findInvoice(id);
+      if (!invoice || (invoice.creatorId || PRIMARY_CREATOR_ID) !== creatorId) return undefined;
+      const storageId = invoice.document?.storageId;
+      return storageId ? readInvoiceFile(storageId) : undefined;
+    },
     list: async (creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
       return {
         data:
           creatorId === PRIMARY_CREATOR_ID
             ? structuredClone(sortInvoices(this.invoiceData))
-            : [],
+            : structuredClone(sortInvoices(adminStore.getUserDetail(creatorId).invoices)),
       };
     },
     get: async (id, creatorId = PRIMARY_CREATOR_ID) => {
       await wait(120);
-      if (creatorId !== PRIMARY_CREATOR_ID) return { data: undefined };
+      if (creatorId !== PRIMARY_CREATOR_ID) return { data: structuredClone(adminStore.getUserDetail(creatorId).invoices.find((invoice) => invoice.id === id || invoice.invoiceNumber === id)) };
       const item = this.findInvoice(id);
       return { data: item ? structuredClone(item) : undefined };
     },
@@ -1994,6 +2500,7 @@ export class MockApiAdapter implements Services {
     correctExternalInvoiceRecognition: (...args) => this.requests.correctExternalInvoiceRecognition(...args),
     selectExternalInvoicePayoutAccount: (...args) => this.requests.selectExternalInvoicePayoutAccount(...args),
     confirmExternalInvoice: (...args) => this.requests.confirmExternalInvoice(...args),
+    confirmExternalInvoicePage: (...args) => this.requests.confirmExternalInvoicePage(...args),
     resubmitExternalInvoice: (...args) => this.requests.resubmitExternalInvoice(...args),
     listExternalInvoiceHistory: (...args) => this.requests.listExternalInvoiceHistory(...args),
     signInternalInvoice: async (invoiceId, signature) => {
@@ -2005,10 +2512,20 @@ export class MockApiAdapter implements Services {
         || invoice.documentState.status !== "WAITING_SIGNATURE"
       ) throw new Error("只有待签署的 Comets内部invoice可以签署");
       if (invoice.signature) throw new Error("该 Invoice 已完成签署，不能重复操作");
+      const profile = normalizePayoutProfile(this.profileData);
+      const mainAccount = profile.payoutAccounts.find(
+        (account) => account.id === profile.defaultPayoutAccountId,
+      );
+      if (!mainAccount || !isPayoutAccountUsable(mainAccount)) {
+        throw new Error("请先在个人档案设置可用的主收款账户，再签署 Invoice");
+      }
+      invoice.payoutAccountId = mainAccount.id;
+      invoice.payoutSnapshot = createInvoicePayoutSnapshot(mainAccount, signature.signedAt);
       invoice.signature = structuredClone(signature);
       invoice.documentState = { kind: "INTERNAL", status: "UNDER_REVIEW" };
       this.recordInvoiceOperation(invoice, "INTERNAL_SIGNED", "Comets内部invoice已签署并提交审核", signature.signerName);
       this.persistInvoices();
+      adminStore.recordCreatorAction(invoice.creatorId || PRIMARY_CREATOR_ID, "INVOICE", `签署 Invoice ${invoiceNumberOf(invoice)}`);
       return { data: structuredClone(invoice), message: "Invoice 已签署并提交审核" };
     },
     submitFeedback: async (invoiceId, input) => {
@@ -2050,7 +2567,7 @@ export class MockApiAdapter implements Services {
       await wait(480);
       return {
         data: this.uploadExternalFile(input, "WAITING_UPLOAD"),
-        message: "Invoice 文件已上传，OCR 识别完成",
+        message: "Invoice 文件已上传，模拟 AI 识别完成",
       };
     },
     confirmExternal: async (invoiceId) => {
@@ -2130,12 +2647,131 @@ export class MockApiAdapter implements Services {
       return {
         data: creatorId === PRIMARY_CREATOR_ID
           ? structuredClone(buildCreatorTasks(this.contractData, this.invoiceData))
-          : [],
+          : structuredClone(buildCreatorTasks(adminStore.getUserDetail(creatorId).contracts, adminStore.getUserDetail(creatorId).invoices)),
       };
     },
   };
 
   payments: PaymentService = {
+    requestPaymentRetry: async (invoiceId, input) => {
+      await wait();
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice) throw new Error("Invoice 不存在");
+      assertCreatorOwnsInvoice(invoice, input.submittedBy);
+      if (invoice.processedClientRequestIds?.includes(input.clientRequestId)) {
+        return { data: structuredClone(invoice), message: "重复请求已忽略" };
+      }
+      assertExpectedVersion(invoice, input.expectedVersion);
+      if (invoice.documentState?.status !== "APPROVED" || invoice.paymentStatus !== "FAILED"
+        || invoice.paymentRecoveryStatus !== "AWAITING_CREATOR_UPDATE") {
+        throw new Error("当前 Invoice 不能申请重新打款");
+      }
+      const account = this.profileData.payoutAccounts.find((item) => item.id === input.payoutAccountId);
+      if (!account || !isPayoutAccountUsable(account)) throw new Error("请选择当前达人已验证且可用的收款账户");
+      const switched = account.id !== invoice.payoutAccountId;
+      const failedSnapshot = failedPaymentSnapshot(invoice, this.paymentAttemptData).snapshot;
+      const updated = !switched && payoutAccountChangedSinceSnapshot(account, failedSnapshot);
+      if ((input.mode === "SWITCH_ACCOUNT") !== switched
+        || (input.mode === "UPDATED_ACCOUNT") !== updated
+        || (input.mode === "CONFIRM_ORIGINAL") !== (!switched && !updated)) {
+        throw new Error("收款账户或资料已变化，请重新核对后提交");
+      }
+      const now = new Date().toISOString();
+      const snapshot = createInvoicePayoutSnapshot(account, now);
+      invoice.paymentRetryRequest = {
+        mode: input.mode,
+        payoutAccountId: account.id,
+        payoutSnapshot: structuredClone(snapshot),
+        requestedBy: input.submittedBy,
+        requestedAt: now,
+      };
+      invoice.payoutAccountId = account.id;
+      invoice.payoutSnapshot = snapshot;
+      invoice.paymentRecoveryStatus = "PENDING_FINANCE_CONFIRMATION";
+      const reason = input.mode === "SWITCH_ACCOUNT" ? "已切换已验证账户并申请重新打款"
+        : input.mode === "UPDATED_ACCOUNT" ? "已更新收款资料并申请重新打款"
+          : "已确认原账户未更改并申请重新打款";
+      this.recordInvoiceOperation(invoice, "PAYMENT_RETRY_REQUESTED", reason, input.submittedBy);
+      invoice.reviewHistory = [...(invoice.reviewHistory || []), {
+        eventId: `history:${invoiceInternalIdOf(invoice)}:retry:${invoice.version || 1}`,
+        action: "PAYMENT_RETRY_REQUESTED",
+        actor: input.submittedBy,
+        occurredAt: now,
+        fromStatus: "APPROVED",
+        toStatus: "APPROVED",
+        reason,
+      }];
+      invoice.version = (invoice.version || 1) + 1;
+      invoice.updatedAt = now;
+      invoice.processedClientRequestIds = [...(invoice.processedClientRequestIds || []), input.clientRequestId];
+      this.persistInvoices();
+      adminStore.recordCreatorAction(input.submittedBy, "PAYMENT", `申请重新打款 · Invoice ${invoiceNumberOf(invoice)}`);
+      return { data: structuredClone(invoice), message: "重新打款申请已提交财务复核" };
+    },
+    listAttempts: async (invoiceId, creatorId) => {
+      await wait(50);
+      if (creatorId !== PRIMARY_CREATOR_ID) {
+        const detail = adminStore.getUserDetail(creatorId);
+        return { data: attemptsByCreator(detail.invoices, [], creatorId).filter((attempt) => attempt.invoiceId === invoiceId) };
+      }
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice || creatorId !== (invoice.creatorId || PRIMARY_CREATOR_ID)) return { data: [] };
+      return { data: structuredClone(this.paymentAttemptData.filter((attempt) => attempt.invoiceId === invoiceInternalIdOf(invoice) && attempt.creatorId === creatorId).sort((a, b) => b.sequence - a.sequence)) };
+    },
+    listCreatorAttempts: async (creatorId) => {
+      await wait(50);
+      return { data: creatorId === PRIMARY_CREATOR_ID
+        ? structuredClone(this.paymentAttemptData.filter((attempt) => attempt.creatorId === creatorId))
+        : attemptsByCreator(adminStore.getUserDetail(creatorId).invoices, [], creatorId) };
+    },
+    approveCorrectionAndRetry: async (invoiceId, actor) => {
+      await wait();
+      if (actor !== "SYSTEM") throw new Error("只有支付系统可发起付款尝试");
+      const invoice = this.findInvoice(invoiceId);
+      if (!invoice || invoice.paymentStatus !== "FAILED" || invoice.paymentRecoveryStatus !== "PENDING_FINANCE_CONFIRMATION" || invoice.documentState?.status !== "APPROVED") throw new Error("收款资料尚未复核通过");
+      const related = this.paymentAttemptData.filter((attempt) => attempt.invoiceId === invoiceInternalIdOf(invoice));
+      const now = new Date().toISOString();
+      const attempt: PaymentAttempt = {
+        id: `attempt:${invoiceInternalIdOf(invoice)}:${Math.max(0, ...related.map((item) => item.sequence)) + 1}`,
+        invoiceId: invoiceInternalIdOf(invoice),
+        creatorId: invoice.creatorId || PRIMARY_CREATOR_ID,
+        sequence: Math.max(0, ...related.map((item) => item.sequence)) + 1,
+        channel: invoice.channel,
+        payoutAccountId: invoice.payoutAccountId,
+        payoutSnapshot: invoice.payoutSnapshot ? structuredClone(invoice.payoutSnapshot) : undefined,
+        status: "PROCESSING",
+        createdAt: now,
+        updatedAt: now,
+      };
+      assertAttemptAllowed(this.paymentAttemptData, attempt);
+      this.paymentAttemptData.push(attempt);
+      invoice.paymentStatus = "PROCESSING";
+      invoice.paymentRecoveryStatus = "RETRY_SUBMITTED";
+      this.recordInvoiceOperation(invoice, "LEGACY_MIGRATED", "收款资料复核通过，已发起新的付款尝试", "系统");
+      this.persistPaymentAttempts();
+      this.persistInvoices();
+      return { data: structuredClone(attempt) };
+    },
+    recordAttemptResult: async (attemptId, status, actor, reason) => {
+      await wait();
+      if (actor !== "SYSTEM") throw new Error("只有支付系统可更新付款结果");
+      const attempt = this.paymentAttemptData.find((item) => item.id === attemptId);
+      if (!attempt || attempt.status !== "PROCESSING") throw new Error("付款尝试不存在或已结束");
+      const invoice = this.findInvoice(attempt.invoiceId);
+      if (!invoice) throw new Error("Invoice 不存在");
+      if (status === "PAID" && this.paymentAttemptData.some((item) => item.invoiceId === attempt.invoiceId && item.status === "PAID")) throw new Error("一张 Invoice 只能有一笔成功付款");
+      attempt.status = status;
+      attempt.updatedAt = new Date().toISOString();
+      attempt.failureReason = status === "FAILED" ? (reason || "付款渠道返回失败") : undefined;
+      invoice.paymentStatus = status;
+      invoice.paymentRecoveryStatus = status === "FAILED" ? "AWAITING_CREATOR_UPDATE" : "RETRY_SUCCEEDED";
+      invoice.paymentFailureReason = attempt.failureReason;
+      if (status === "PAID") invoice.paymentCompletedAt = attempt.updatedAt;
+      this.recordInvoiceOperation(invoice, "LEGACY_MIGRATED", status === "PAID" ? "付款成功" : "付款失败", "系统", attempt.failureReason);
+      this.persistPaymentAttempts();
+      this.persistInvoices();
+      return { data: structuredClone(attempt) };
+    },
     submitAccountCorrection: async (invoiceId, input) => {
       await wait();
       const invoice = this.findInvoice(invoiceId);
@@ -2244,7 +2880,9 @@ export class MockApiAdapter implements Services {
     },
     get: async (id) => {
       await wait(120);
-      return { data: adminStore.getUserDetail(id) };
+      return { data: managementCreatorDetail(adminStore.getUserDetail(id, id === PRIMARY_CREATOR_ID ? {
+        contracts: this.contractData, invoices: this.invoiceData, profile: this.profileData,
+      } : undefined)) };
     },
     create: async (input, actorId) => {
       await wait();
@@ -2253,7 +2891,7 @@ export class MockApiAdapter implements Services {
         message: input.mode === "INVITE" ? "邀请邮件已模拟发送" : "账号已创建",
       };
     },
-    setStatus: async (ids, status, actorId, reason) => {
+    setStatus: async (ids, status, actorId, reason = "") => {
       await wait();
       return {
         data: adminStore.setStatus(ids, status, actorId, reason),
@@ -2269,12 +2907,12 @@ export class MockApiAdapter implements Services {
           window.localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(this.profileData));
         }
       }
-      return { data: detail, message: "用户档案已更新" };
+      return { data: managementCreatorDetail(detail), message: "用户档案已更新" };
     },
     updateVerification: async (id, status, actorId, reason = "") => {
       await wait();
       return {
-        data: adminStore.updateVerification(id, status, actorId, reason),
+        data: managementCreatorDetail(adminStore.updateVerification(id, status, actorId, reason)),
         message: status === "VERIFIED" ? "认证已通过" : "认证状态已更新",
       };
     },
@@ -2302,7 +2940,12 @@ export class MockApiAdapter implements Services {
   adminBusiness: AdminBusinessDataService = {
     list: async () => {
       await wait(120);
-      return { data: adminStore.listAllBusinessData() };
+      const rows = adminStore.listAllBusinessData({ contracts: this.contractData, invoices: this.invoiceData, profile: this.profileData });
+      return { data: {
+        ...rows,
+        contracts: rows.contracts.map((entry) => ({ ...entry, record: { ...entry.record, documentUrl: "" } })),
+        invoices: rows.invoices.map((entry) => ({ ...entry, record: maskedCreatorDetail({ account: adminStore.listUsers().find((user) => user.id === entry.creator.id)!, contracts: [], invoices: [entry.record], requests: [], corrections: [], notifications: [], loginHistory: [] }).invoices[0] })),
+      } };
     },
   };
 
@@ -2314,13 +2957,13 @@ export class MockApiAdapter implements Services {
     create: async (userId, fieldKey, fieldLabel, reason, actorId) => {
       await wait();
       return {
-        data: adminStore.createCorrection(
+        data: managementCreatorDetail(adminStore.createCorrection(
           userId,
           fieldKey,
           fieldLabel,
           reason,
           actorId,
-        ),
+        )),
         message: "修改要求已通过站内通知和模拟邮件发送",
       };
     },
@@ -2412,4 +3055,100 @@ export class MockApiAdapter implements Services {
   };
 }
 
-export const services = new MockApiAdapter();
+const rawServices = new MockApiAdapter();
+
+/** Browser mock boundary: the authenticated actor is recovered from the store, never from caller input. */
+const browserSession = () => {
+  if (typeof window === "undefined") throw new Error("需要有效登录会话");
+  let sessionId = "";
+  try { sessionId = (JSON.parse(window.localStorage.getItem("comets-creator-session") || "null") as Session | null)?.sessionId || ""; }
+  catch { /* Invalid local storage is not authorization. */ }
+  const session = adminStore.restoreSession(sessionId);
+  if (!session) throw new Error("登录会话已失效，请重新登录");
+  return session;
+};
+
+function creatorGuard<T extends object>(module: T, writeMethods: string[], ownerAt: (method: string, args: unknown[], actor: Session) => string = (_method, _args, actor) => actor.userId): T {
+  return new Proxy(module, {
+    get(target, property, receiver) {
+      const original = Reflect.get(target, property, receiver) as unknown;
+      if (typeof original !== "function") return original;
+      return (...args: unknown[]) => {
+        const actor = browserSession();
+        const method = String(property);
+        const creatorId = ownerAt(method, args, actor);
+        rawServices.creatorScope.assertWrite(actor.sessionId, creatorId);
+        if (writeMethods.includes(method) && (module === rawServices.invoices || module === rawServices.requests)) {
+          const first = args[0] as string | { invoiceId?: string };
+          rawServices.creatorScope.assertInvoiceWrite(actor.sessionId, creatorId, typeof first === "string" ? first : first?.invoiceId || "");
+        }
+        if (method === "approveCorrectionAndRetry" || method === "recordAttemptResult") throw new Error("付款执行只能由外部系统完成");
+        if (!writeMethods.includes(method)) return (original as (...values: unknown[]) => unknown)(...args);
+        return (original as (...values: unknown[]) => unknown)(...args);
+      };
+    },
+  });
+}
+
+function administratorGuard<T extends object>(module: T, actorAt: Record<string, number> = {}): T {
+  return new Proxy(module, {
+    get(target, property, receiver) {
+      const original = Reflect.get(target, property, receiver) as unknown;
+      if (typeof original !== "function") return original;
+      return (...args: unknown[]) => {
+        const actor = browserSession();
+        if (actor.role !== "ADMIN") throw new Error("仅管理员可访问用户管理资料");
+        if (String(property) === "upsert") throw new Error("外部业务数据只能由外部同步适配器写入");
+        const index = actorAt[String(property)];
+        if (index !== undefined && args[index] !== actor.userId) throw new Error("管理员操作人身份无效");
+        return (original as (...values: unknown[]) => unknown)(...args);
+      };
+    },
+  });
+}
+
+const secureInvoices = creatorGuard(rawServices.invoices, [
+  "signInternalInvoice", "submitFeedback", "uploadExternal", "confirmExternal", "correctExternal",
+  "resubmitExternal", "selectPayoutAccount", "uploadExternalInvoiceFile", "retryExternalInvoiceRecognition",
+  "correctExternalInvoiceRecognition", "selectExternalInvoicePayoutAccount", "confirmExternalInvoice",
+  "confirmExternalInvoicePage", "resubmitExternalInvoice",
+], (method, args, actor) => {
+  if (["list", "listExternalInvoices"].includes(method)) return String(args[0] || actor.userId);
+  if (["get", "getDocumentFile", "getExternalInvoice", "listExternalInvoiceHistory"].includes(method)) return String(args[1] || actor.userId);
+  const command = args[0] as { creatorId?: string } | undefined;
+  return command?.creatorId || actor.userId;
+});
+
+const adminCorrections = administratorGuard(rawServices.corrections, { create: 4 });
+const scopedCorrections: CorrectionService = {
+  list: (userId) => {
+    const actor = browserSession();
+    if (actor.role === "ADMIN") {
+      if (!adminStore.listUsers({ role: "CREATOR" }).some((user) => user.id === userId)) {
+        throw new Error("达人不存在或无权查看");
+      }
+      return adminCorrections.list(userId);
+    }
+    rawServices.creatorScope.assertWrite(actor.sessionId, userId);
+    return rawServices.corrections.list(userId);
+  },
+  create: (...args) => adminCorrections.create(...args),
+};
+
+export const services: Services = {
+  ...rawServices,
+  profile: creatorGuard(rawServices.profile, ["save", "addSocialAccount"], (method, args, actor) => method === "get" ? String(args[0] || actor.userId) : method === "addSocialAccount" ? (args[0] as AddSocialAccountInput).creatorId : (args[0] as UserProfile).id),
+  contracts: creatorGuard(rawServices.contracts, ["signContract"], (method, args, actor) => method === "list" ? String(args[0] || actor.userId) : method === "get" ? String(args[1] || actor.userId) : actor.userId),
+  invoices: secureInvoices,
+  requests: creatorGuard(rawServices.requests, ["uploadExternalInvoiceFile", "retryExternalInvoiceRecognition", "correctExternalInvoiceRecognition", "selectExternalInvoicePayoutAccount", "confirmExternalInvoice", "confirmExternalInvoicePage", "resubmitExternalInvoice"], (method, args, actor) => ["list", "listExternalInvoices"].includes(method) ? String(args[0] || actor.userId) : ["get", "getExternalInvoice", "listExternalInvoiceHistory"].includes(method) ? String(args[1] || actor.userId) : (args[0] as { creatorId?: string } | undefined)?.creatorId || actor.userId),
+  tasks: creatorGuard(rawServices.tasks, [], (_method, args, actor) => String(args[0] || actor.userId)),
+  payments: creatorGuard(rawServices.payments, ["submitAccountCorrection", "requestPaymentRetry"], (method, args, actor) => method === "listAttempts" ? String(args[1] || actor.userId) : method === "listCreatorAttempts" ? String(args[0] || actor.userId) : method === "requestPaymentRetry" ? (args[1] as PaymentRetryRequestInput).submittedBy : actor.userId),
+  notifications: creatorGuard(rawServices.notifications, ["markRead", "markAllRead"], (method, args, actor) => method === "markRead" ? String(args[1] || actor.userId) : String(args[0] || actor.userId)),
+  adminUsers: administratorGuard(rawServices.adminUsers, { create: 1, setStatus: 2, updateProfile: 2, updateVerification: 2, resetPassword: 1, revealSensitive: 3, exportMasked: 1 }),
+  adminBusiness: administratorGuard(rawServices.adminBusiness),
+  corrections: scopedCorrections,
+  audit: administratorGuard(rawServices.audit),
+  adminSettings: administratorGuard(rawServices.adminSettings, { save: 1 }),
+  adminNotifications: administratorGuard(rawServices.adminNotifications),
+  externalBusinessData: administratorGuard(rawServices.externalBusinessData),
+};

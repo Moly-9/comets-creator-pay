@@ -26,6 +26,22 @@
 
 final result: passed
 
+### Iteration 85: Creator Collection Timeline, Sort, and Pagination
+
+- Visual source: `/var/folders/rf/2q5dyfp52bl2053nt7fy31yr0000gn/T/codex-clipboard-2823e7e8-790e-4a9d-8b9b-8aedaee7c51e.png`.
+- Environment: local test environment only at `http://localhost:4173/`; the user Mac at `192.168.88.188:8772` was not updated.
+- Copy: all creator-facing internal Invoice type labels now use the exact text `Comets内部invoice`.
+- Ordering: the collection list is sorted by `updatedAt` descending and currently renders `今天 16:20 → 今天 14:30 → 今天 10:12 → 07-19 09:30 → 07-16 14:32`.
+- Progress: desktop replaces the former `下一步` column with the reference four-node `合同 → Invoice → 审批 → 付款` progress. Mobile cards render the same progress below their status fields. Completed, current, blocked, and pending nodes use green, purple, red, and gray treatments respectively.
+- Pagination: the footer shows the visible range and filtered total, provides previous/current/next page controls, and supports `10 / 20 / 50 / 100` rows per page. Search, task group, review status, payment status, and page-size changes reset to page 1.
+- Responsive QA: verified at the supplied `963px` working viewport, desktop `1366×768`, and mobile `320×568`. The desktop table remains compact, the 320px footer wraps without clipped controls, and all five mobile cards retain their progress labels.
+- Browser console: zero warnings and zero errors.
+- Automated verification: TypeScript passed; Vitest 150/150 passed; Vite production build and Sites packaging passed; Sites worker tests 4/4 passed.
+
+- No actionable P0/P1/P2 findings remain.
+
+final result: passed
+
 ### Iteration 84: External Invoice Collection and Payment Timeline MVP
 
 - Source of truth: the external Invoice task, OCR correction, review, payout comparison, and payment-recovery requirements supplied on 2026-09-19.
@@ -2081,5 +2097,35 @@ final result: passed
 - Environment: local test environment only. The user Mac at `192.168.88.188:8772` was not updated.
 
 - No actionable P0/P1/P2 findings remain.
+
+final result: passed
+
+### Iteration 65: Creator Home and Payment Attempts
+
+- Local-only homepage: greeting banner, unified prioritized to-dos, three existing amount-card styles, and the latest three Invoice updates. Desktop tables use the requested six-column headings; at 320 px they become labeled cards without page-level horizontal overflow.
+- Browser QA: at 1366 px, six actionable rows appear with payment failure first and three recent updates in descending time order. At 320 px, the drawer, cards, action links, recent updates, and Invoice detail remain usable with `scrollWidth === innerWidth`.
+- Relationship QA: `CON-260711-KOL-04` shows two linked Invoices; failed Invoice `INV-20260728-00001` shows two independent failed attempts. The failure summary masks the account identifier and attempt timestamps are human-readable.
+- Navigation QA: notification bell opens `/notifications`, help opens `/help`, and contract/Invoice links reach their corresponding details. Browser console reported no errors.
+- Automated checks: TypeScript, 155 Vitest tests, production build, four Sites worker tests, and `git diff --check` pass. Vite reports only its large-chunk advisory.
+- Environment: `http://localhost:4173` only. The user Mac at `192.168.88.188:8772` was not updated.
+
+final result: passed
+
+### Iteration 66: Home Amount Cards and Parallel Lists
+
+- Layout: the three unchanged amount-card surfaces now follow the greeting. The task and recent-update panels align at the top in a 60/40 grid at 768px and wider; both use compact field-embedded cards, with no internal scroll.
+- Responsive QA: 1366px and 963px show the parallel panels; 768px retains the two columns; 560px and 320px stack task before updates. At every tested width, the document had no page-level horizontal overflow.
+- Content and interaction: six prioritized task cards and three reverse-time update cards retain their fields and detail links. A recent-update card navigated to its Invoice detail; keyboard focus on a task action retained a visible focus halo. Browser console had no errors.
+- Automated checks: TypeScript, 156 Vitest tests, production build, four Sites worker tests, and `git diff --check` pass. Vite's only warning is the existing large bundle advisory.
+- Environment: local test `http://localhost:4173` only; `192.168.88.188:8772` was not changed.
+
+final result: passed
+
+### Iteration 67: Three-Row Task Scroll and Processing Amount
+
+- Both homepage list panels have one shared measured height at 963px, 768px, 560px, and 320px. The visible window includes three complete cards; further tasks stay inside a vertically scrollable region with a thin scrollbar and keyboard focus.
+- The fourth to-do remains accessible with Tab, which scrolls it into view; wheel scrolling changes the inner task position while the recent-update preview remains at three entries. No page-level horizontal overflow was observed.
+- `付款处理中金额` now includes signed internal and previously uploaded external Invoices that are not paid or canceled. The seeded totals are `EUR 1,850 · USD 2,100`, covering the returned upload and failed payment (2 Invoices); this can overlap `待处理金额` by design.
+- TypeScript, 176 Vitest tests, production build, four Sites worker tests, and `git diff --check` pass. Vite reports only the large-bundle advisory. Local environment only; the remote Mac was not updated.
 
 final result: passed

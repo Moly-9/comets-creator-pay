@@ -2,10 +2,14 @@ import type { Invoice, PayoutAccount, UserProfile } from "../../types";
 import { isPayoutAccountUsable } from "../../payout-accounts";
 import type {
   ExternalInvoiceConfirmedSnapshot,
+  ExternalInvoiceCollectionStatus,
   ExternalInvoiceExpectedValues,
   ExternalInvoiceFieldKey,
   ExternalInvoiceRecognitionSnapshot,
 } from "./types";
+
+export const canCorrectExternalInvoice = (status: ExternalInvoiceCollectionStatus) =>
+  status === "WAITING_CONFIRMATION" || status === "RETURNED_FOR_CORRECTION";
 
 export const EXTERNAL_INVOICE_FIELD_ORDER: ExternalInvoiceFieldKey[] = [
   "SOURCE_INVOICE_NUMBER",
@@ -38,8 +42,8 @@ const numberValue = (value: string | undefined) =>
 export const payoutAccountFields = (account: PayoutAccount) => ({
   account_name: account.accountHolder,
   bank_name: account.bankName,
+  bank_address: account.schemaValues.bank_street_address || "",
   bank_country: account.bankCountry,
-  currency: account.currency,
   account_number: account.accountNumber,
   iban: account.schemaValues.iban || "",
   swift_code: account.swiftCode,
@@ -47,17 +51,21 @@ export const payoutAccountFields = (account: PayoutAccount) => ({
   beneficiary_type: account.beneficiaryType,
   paypal_email: account.accountEmail || "",
   provider: account.provider,
+  payment_method: account.provider === "PayPal" ? "PayPal" : "Bank Transfer",
 });
 
+export const payoutAccountFingerprint = (account: PayoutAccount) =>
+  JSON.stringify({ ...payoutAccountFields(account), currency: account.currency });
+
 export const recognitionFieldsFromExtracted = (
-  invoiceNumber: string,
+  _invoiceNumber: string,
   extracted: NonNullable<Invoice["extractedData"]>,
 ): Record<ExternalInvoiceFieldKey, string> => ({
-  SOURCE_INVOICE_NUMBER: invoiceNumber,
+  SOURCE_INVOICE_NUMBER: "",
   INVOICE_DATE: extracted.invoiceDate,
   PUBLISHER: extracted.invoiceFrom,
   ADVERTISER: extracted.billTo,
-  DESCRIPTION: "External creator services",
+  DESCRIPTION: extracted.description || "",
   AMOUNT: extracted.total,
   CURRENCY: extracted.currency,
   PAYMENT_ACCOUNT: JSON.stringify(extracted.paymentDetails),
@@ -67,6 +75,14 @@ export const confirmedValues = (
   recognition: ExternalInvoiceRecognitionSnapshot,
   confirmation?: ExternalInvoiceConfirmedSnapshot,
 ) => ({ ...recognition.fields, ...(confirmation?.values || {}) });
+
+export const currentExternalCorrection = (invoice: Invoice) => {
+  const recognition = invoice.recognitionSnapshots?.at(-1);
+  const correction = invoice.confirmedSnapshots?.at(-1);
+  return recognition && recognition.fileVersionId === invoice.sourceFileVersions?.at(-1)?.fileVersionId
+    && correction?.recognitionId === recognition.recognitionId
+    && correction.fileVersionId === recognition.fileVersionId ? correction : undefined;
+};
 
 export type ExternalInvoiceValidationIssue = {
   field: ExternalInvoiceFieldKey | "PAYOUT_ACCOUNT";
@@ -84,12 +100,18 @@ export const validateExternalInvoiceConfirmation = ({
 }): ExternalInvoiceValidationIssue[] => {
   const expected = invoice.expectedValues as ExternalInvoiceExpectedValues | undefined;
   const recognition = invoice.recognitionSnapshots?.at(-1);
-  const confirmation = invoice.confirmedSnapshots?.at(-1);
+  const confirmation = currentExternalCorrection(invoice);
   if (!recognition || recognition.failureReason) {
     return [{ field: "SOURCE_INVOICE_NUMBER", message: "Invoice 尚未生成有效识别结果" }];
   }
   const values = confirmedValues(recognition, confirmation);
   const issues: ExternalInvoiceValidationIssue[] = [];
+  if (!values.INVOICE_DATE?.trim()) {
+    issues.push({ field: "INVOICE_DATE", message: "请核对并填写 Invoice date" });
+  }
+  if (!values.DESCRIPTION?.trim()) {
+    issues.push({ field: "DESCRIPTION", message: "请对照 Invoice 票面填写 Description" });
+  }
   if (!account) issues.push({ field: "PAYOUT_ACCOUNT", message: "请选择收款账户" });
   else if (!isPayoutAccountUsable(account)) issues.push({ field: "PAYOUT_ACCOUNT", message: "所选账户未验证、已停用或正在付款处理中" });
   if (normalized(values.PUBLISHER) !== normalized(profile.legalName)) {
@@ -98,28 +120,11 @@ export const validateExternalInvoiceConfirmation = ({
   if (normalized(values.ADVERTISER) !== normalized(expected?.billTo || "COMETS INTERNATIONAL LIMITED")) {
     issues.push({ field: "ADVERTISER", message: "Bill To 应为 COMETS INTERNATIONAL LIMITED" });
   }
-  if (numberValue(values.AMOUNT) !== numberValue(expected?.amount)) {
+  if (!values.AMOUNT?.trim() || numberValue(values.AMOUNT) !== numberValue(expected?.amount)) {
     issues.push({ field: "AMOUNT", message: "Invoice 金额与系统预期金额不一致" });
   }
   if (normalized(values.CURRENCY) !== normalized(expected?.currency)) {
     issues.push({ field: "CURRENCY", message: "Invoice 币种与系统预期币种不一致" });
-  }
-  if (account) {
-    if (normalized(account.currency) !== normalized(values.CURRENCY)) {
-      issues.push({ field: "CURRENCY", message: "Invoice 币种与所选收款账户币种不一致" });
-    }
-    let recognizedPayment: Record<string, string> = {};
-    try { recognizedPayment = JSON.parse(values.PAYMENT_ACCOUNT || "{}"); } catch { recognizedPayment = {}; }
-    const selected = payoutAccountFields(account);
-    const mismatches = Object.entries(recognizedPayment).filter(([key, value]) => (
-      value && key in selected && normalized(value) !== normalized(selected[key as keyof typeof selected])
-    ));
-    if (mismatches.length) {
-      issues.push({
-        field: "PAYMENT_ACCOUNT",
-        message: `收款账户不匹配：${mismatches.map(([key]) => key).join("、")}`,
-      });
-    }
   }
   return issues;
 };

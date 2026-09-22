@@ -1,4 +1,5 @@
 import type { PayoutAccount, UserProfile } from "./types";
+import { synchronizeProfileSocialFields } from "./creator-display";
 
 export type PayoutDestructiveAction = "DELETE" | "DISABLE" | "LOCKED";
 
@@ -138,6 +139,19 @@ const ensureAccountDefaults = (
   };
 };
 
+const retainOneAccountPerChannel = (
+  accounts: PayoutAccount[],
+  requestedDefaultId: string,
+) => {
+  const channels = [...new Set(accounts.map((account) => account.channel))];
+  return channels.map((channel) => {
+    const candidates = accounts.filter((account) => account.channel === channel);
+    return candidates.find((account) => account.id === requestedDefaultId)
+      || candidates.find(isPayoutAccountUsable)
+      || candidates[0];
+  }).filter((account): account is PayoutAccount => Boolean(account));
+};
+
 export const normalizePayoutProfile = (profile: UserProfile): UserProfile => {
   const fallbackAccount = ensureAccountDefaults(
     profile.payout,
@@ -156,18 +170,19 @@ export const normalizePayoutProfile = (profile: UserProfile): UserProfile => {
           }, `payout-${profile.id.toLowerCase()}-${index + 1}`),
         )
       : [fallbackAccount];
+  const retainedAccounts = retainOneAccountPerChannel(accounts, requestedDefault);
   const defaultAccount =
-    accounts.find((account) => account.id === requestedDefault) ||
-    accounts.find(isPayoutAccountUsable) ||
-    accounts[0] ||
+    retainedAccounts.find((account) => account.id === requestedDefault) ||
+    retainedAccounts.find(isPayoutAccountUsable) ||
+    retainedAccounts[0] ||
     fallbackAccount;
-  return {
+  return synchronizeProfileSocialFields({
     ...profile,
     payout: defaultAccount,
-    payoutAccounts: accounts,
+    payoutAccounts: retainedAccounts,
     defaultPayoutAccountId: defaultAccount.id,
-    payoutAccountsVersion: 2,
-  };
+    payoutAccountsVersion: 3,
+  });
 };
 
 export const syncPayoutAccounts = (
@@ -175,23 +190,32 @@ export const syncPayoutAccounts = (
   accounts: PayoutAccount[],
   defaultPayoutAccountId: string,
 ): UserProfile => {
+  const retainedAccounts = retainOneAccountPerChannel(
+    accounts.map((account, index) => ensureAccountDefaults(
+      account,
+      `payout-${profile.id.toLowerCase()}-${index + 1}`,
+    )),
+    defaultPayoutAccountId,
+  );
   const defaultAccount =
-    accounts.find((account) => account.id === defaultPayoutAccountId) ||
-    accounts.find(isPayoutAccountUsable) ||
-    accounts[0];
+    retainedAccounts.find((account) => account.id === defaultPayoutAccountId) ||
+    retainedAccounts.find(isPayoutAccountUsable) ||
+    retainedAccounts[0];
   if (!defaultAccount) {
-    return {
+    return synchronizeProfileSocialFields({
       ...profile,
       payoutAccounts: [],
       defaultPayoutAccountId: "",
-    };
+      payoutAccountsVersion: 3,
+    });
   }
-  return {
+  return synchronizeProfileSocialFields({
     ...profile,
     payout: defaultAccount,
-    payoutAccounts: accounts,
+    payoutAccounts: retainedAccounts,
     defaultPayoutAccountId: defaultAccount.id,
-  };
+    payoutAccountsVersion: 3,
+  });
 };
 
 export const calculatePayoutProfileCompleteness = (profile: UserProfile) => {

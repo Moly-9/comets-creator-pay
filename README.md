@@ -1,6 +1,6 @@
 # COMETS Creator Pay
 
-COMETS Creator Pay 是面向网红/创作者的支付协作门户，覆盖账号注册、社媒认证、个人与收款档案、合同、Invoice 和请款项目流程。
+COMETS Creator Pay 是面向网红/创作者的支付协作门户，覆盖账号注册、社媒认证、个人与收款档案、合同、Invoice 和收款进度。
 
 ## 技术栈
 
@@ -43,7 +43,7 @@ pnpm test:sites
 
 当前使用类型化 service 接口和 `MockApiAdapter`。Mock 状态保存在浏览器 `localStorage`，后续接入真实后端时只需替换 service adapter。
 
-合同先于 Invoice 创建。没有关联 Invoice 的合同保持“未请款”，仅出现在合同模块；创建 Invoice 后，项目才进入请款项目和 Invoice 模块。
+合同先于 Invoice 创建。合同使用独立的“待签署 / 执行中 / 已过期”生命周期，不随 Invoice 审核或付款状态变化。创作者首页的“收款”只展示合同与 Invoice 项目名匹配的项目。
 
 ## 目录
 

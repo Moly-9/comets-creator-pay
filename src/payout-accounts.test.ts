@@ -104,14 +104,14 @@ describe("payout account lifecycle rules", () => {
     ).toBe(false);
   });
 
-  it("groups every account under its selected payment channel", () => {
+  it("retains at most one account under each payment channel", () => {
     const profile = normalizePayoutProfile(structuredClone(initialProfile));
 
     expect(
       payoutAccountsForChannel(profile.payoutAccounts, "AIRWALLEX").map(
         (item) => item.id,
       ),
-    ).toEqual(["payout-awx-fr-primary", "payout-awx-jp-backup"]);
+    ).toEqual(["payout-awx-fr-primary"]);
     expect(
       payoutAccountsForChannel(profile.payoutAccounts, "PAYPAL").map(
         (item) => item.id,
@@ -120,6 +120,25 @@ describe("payout account lifecycle rules", () => {
     expect(
       payoutAccountsForChannel(profile.payoutAccounts, "PAYERMAX"),
     ).toEqual([]);
+  });
+
+  it("prefers the legacy default when migrating duplicate channel accounts", () => {
+    const legacyProfile = structuredClone(initialProfile);
+    legacyProfile.payoutAccountsVersion = 2;
+    legacyProfile.defaultPayoutAccountId = "payout-awx-jp-backup";
+    legacyProfile.payout = legacyProfile.payoutAccounts.find(
+      (item) => item.id === "payout-awx-jp-backup",
+    )!;
+
+    const migrated = normalizePayoutProfile(legacyProfile);
+
+    expect(migrated.payoutAccountsVersion).toBe(3);
+    expect(
+      payoutAccountsForChannel(migrated.payoutAccounts, "AIRWALLEX").map(
+        (item) => item.id,
+      ),
+    ).toEqual(["payout-awx-jp-backup"]);
+    expect(migrated.defaultPayoutAccountId).toBe("payout-awx-jp-backup");
   });
 
   it("atomically synchronizes the compatibility payout to a new default", () => {

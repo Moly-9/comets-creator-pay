@@ -163,7 +163,7 @@ export const migrateInvoice = (source: Invoice): Invoice => {
     ...(recognitionSnapshots.length ? [{
       eventId: `history:migrated:${invoiceId}:recognition`,
       action: "RECOGNITION_SUCCEEDED" as const,
-      actor: "Mock OCR",
+      actor: "模拟 AI",
       occurredAt: recognitionSnapshots.at(-1)!.recognizedAt,
       fromStatus: "RECOGNIZING" as const,
       toStatus: "WAITING_CONFIRMATION" as const,
@@ -285,6 +285,87 @@ export const invoicePaymentMeta = (invoice: Invoice) => (
   PAYMENT_STATUS_META[migrateInvoice(invoice).paymentStatus!]
 );
 
+/** The stored payment status is not an active stage until document approval. */
+export const invoiceDetailPaymentMeta = (invoice: Invoice) => {
+  const migrated = migrateInvoice(invoice);
+  return migrated.documentState!.status === "APPROVED"
+    ? invoicePaymentMeta(migrated)
+    : { label: "未开始", tone: "neutral" };
+};
+
+export const invoiceDetailPaymentTimeline = (invoice: Invoice) => {
+  const migrated = migrateInvoice(invoice);
+  const approved = migrated.documentState!.status === "APPROVED";
+  const payment = migrated.paymentStatus;
+  const repairSubmitted = recoveryStatusIsSubmitted(migrated.paymentRecoveryStatus);
+  if (approved && payment === "FAILED") {
+    const recovery = migrated.paymentRecoveryStatus;
+    const retryReady = ["READY_FOR_RETRY", "RETRY_SUBMITTED", "RETRY_SUCCEEDED"].includes(recovery || "");
+    const retryProcessing = ["RETRY_SUBMITTED", "RETRY_SUCCEEDED"].includes(recovery || "");
+    const retrySucceeded = recovery === "RETRY_SUCCEEDED";
+    return [
+      ["审核通过", "complete"],
+      ["待付款", "complete"],
+      ["付款处理中", "complete"],
+      ["付款失败", "error"],
+      ["待确认重试方案", repairSubmitted ? "complete" : "current"],
+      ["重新打款申请已提交复核", !repairSubmitted ? "pending" : retryReady ? "complete" : "current"],
+      ["等待重新付款", !retryReady ? "pending" : retryProcessing ? "complete" : "current"],
+      ["付款处理中", !retryProcessing ? "pending" : retrySucceeded ? "complete" : "current"],
+      ["付款成功", retrySucceeded ? "complete" : "pending"],
+    ] as const;
+  }
+  return [
+    ["审核通过", approved ? "complete" : "pending"],
+    ["等待付款", !approved ? "pending" : payment === "WAITING_PAYMENT" ? "current" : "complete"],
+    ["付款处理中", !approved ? "pending" : payment === "PROCESSING" ? "current" : payment === "PAID" ? "complete" : "pending"],
+    ["付款成功", approved && payment === "PAID" ? "complete" : "pending"],
+  ] as const;
+};
+
+export type InvoiceTimelineNode = readonly [
+  label: string,
+  status: "complete" | "current" | "error" | "pending",
+];
+
+/** A document must reach approval before any payment step becomes active. */
+export const invoiceLifecycleTimeline = (invoice: Invoice): InvoiceTimelineNode[] => {
+  const migrated = migrateInvoice(invoice);
+  const document = migrated.documentState!;
+  let review: InvoiceTimelineNode[];
+
+  if (document.kind === "INTERNAL") {
+    const signed = !["WAITING_SIGNATURE", "CREATOR_FEEDBACK"].includes(document.status);
+    const approved = document.status === "APPROVED";
+    review = [
+      ["签署 Invoice", signed ? "complete" : document.status === "WAITING_SIGNATURE" ? "current" : "pending"],
+      ...(document.status === "CREATOR_FEEDBACK" ? [["信息反馈处理中", "current"] as const] : []),
+      [document.status === "CHANGES_REQUIRED" ? "审核未通过" : "资料审核", approved ? "complete" : document.status === "CHANGES_REQUIRED" ? "error" : document.status === "UNDER_REVIEW" ? "current" : "pending"],
+      ...(document.status === "CHANGES_REQUIRED" ? [["等待修改 Invoice", "current"] as const] : []),
+      ["审核通过", approved ? "complete" : "pending"],
+    ];
+  } else {
+    const status = document.status;
+    const uploaded = !["DRAFT", "WAITING_UPLOAD", "CANCELLED"].includes(status);
+    const recognized = ["WAITING_MEDIA_REVIEW", "RETURNED_FOR_CORRECTION", "APPROVED"].includes(status);
+    const approved = status === "APPROVED";
+    review = [
+      [status === "RETURNED_FOR_REUPLOAD" ? "上传文件未通过" : "上传 Invoice", status === "RETURNED_FOR_REUPLOAD" ? "error" : !uploaded && status !== "CANCELLED" ? "current" : uploaded ? "complete" : "pending"],
+      ...(status === "RETURNED_FOR_REUPLOAD" ? [["等待重新上传", "current"] as const] : []),
+      [status === "RECOGNITION_FAILED" ? "识别失败" : "识别与确认", status === "RECOGNITION_FAILED" ? "error" : recognized ? "complete" : ["RECOGNIZING", "WAITING_CONFIRMATION"].includes(status) ? "current" : "pending"],
+      ...(status === "RECOGNITION_FAILED" ? [["等待重新识别", "current"] as const] : []),
+      [status === "RETURNED_FOR_CORRECTION" ? "审核未通过" : "资料审核", status === "RETURNED_FOR_CORRECTION" ? "error" : approved ? "complete" : status === "WAITING_MEDIA_REVIEW" ? "current" : "pending"],
+      ...(status === "RETURNED_FOR_CORRECTION" ? [["等待修改 Invoice", "current"] as const] : []),
+      ["审核通过", approved ? "complete" : "pending"],
+      ...(status === "CANCELLED" ? [["已取消", "error"] as const] : []),
+    ];
+  }
+
+  // Payment helper already handles failures and repair paths; the review
+  // section above owns the shared approval step so it is not rendered twice.
+  return [...review, ...invoiceDetailPaymentTimeline(migrated).slice(1)];
+};
+
 export const invoicePrimaryStatusMeta = (invoice: Invoice) => {
   const migrated = migrateInvoice(invoice);
   if (migrated.documentState!.status !== "APPROVED") {
@@ -308,6 +389,38 @@ export const invoiceMatchesStatusFilters = (
     (reviewFilter === "ALL" || invoiceReviewFilterValue(migrated) === reviewFilter)
     && (paymentFilter === "ALL" || migrated.paymentStatus === paymentFilter)
   );
+};
+
+export type InvoiceListSummaryGroup = "TODO" | "PROCESSING" | "PAID" | "EXCLUDED";
+
+export const invoiceListSummaryGroup = (invoiceSource: Invoice): InvoiceListSummaryGroup => {
+  const invoice = migrateInvoice(invoiceSource);
+  const document = invoice.documentState!;
+  if (document.kind === "EXTERNAL" && document.status === "CANCELLED") return "EXCLUDED";
+  if (invoice.paymentStatus === "PAID") return "PAID";
+  if (invoice.paymentStatus === "FAILED") {
+    return recoveryStatusIsSubmitted(invoice.paymentRecoveryStatus) ? "PROCESSING" : "TODO";
+  }
+  if (invoice.paymentStatus === "PROCESSING") return "PROCESSING";
+  if (document.status === "APPROVED"
+    || (document.kind === "INTERNAL" && document.status === "UNDER_REVIEW")
+    || (document.kind === "EXTERNAL" && document.status === "WAITING_MEDIA_REVIEW")) {
+    return "PROCESSING";
+  }
+  return "TODO";
+};
+
+export const summarizeInvoiceList = (invoiceSources: Invoice[]) => {
+  const summary = { all: 0, todo: 0, processing: 0, paid: 0 };
+  invoiceSources.forEach((invoice) => {
+    const group = invoiceListSummaryGroup(invoice);
+    if (group === "EXCLUDED") return;
+    summary.all += 1;
+    if (group === "TODO") summary.todo += 1;
+    if (group === "PROCESSING") summary.processing += 1;
+    if (group === "PAID") summary.paid += 1;
+  });
+  return summary;
 };
 
 const taskForInvoice = (invoiceSource: Invoice): CreatorTask => {
@@ -400,7 +513,7 @@ const taskForInvoice = (invoiceSource: Invoice): CreatorTask => {
       type: "EXTERNAL_INVOICE_UPLOAD",
       group: "TODO",
       title: `Invoice ${number} 待确认`,
-      description: "请核对 OCR 结果及收款账户后提交审核。",
+      description: "请核对模拟 AI 结果及收款账户后提交审核。",
     };
   }
   return {
@@ -487,16 +600,16 @@ export const buildCreatorNotifications = (
         return [notification({
           type: "PAYMENT_ACCOUNT_CORRECTION_SUBMITTED",
           invoice,
-          title: `Invoice ${number} 收款资料已提交复核`,
-          message: "资料正在复核，后续重新付款由系统处理。",
+          title: `Invoice ${number} 重新打款申请已提交复核`,
+          message: "财务正在复核申请，后续重新付款由系统处理。",
           tone: "purple",
         })];
       }
       return [notification({
         type: "PAYMENT_FAILED",
         invoice,
-        title: `Invoice ${number} 付款失败，请修正收款信息`,
-        message: invoice.paymentFailureReason || "请修改收款信息或选择其他已验证账户。",
+        title: `Invoice ${number} 付款失败，请核对收款账户`,
+        message: invoice.paymentFailureReason || "请核对失败原因和绑定账户，再决定是否申请重新打款。",
         tone: "danger",
       })];
     }
