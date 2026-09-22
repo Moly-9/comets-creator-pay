@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" role="img" aria-label="演示社媒后台截图，仅供原型体验">
+  <rect width="960" height="600" rx="22" fill="#f6f7fb"/>
+  <rect width="960" height="76" rx="22" fill="#22232a"/>
+  <rect y="55" width="960" height="21" fill="#22232a"/>
+  <circle cx="48" cy="38" r="13" fill="#f39bbb"/>
+  <text x="78" y="46" fill="#fff" font-family="Arial,sans-serif" font-size="21" font-weight="700">CREATOR STUDIO · DEMO</text>
+  <rect x="38" y="112" width="884" height="102" rx="15" fill="#fff" stroke="#e4e6ef"/>
+  <circle cx="100" cy="163" r="32" fill="#f5eaf8"/>
+  <text x="87" y="172" fill="#8660ad" font-family="Arial,sans-serif" font-size="25">C</text>
+  <text x="153" y="155" fill="#202127" font-family="Arial,sans-serif" font-size="22" font-weight="700">Comets Demo Creator</text>
+  <text x="153" y="185" fill="#747b89" font-family="Arial,sans-serif" font-size="17">@CometsDemoCreator</text>
+  <rect x="38" y="244" width="273" height="146" rx="14" fill="#fff" stroke="#e4e6ef"/>
+  <rect x="343" y="244" width="273" height="146" rx="14" fill="#fff" stroke="#e4e6ef"/>
+  <rect x="649" y="244" width="273" height="146" rx="14" fill="#fff" stroke="#e4e6ef"/>
+  <text x="62" y="285" fill="#747b89" font-family="Arial,sans-serif" font-size="16">Audience</text>
+  <text x="62" y="346" fill="#252631" font-family="Arial,sans-serif" font-size="37" font-weight="700">12,480</text>
+  <text x="367" y="285" fill="#747b89" font-family="Arial,sans-serif" font-size="16">Views</text>
+  <text x="367" y="346" fill="#252631" font-family="Arial,sans-serif" font-size="37" font-weight="700">83,200</text>
+  <text x="673" y="285" fill="#747b89" font-family="Arial,sans-serif" font-size="16">Engagement</text>
+  <text x="673" y="346" fill="#252631" font-family="Arial,sans-serif" font-size="37" font-weight="700">5.4%</text>
+  <rect x="38" y="428" width="884" height="129" rx="14" fill="#fff" stroke="#e4e6ef"/>
+  <text x="66" y="480" fill="#6c4782" font-family="Arial,sans-serif" font-size="24" font-weight="700">DEMO ONLY · NOT REAL VERIFICATION EVIDENCE</text>
+  <text x="66" y="520" fill="#747b89" font-family="Arial,sans-serif" font-size="17">Use this image only to experience the local onboarding prototype.</text>
+</svg>

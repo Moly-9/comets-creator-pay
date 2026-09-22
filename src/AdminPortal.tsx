@@ -26,18 +26,17 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   UserCheck,
-  UserPlus,
   Users,
   UserX,
   X,
 } from "lucide-react";
 import {
   createContext,
-  type FormEvent,
   type ReactNode,
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
@@ -49,6 +48,11 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
+import Select from "./Select";
+import { useTranslation } from "react-i18next";
+import { displayCopy } from "./display-copy";
+import LangSwitch from "./components/LangSwitch";
+import { adminReturnPath } from "./admin-view-context";
 import {
   ADMIN_PAGE_SIZES,
   type AdminPageSize,
@@ -60,7 +64,6 @@ import {
   maskSensitiveValue,
   type AdminProfilePatch,
   type AdminUserFilters,
-  type CreateManagedUserInput,
 } from "./admin-store";
 import { contractStatusLabel } from "./contract-status";
 import { services, summarizeAmountsByCurrency } from "./services";
@@ -72,9 +75,9 @@ import type {
   AdminUserDetail,
   AuditEvent,
   Contract,
+  ContractType,
   Invoice,
   InvoiceStatus,
-  InvitationStatus,
   RequestProject,
   Session,
   SensitiveFieldKey,
@@ -89,6 +92,10 @@ type AdminSessionValue = {
 };
 
 const AdminSessionContext = createContext<AdminSessionValue | null>(null);
+
+export function AdminSessionProvider({ session, logout, children }: AdminSessionValue & { children: ReactNode }) {
+  return <AdminSessionContext.Provider value={{ session, logout }}>{children}</AdminSessionContext.Provider>;
+}
 
 const useAdminSession = () => {
   const value = useContext(AdminSessionContext);
@@ -112,11 +119,13 @@ const verificationLabel: Record<VerificationStatus, string> = {
   CHANGES_REQUESTED: "待修正",
 };
 
-const invitationLabel: Record<InvitationStatus, string> = {
-  NOT_REQUIRED: "自主注册",
-  PENDING: "待接受",
-  ACCEPTED: "已接受",
-  EXPIRED: "已过期",
+const adminContractStatusTone: Record<
+  Contract["status"],
+  "purple" | "info" | "neutral"
+> = {
+  PENDING_SIGNATURE: "purple",
+  ACTIVE: "info",
+  EXPIRED: "neutral",
 };
 
 const auditActionLabel: Record<AuditEvent["action"], string> = {
@@ -125,6 +134,7 @@ const auditActionLabel: Record<AuditEvent["action"], string> = {
   USER_INVITED: "邀请用户",
   USER_STATUS_CHANGED: "账号状态变更",
   PASSWORD_RESET_SENT: "密码重置",
+  PASSWORD_RESET_COMPLETED: "密码重置完成",
   PROFILE_UPDATED: "档案更新",
   VERIFICATION_UPDATED: "认证状态更新",
   CORRECTION_CREATED: "资料退回",
@@ -134,6 +144,7 @@ const auditActionLabel: Record<AuditEvent["action"], string> = {
   SETTINGS_UPDATED: "更新设置",
   EXTERNAL_DATA_SYNCED: "外部数据同步",
   EXTERNAL_DATA_REJECTED: "外部数据拒绝",
+  CREATOR_BUSINESS_ACTION: "达人操作",
 };
 
 function AdminBadge({
@@ -143,7 +154,8 @@ function AdminBadge({
   label: string;
   tone?: "neutral" | "success" | "warning" | "danger" | "info" | "purple";
 }) {
-  return <span className={`admin-badge admin-badge-${tone}`}>{label}</span>;
+  const { t } = useTranslation();
+  return <span className={`admin-badge admin-badge-${tone}`}>{displayCopy(label, t)}</span>;
 }
 
 function accountStatusTone(status: AccountStatus) {
@@ -165,11 +177,12 @@ function PageHeader({
   description: string;
   actions?: ReactNode;
 }) {
+  const { t } = useTranslation();
   return (
     <header className="admin-page-header">
       <div>
-        <h1>{title}</h1>
-        <p>{description}</p>
+        <h1>{displayCopy(title, t)}</h1>
+        <p>{displayCopy(description, t)}</p>
       </div>
       {actions ? <div className="admin-page-actions">{actions}</div> : null}
     </header>
@@ -227,6 +240,7 @@ function AdminPagination({
   onPageChange(page: number): void;
   onPageSizeChange(pageSize: AdminPageSize): void;
 }) {
+  const { t } = useTranslation();
   const [jumpValue, setJumpValue] = useState(String(page));
   const [jumpToken, setJumpToken] = useState<
     "start-ellipsis" | "end-ellipsis" | null
@@ -248,14 +262,14 @@ function AdminPagination({
   };
 
   return (
-    <footer className="admin-pagination" aria-label={`${unit}分页`}>
+    <footer className="admin-pagination" aria-label={t("admin.pagination", { unit: displayCopy(unit, t) })}>
       <div className="admin-pagination-content">
-        <div className="admin-pagination-meta">共{totalItems}条</div>
-        <nav className="admin-page-buttons" aria-label={`${unit}页码`}>
+        <div className="admin-pagination-meta">{t("admin.totalRecords", { count: totalItems })}</div>
+        <nav className="admin-page-buttons" aria-label={t("admin.pageNumbers", { unit: displayCopy(unit, t) })}>
           <button
             type="button"
-            aria-label="上一页"
-            title="上一页"
+            aria-label={t("admin.previousPage")}
+            title={t("admin.previousPage")}
             disabled={page <= 1}
             onClick={() => onPageChange(page - 1)}
           >
@@ -265,7 +279,7 @@ function AdminPagination({
             typeof token === "number" ? (
               <button
                 type="button"
-                aria-label={`第 ${token} 页`}
+                aria-label={t("admin.pageNumber", { number: token })}
                 aria-current={token === page ? "page" : undefined}
                 className={token === page ? "active" : ""}
                 key={token}
@@ -280,7 +294,7 @@ function AdminPagination({
                 min={1}
                 max={totalPages}
                 inputMode="numeric"
-                aria-label={`跳转${unit}页码`}
+                aria-label={t("admin.jumpPage", { unit: displayCopy(unit, t) })}
                 value={jumpValue}
                 key={token}
                 autoFocus
@@ -298,8 +312,8 @@ function AdminPagination({
               <button
                 type="button"
                 className="admin-page-ellipsis"
-                aria-label="输入指定页码"
-                title="输入指定页码"
+                aria-label={t("admin.enterPage")}
+                title={t("admin.enterPage")}
                 key={token}
                 onClick={() => {
                   setJumpValue(String(page));
@@ -312,8 +326,8 @@ function AdminPagination({
           )}
           <button
             type="button"
-            aria-label="下一页"
-            title="下一页"
+            aria-label={t("admin.nextPage")}
+            title={t("admin.nextPage")}
             disabled={page >= totalPages}
             onClick={() => onPageChange(page + 1)}
           >
@@ -321,20 +335,19 @@ function AdminPagination({
           </button>
         </nav>
         <label className="admin-page-size">
-          <select
-            aria-label={`${unit}每页条数`}
+          <Select
+            aria-label={t("admin.pageSize", { unit: displayCopy(unit, t) })}
             value={pageSize}
-            onChange={(event) =>
-              onPageSizeChange(Number(event.target.value) as AdminPageSize)
+            onValueChange={(value) =>
+              onPageSizeChange(Number(value) as AdminPageSize)
             }
           >
             {ADMIN_PAGE_SIZES.map((size) => (
               <option key={size} value={size}>
-                {size}条/页
+                {t("admin.recordsPerPage", { size })}
               </option>
             ))}
-          </select>
-          <ChevronDown className="admin-page-size-chevron" size={12} />
+          </Select>
         </label>
       </div>
     </footer>
@@ -354,6 +367,7 @@ function AdminModal({
   onClose(): void;
   footer: ReactNode;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="admin-modal-backdrop" role="presentation">
       <section
@@ -364,14 +378,14 @@ function AdminModal({
       >
         <header>
           <div>
-            <h2 id="admin-modal-title">{title}</h2>
-            {description ? <p>{description}</p> : null}
+            <h2 id="admin-modal-title">{displayCopy(title, t)}</h2>
+            {description ? <p>{displayCopy(description, t)}</p> : null}
           </div>
           <button
             type="button"
             className="admin-icon-button"
-            aria-label="关闭"
-            title="关闭"
+            aria-label={t("common.close")}
+            title={t("common.close")}
             onClick={onClose}
           >
             <X size={17} />
@@ -384,6 +398,68 @@ function AdminModal({
   );
 }
 
+function AdminStatusConfirmModal({
+  status,
+  count,
+  bulk = false,
+  onClose,
+  onConfirm,
+}: {
+  status: AccountStatus;
+  count: number;
+  bulk?: boolean;
+  onClose(): void;
+  onConfirm(): void;
+}) {
+  const { t } = useTranslation();
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const disabling = status === "DISABLED";
+
+  useEffect(() => {
+    cancelRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  const title = bulk
+    ? t(disabling ? "admin.confirmBulkDisableTitle" : "admin.confirmBulkEnableTitle", { count })
+    : t(disabling ? "admin.confirmDisableTitle" : "admin.confirmEnableTitle");
+
+  return (
+    <div className="admin-modal-backdrop admin-confirm-backdrop" role="presentation">
+      <section
+        className="admin-confirm-modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="admin-status-confirm-title"
+        aria-describedby="admin-status-confirm-description"
+      >
+        <header>
+          <h2 id="admin-status-confirm-title">{title}</h2>
+          <p id="admin-status-confirm-description">
+            {t(disabling ? "admin.disableAccountDescription" : "admin.enableAccountDescription")}
+          </p>
+        </header>
+        <footer>
+          <button ref={cancelRef} type="button" className="admin-ghost-button" onClick={onClose}>
+            {t("common.cancel")}
+          </button>
+          <button
+            type="button"
+            className={disabling ? "admin-confirm-danger" : "admin-primary-button"}
+            onClick={onConfirm}
+          >
+            {t(disabling ? "admin.confirmDisable" : "admin.confirmEnable")}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function Toast({
   message,
   onClose,
@@ -391,6 +467,7 @@ function Toast({
   message: string;
   onClose(): void;
 }) {
+  const { t } = useTranslation();
   useEffect(() => {
     const timer = window.setTimeout(onClose, 3200);
     return () => window.clearTimeout(timer);
@@ -398,8 +475,8 @@ function Toast({
   return (
     <div className="admin-toast" role="status">
       <Check size={16} />
-      <span>{message}</span>
-      <button type="button" onClick={onClose} aria-label="关闭提醒">
+      <span>{displayCopy(message, t)}</span>
+      <button type="button" onClick={onClose} aria-label={t("admin.closeReminder")}>
         <X size={14} />
       </button>
     </div>
@@ -417,6 +494,7 @@ function AdminSearchControl({
   placeholder: string;
   label?: string;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="admin-filter-control admin-search-control">
       <Search size={15} aria-hidden="true" />
@@ -424,14 +502,14 @@ function AdminSearchControl({
         type="search"
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        placeholder={placeholder}
-        aria-label={label}
+        placeholder={displayCopy(placeholder, t)}
+        aria-label={displayCopy(label, t)}
       />
       {value ? (
         <button
           type="button"
-          aria-label="清空搜索"
-          title="清空搜索"
+          aria-label={t("common.clearSearch")}
+          title={t("common.clearSearch")}
           onClick={() => onChange("")}
         >
           <X size={13} />
@@ -454,6 +532,7 @@ function AdminSelectControl({
   icon: ReactNode;
   children: ReactNode;
 }) {
+  const { t } = useTranslation();
   const active = value !== "ALL" && value !== "";
   return (
     <div
@@ -462,18 +541,13 @@ function AdminSelectControl({
       <span className="admin-filter-leading-icon" aria-hidden="true">
         {icon}
       </span>
-      <select
+      <Select
         value={value}
-        onChange={(event) => onChange(event.target.value)}
-        aria-label={label}
+        onValueChange={onChange}
+        aria-label={displayCopy(label, t)}
       >
         {children}
-      </select>
-      <ChevronDown
-        className="admin-filter-chevron"
-        size={14}
-        aria-hidden="true"
-      />
+      </Select>
     </div>
   );
 }
@@ -487,6 +561,7 @@ function AdminDateControl({
   onChange(value: string): void;
   label: string;
 }) {
+  const { t } = useTranslation();
   return (
     <div
       className={`admin-filter-control admin-date-control${value ? " is-active" : ""}`}
@@ -496,18 +571,12 @@ function AdminDateControl({
         type="date"
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        aria-label={label}
-        title={label}
+        aria-label={displayCopy(label, t)}
+        title={displayCopy(label, t)}
       />
     </div>
   );
 }
-
-const adminBusinessNav = [
-  { to: "/admin", label: "请款项目", icon: FolderKanban, end: true },
-  { to: "/admin/contracts", label: "合同", icon: FileText },
-  { to: "/admin/invoices", label: "Invoice", icon: ReceiptText },
-];
 
 const adminSettingsNav = [
   { to: "/admin/settings/users", label: "用户管理", icon: Users },
@@ -521,6 +590,7 @@ export function AdminLayout({
   session: Session;
   logout(): void;
 }) {
+  const { t } = useTranslation();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const location = useLocation();
   const [settingsOpen, setSettingsOpen] = useState(
@@ -540,7 +610,7 @@ export function AdminLayout({
     navigate("/login");
   };
   return (
-    <AdminSessionContext.Provider value={{ session, logout }}>
+    <>
       <div className="admin-shell">
         <header className="admin-topbar">
           <div className="admin-brand-lockup">
@@ -548,50 +618,37 @@ export function AdminLayout({
               type="button"
               className="admin-mobile-menu"
               onClick={() => setDrawerOpen(true)}
-              aria-label="打开导航"
+              aria-label={t("layout.openNavigation")}
             >
               <Menu size={20} />
             </button>
-            <Link to="/admin" className="admin-brand">
+            <Link to="/admin/select-user" className="admin-brand">
               <img src="/comets-mark.svg" alt="" />
-              <span><strong>COMETS</strong><small>Pay · 管理员端</small></span>
+              <span><strong>COMETS</strong><small>{t("admin.portalName")}</small></span>
             </Link>
           </div>
           <div className="admin-topbar-account">
+            <LangSwitch />
             <AdminBadge label="系统管理员" tone="purple" />
             <span className="admin-avatar">{session.email.slice(0, 1).toUpperCase()}</span>
-            <span><strong>{session.email}</strong><small>用户与身份运营</small></span>
+            <span><strong>{session.email}</strong><small>{t("admin.identityOperations")}</small></span>
           </div>
         </header>
         <aside className={`admin-sidebar ${drawerOpen ? "admin-sidebar-open" : ""}`}>
           <div className="admin-sidebar-mobile-head">
-            <span>管理员导航</span>
+            <span>{t("admin.navigation")}</span>
             <button
               type="button"
               className="admin-icon-button"
               onClick={() => setDrawerOpen(false)}
-              aria-label="关闭导航"
+              aria-label={t("layout.closeNavigation")}
             >
               <X size={18} />
             </button>
           </div>
           <nav>
-            <span className="admin-nav-label">业务管理</span>
-            {adminBusinessNav.map(({ to, label, icon: Icon, end }) => (
-              <NavLink
-                key={to}
-                to={to}
-                end={end}
-                onClick={() => setDrawerOpen(false)}
-                className={({ isActive }) =>
-                  `admin-nav-item ${isActive ? "admin-nav-active" : ""}`
-                }
-              >
-                <Icon size={17} />
-                <span>{label}</span>
-                <ChevronRight size={14} />
-              </NavLink>
-            ))}
+            <span className="admin-nav-label">{t("admin.creatorView")}</span>
+            <Link className="admin-nav-item" to="/admin/select-user" onClick={() => setDrawerOpen(false)}><Users size={17} /><span>{t("menu.selectCreator")}</span><ChevronRight size={14} /></Link>
             <button
               type="button"
               className={`admin-nav-item admin-nav-group ${location.pathname.startsWith("/admin/settings") ? "admin-nav-group-active" : ""}`}
@@ -599,12 +656,12 @@ export function AdminLayout({
               onClick={() => setSettingsOpen((open) => !open)}
             >
               <Settings size={17} />
-              <span>系统设置</span>
+              <span>{t("admin.systemSettings")}</span>
               <ChevronDown className={settingsOpen ? "is-open" : ""} size={14} />
             </button>
             {settingsOpen ? (
               <div className="admin-nav-children">
-                {adminSettingsNav.map(({ to, label, icon: Icon }) => (
+                {adminSettingsNav.map(({ to, icon: Icon }) => (
                   <NavLink
                     key={to}
                     to={to}
@@ -614,15 +671,16 @@ export function AdminLayout({
                     }
                   >
                     <Icon size={15} />
-                    <span>{label}</span>
+                    <span>{t(to.endsWith("/users") ? "menu.users" : "menu.auditLogs")}</span>
                   </NavLink>
                 ))}
               </div>
             ) : null}
           </nav>
+          <Link className="admin-nav-item" to={adminReturnPath()}><ArrowLeft size={17} /><span>{t("admin.returnToCreatorView")}</span></Link>
           <button type="button" className="admin-sidebar-logout" onClick={doLogout}>
             <LogOut size={17} />
-            退出登录
+            {t("menu.signOut")}
           </button>
         </aside>
         {drawerOpen ? (
@@ -630,20 +688,20 @@ export function AdminLayout({
             type="button"
             className="admin-sidebar-scrim"
             onClick={() => setDrawerOpen(false)}
-            aria-label="关闭导航"
+            aria-label={t("layout.closeNavigation")}
           />
         ) : null}
         <main className="admin-main">
           {accessDenied ? (
             <div className="role-access-notice" role="alert">
               <AlertCircle size={16} />
-              <span>{accessDenied}</span>
+              <span>{displayCopy(accessDenied, t)}</span>
             </div>
           ) : null}
           <Outlet />
         </main>
       </div>
-    </AdminSessionContext.Provider>
+    </>
   );
 }
 
@@ -682,6 +740,7 @@ const summarizeAdminAmounts = (items: Array<{ amount: string }>) => {
 };
 
 function AdminRequestProgress({ status }: { status: InvoiceStatus }) {
+  const { t } = useTranslation();
   const steps =
     status === "PAID"
       ? ["success", "success", "success", "success"]
@@ -695,9 +754,9 @@ function AdminRequestProgress({ status }: { status: InvoiceStatus }) {
   return (
     <div
       className="request-mini-progress"
-      aria-label={`当前请款状态：${adminInvoiceStatus[status].requestLabel}`}
+      aria-label={t("admin.currentRequestStatus", { status: displayCopy(adminInvoiceStatus[status].requestLabel, t) })}
     >
-      {["合同", "Invoice", "审批", "付款"].map((label, index) => (
+      {[t("menu.contracts"), "Invoice", t("admin.reviewStep"), t("admin.paymentStep")].map((label, index) => (
         <div className={`request-mini-step step-${steps[index]}`} key={label}>
           <span>{steps[index] === "success" ? <Check size={10} /> : null}</span>
           <small>{label}</small>
@@ -723,6 +782,7 @@ interface AdminRequestRow {
 }
 
 export function AdminRequestProjectsPage() {
+  const { t } = useTranslation();
   const data = useAdminBusinessData();
   const [query, setQuery] = useState("");
   const [creatorId, setCreatorId] = useState("ALL");
@@ -792,7 +852,7 @@ export function AdminRequestProjectsPage() {
     return (
       <div className="admin-page-stack">
         <div className="admin-loading">
-          <RefreshCcw className="spin" size={20} /> 正在加载请款项目
+          <RefreshCcw className="spin" size={20} /> {t("admin.loadingProjects")}
         </div>
       </div>
     );
@@ -801,38 +861,38 @@ export function AdminRequestProjectsPage() {
   return (
     <div className="admin-page-stack admin-business-page">
       <PageHeader
-        title="请款项目"
-        description="汇总本系统所有创作者已匹配合同与 Invoice 的请款项目。"
+        title={t("admin.requestProjects")}
+        description={t("admin.projectsDescription")}
       />
       <section
         className="request-money-overview admin-request-money-overview"
-        aria-label="全平台请款金额概览"
+        aria-label={t("admin.projectAmountOverview")}
       >
         <article>
           <i className="amber" />
-          <div><span>待签署金额</span><strong>{summarizeAdminAmounts(signatureRows.map((item) => item.request))}</strong></div>
-          <small>{signatureRows.length} 个项目</small>
+          <div><span>{t("admin.pendingSignatureAmount")}</span><strong>{summarizeAdminAmounts(signatureRows.map((item) => item.request))}</strong></div>
+          <small>{t("admin.projectCount", { count: signatureRows.length })}</small>
         </article>
         <article>
           <i className="blue" />
-          <div><span>处理中金额</span><strong>{summarizeAdminAmounts(processingRows.map((item) => item.request))}</strong></div>
-          <small>{processingRows.length} 个项目</small>
+          <div><span>{t("admin.processingAmount")}</span><strong>{summarizeAdminAmounts(processingRows.map((item) => item.request))}</strong></div>
+          <small>{t("admin.projectCount", { count: processingRows.length })}</small>
         </article>
         <article>
           <i className="green" />
-          <div><span>已打款金额</span><strong>{summarizeAdminAmounts(paidRows.map((item) => item.request))}</strong></div>
-          <small>{paidRows.length} 个项目</small>
+          <div><span>{t("admin.paidAmount")}</span><strong>{summarizeAdminAmounts(paidRows.map((item) => item.request))}</strong></div>
+          <small>{t("admin.projectCount", { count: paidRows.length })}</small>
         </article>
         <article className="admin-request-total-card">
           <i className="purple" />
           <div>
-            <span>项目总数</span>
-            <strong>{rows.length} 个项目</strong>
+            <span>{t("admin.totalProjects")}</span>
+            <strong>{t("admin.projectCount", { count: rows.length })}</strong>
             <div className="admin-currency-breakdown">
               {allProjectAmounts.map((summary) => (
                 <span key={summary.currency}>
                   <b>{summary.currency} {summary.formattedAmount}</b>
-                  <small>{summary.count} 个项目</small>
+                  <small>{t("admin.projectCount", { count: summary.count })}</small>
                 </span>
               ))}
             </div>
@@ -841,7 +901,7 @@ export function AdminRequestProjectsPage() {
       </section>
       <section className="admin-panel admin-table-panel">
         <header className="admin-panel-heading">
-          <div><h2>全部请款项目</h2><p>仅展示合同与 Invoice 项目名匹配的数据</p></div>
+          <div><h2>{t("admin.allProjects")}</h2><p>{t("admin.matchedProjectsOnly")}</p></div>
           <FolderKanban size={18} />
         </header>
         <div className="admin-business-toolbar">
@@ -857,7 +917,7 @@ export function AdminRequestProjectsPage() {
               label="筛选创作者"
               icon={<Users size={15} />}
             >
-              <option value="ALL">全部创作者</option>
+              <option value="ALL">{t("admin.allCreatorsOption")}</option>
               {creators.map((creator) => (
                 <option key={creator.id} value={creator.id}>
                   {creator.name} · {creator.id}
@@ -865,7 +925,7 @@ export function AdminRequestProjectsPage() {
               ))}
             </AdminSelectControl>
           </div>
-          <div className="admin-status-tabs" role="tablist" aria-label="请款状态筛选">
+          <div className="admin-status-tabs" role="tablist" aria-label={t("admin.filterRequestStatus")}>
             {(["ALL", ...adminInvoiceOrder] as const).map((value) => (
               <button
                 type="button"
@@ -876,8 +936,8 @@ export function AdminRequestProjectsPage() {
                 onClick={() => setStatus(value)}
               >
                 {value === "ALL"
-                  ? "全部"
-                  : adminInvoiceStatus[value].requestLabel}
+                  ? t("common.all")
+                  : displayCopy(adminInvoiceStatus[value].requestLabel, t)}
               </button>
             ))}
           </div>
@@ -886,15 +946,15 @@ export function AdminRequestProjectsPage() {
           <table className="admin-data-table admin-request-table">
             <thead>
               <tr>
-                <th>项目 / 请款编号</th>
-                <th>达人</th>
-                <th>金额</th>
-                <th>合同状态</th>
-                <th>Invoice 状态</th>
-                <th>请款状态</th>
-                <th>更新时间</th>
-                <th>请款进度</th>
-                <th>操作</th>
+                <th>{t("admin.projectRequestNumber")}</th>
+                <th>{t("admin.creatorColumn")}</th>
+                <th>{t("admin.amountColumn")}</th>
+                <th>{t("admin.contractStatusColumn")}</th>
+                <th>{t("admin.invoiceStatusColumn")}</th>
+                <th>{t("admin.requestStatusColumn")}</th>
+                <th>{t("admin.updatedColumn")}</th>
+                <th>{t("admin.requestProgress")}</th>
+                <th>{t("admin.actions")}</th>
               </tr>
             </thead>
             <tbody>
@@ -905,7 +965,7 @@ export function AdminRequestProjectsPage() {
                     <td><strong>{item.request.projectName}</strong><small className="admin-table-block">{item.request.id} · {item.request.brand}</small></td>
                     <td><strong>{item.creator.name}</strong><small className="admin-table-block">{item.creator.id}</small></td>
                     <td><strong>{item.request.amount}</strong></td>
-                    <td><AdminBadge label={contractStatusLabel[item.contract.status]} tone={item.contract.status === "已付款" ? "success" : "info"} /></td>
+                    <td><AdminBadge label={contractStatusLabel[item.contract.status]} tone={adminContractStatusTone[item.contract.status]} /></td>
                     <td><AdminBadge label={meta.label} tone={meta.tone} /></td>
                     <td><AdminBadge label={meta.requestLabel} tone={meta.tone} /></td>
                     <td><span className="admin-table-secondary">{item.request.updatedAt}</span></td>
@@ -914,9 +974,9 @@ export function AdminRequestProjectsPage() {
                       <Link
                         className="admin-icon-link"
                         to={`/admin/requests/${item.creator.id}/${item.request.id}`}
-                        title="查看请款项目详情"
+                        title={t("admin.viewRequestDetails")}
                       >
-                        <Eye size={15} /><span>查看</span>
+                        <Eye size={15} /><span>{t("common.view")}</span>
                       </Link>
                     </td>
                   </tr>
@@ -933,21 +993,21 @@ export function AdminRequestProjectsPage() {
                 <header><strong>{item.request.projectName}</strong><AdminBadge label={meta.requestLabel} tone={meta.tone} /></header>
                 <small className="admin-mobile-record-id">{item.request.id} · {item.request.brand}</small>
                 <dl>
-                  <div><dt>达人</dt><dd>{item.creator.name} · {item.creator.id}</dd></div>
-                  <div><dt>金额</dt><dd>{item.request.amount}</dd></div>
-                  <div><dt>合同状态</dt><dd>{contractStatusLabel[item.contract.status]}</dd></div>
-                  <div><dt>Invoice 状态</dt><dd>{meta.label}</dd></div>
-                  <div><dt>更新时间</dt><dd>{item.request.updatedAt}</dd></div>
+                  <div><dt>{t("admin.creatorColumn")}</dt><dd>{item.creator.name} · {item.creator.id}</dd></div>
+                  <div><dt>{t("admin.amountColumn")}</dt><dd>{item.request.amount}</dd></div>
+                  <div><dt>{t("admin.contractStatusColumn")}</dt><dd>{displayCopy(contractStatusLabel[item.contract.status], t)}</dd></div>
+                  <div><dt>{t("admin.invoiceStatusColumn")}</dt><dd>{displayCopy(meta.label, t)}</dd></div>
+                  <div><dt>{t("admin.updatedColumn")}</dt><dd>{item.request.updatedAt}</dd></div>
                 </dl>
                 <AdminRequestProgress status={item.invoice.status} />
                 <Link to={`/admin/requests/${item.creator.id}/${item.request.id}`}>
-                  查看请款项目 <ChevronRight size={14} />
+                  {t("admin.viewRequest")} <ChevronRight size={14} />
                 </Link>
               </article>
             );
           })}
         </div>
-        {!filtered.length ? <div className="admin-empty">没有符合筛选条件的请款项目</div> : null}
+        {!filtered.length ? <div className="admin-empty">{t("admin.noProjects")}</div> : null}
         <AdminPagination
           totalItems={filtered.length}
           page={requestPagination.currentPage}
@@ -965,6 +1025,7 @@ export function AdminRequestProjectsPage() {
 }
 
 export function AdminContractsPage() {
+  const { t } = useTranslation();
   const data = useAdminBusinessData();
   const [query, setQuery] = useState("");
   const [creatorId, setCreatorId] = useState("ALL");
@@ -988,43 +1049,43 @@ export function AdminContractsPage() {
     `${normalizedQuery}|${creatorId}|${status}`,
   );
   const counts: Record<Contract["status"], number> = {
-    未请款: rows.filter((item) => item.record.status === "未请款").length,
-    请款中: rows.filter((item) => item.record.status === "请款中").length,
-    已付款: rows.filter((item) => item.record.status === "已付款").length,
+    PENDING_SIGNATURE: rows.filter((item) => item.record.status === "PENDING_SIGNATURE").length,
+    ACTIVE: rows.filter((item) => item.record.status === "ACTIVE").length,
+    EXPIRED: rows.filter((item) => item.record.status === "EXPIRED").length,
   };
 
-  if (!data) return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> 正在加载合同</div></div>;
+  if (!data) return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> {t("admin.loadingContracts")}</div></div>;
 
   return (
     <div className="admin-page-stack admin-business-page">
-      <PageHeader title="合同" description="查看本系统所有创作者的合同与当前请款状态。" />
-      <section className="admin-business-summary admin-business-summary-card" aria-label="合同概览">
-        <article><span>合同总数</span><strong>{rows.length}</strong><small>本系统全部合同</small></article>
-        <article><span>未付款</span><strong>{counts.未请款}</strong><small>暂无关联 Invoice</small></article>
-        <article><span>付款中</span><strong>{counts.请款中}</strong><small>已进入 Invoice 流程</small></article>
-        <article><span>已付款</span><strong>{counts.已付款}</strong><small>款项已完成支付</small></article>
+      <PageHeader title={t("menu.contracts")} description={t("admin.contractsDescription")} />
+      <section className="admin-business-summary admin-business-summary-card" aria-label={t("admin.contractOverview")}>
+        <article><span>{t("admin.allContracts")}</span><strong>{rows.length}</strong><small>{t("admin.allContractsDescription")}</small></article>
+        <article><span>{t("status.awaitingSignature")}</span><strong>{counts.PENDING_SIGNATURE}</strong><small>{t("admin.pendingContractsDescription")}</small></article>
+        <article><span>{t("status.active")}</span><strong>{counts.ACTIVE}</strong><small>{t("admin.activeContractsDescription")}</small></article>
+        <article><span>{t("status.expired")}</span><strong>{counts.EXPIRED}</strong><small>{t("admin.expiredContractsDescription")}</small></article>
       </section>
       <section className="admin-panel admin-table-panel">
-        <header className="admin-panel-heading"><div><h2>全部合同</h2><p>只读查看与下载</p></div><FileText size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.allContracts")}</h2><p>{t("admin.readOnlyDownload")}</p></div><FileText size={18} /></header>
         <div className="admin-business-toolbar">
           <div className="admin-business-filter-fields">
             <AdminSearchControl value={query} onChange={setQuery} placeholder="搜索合同、项目、品牌、达人或 Creator ID" />
             <AdminSelectControl value={creatorId} onChange={setCreatorId} label="筛选创作者" icon={<Users size={15} />}>
-              <option value="ALL">全部创作者</option>
+              <option value="ALL">{t("admin.allCreatorsOption")}</option>
               {creators.map((creator) => <option key={creator.id} value={creator.id}>{creator.name} · {creator.id}</option>)}
             </AdminSelectControl>
           </div>
-          <div className="admin-status-tabs" role="tablist" aria-label="合同状态筛选">
-            {(["ALL", "未请款", "请款中", "已付款"] as const).map((value) => (
+          <div className="admin-status-tabs" role="tablist" aria-label={t("admin.filterContractStatus")}>
+            {(["ALL", "PENDING_SIGNATURE", "ACTIVE", "EXPIRED"] as const).map((value) => (
               <button type="button" role="tab" aria-selected={status === value} className={status === value ? "active" : ""} key={value} onClick={() => setStatus(value)}>
-                {value === "ALL" ? "全部" : contractStatusLabel[value]}
+                {value === "ALL" ? t("common.all") : displayCopy(contractStatusLabel[value], t)}
               </button>
             ))}
           </div>
         </div>
         <div className="admin-table-scroll">
           <table className="admin-data-table admin-contract-table">
-            <thead><tr><th>合同</th><th>项目 / 品牌</th><th>达人</th><th>合同金额</th><th>合同状态</th><th>生效日期</th><th>更新日期</th><th>操作</th></tr></thead>
+            <thead><tr><th>{t("menu.contracts")}</th><th>{t("admin.projectBrand")}</th><th>{t("admin.creatorColumn")}</th><th>{t("contracts.amount")}</th><th>{t("admin.contractStatusColumn")}</th><th>{t("admin.effectiveDate")}</th><th>{t("admin.updatedDate")}</th><th>{t("admin.actions")}</th></tr></thead>
             <tbody>
               {contractPagination.items.map(({ creator, record }) => (
                 <tr key={`${creator.id}-${record.id}`}>
@@ -1032,10 +1093,10 @@ export function AdminContractsPage() {
                   <td><strong>{record.projectName}</strong><small className="admin-table-block">{record.brand}</small></td>
                   <td><strong>{creator.name}</strong><small className="admin-table-block">{creator.id}</small></td>
                   <td><strong>{record.amount}</strong></td>
-                  <td><AdminBadge label={contractStatusLabel[record.status]} tone={record.status === "已付款" ? "success" : record.status === "请款中" ? "info" : "purple"} /></td>
+                  <td><AdminBadge label={contractStatusLabel[record.status]} tone={adminContractStatusTone[record.status]} /></td>
                   <td><span className="admin-table-secondary">{record.effectiveDate}</span></td>
                   <td><span className="admin-table-secondary">{record.updatedAt}</span></td>
-                  <td><div className="admin-inline-actions"><Link className="admin-icon-link" to={`/admin/contracts/${creator.id}/${record.id}`} title="查看合同详情"><Eye size={15} /><span>查看</span></Link><a className="admin-icon-link" href={record.documentUrl} download={record.fileName} title="下载合同"><Download size={15} /><span>下载</span></a></div></td>
+                  <td><div className="admin-inline-actions"><Link className="admin-icon-link" to={`/admin/contracts/${creator.id}/${record.id}`} title={t("admin.viewContractDetails")}><Eye size={15} /><span>{t("common.view")}</span></Link><span title={t("admin.originalNotRedacted")}>{t("admin.originalNotAvailable")}</span></div></td>
                 </tr>
               ))}
             </tbody>
@@ -1044,14 +1105,14 @@ export function AdminContractsPage() {
         <div className="admin-business-mobile-list">
           {contractPagination.items.map(({ creator, record }) => (
             <article key={`${creator.id}-${record.id}`}>
-              <header><strong>{record.projectName}</strong><AdminBadge label={contractStatusLabel[record.status]} tone={record.status === "已付款" ? "success" : record.status === "请款中" ? "info" : "purple"} /></header>
+              <header><strong>{record.projectName}</strong><AdminBadge label={contractStatusLabel[record.status]} tone={adminContractStatusTone[record.status]} /></header>
               <small className="admin-mobile-record-id">{record.id} · {record.orderId}</small>
-              <dl><div><dt>品牌</dt><dd>{record.brand}</dd></div><div><dt>达人</dt><dd>{creator.name} · {creator.id}</dd></div><div><dt>合同金额</dt><dd>{record.amount}</dd></div><div><dt>生效日期</dt><dd>{record.effectiveDate}</dd></div><div><dt>更新日期</dt><dd>{record.updatedAt}</dd></div></dl>
-              <div className="admin-business-mobile-actions"><Link to={`/admin/contracts/${creator.id}/${record.id}`}><Eye size={14} /> 查看</Link><a href={record.documentUrl} download={record.fileName}><Download size={14} /> 下载</a></div>
+              <dl><div><dt>{t("admin.brand")}</dt><dd>{record.brand}</dd></div><div><dt>{t("admin.creatorColumn")}</dt><dd>{creator.name} · {creator.id}</dd></div><div><dt>{t("contracts.amount")}</dt><dd>{record.amount}</dd></div><div><dt>{t("admin.effectiveDate")}</dt><dd>{record.effectiveDate}</dd></div><div><dt>{t("admin.updatedDate")}</dt><dd>{record.updatedAt}</dd></div></dl>
+              <div className="admin-business-mobile-actions"><Link to={`/admin/contracts/${creator.id}/${record.id}`}><Eye size={14} /> {t("common.view")}</Link><span>{t("admin.originalNotAvailable")}</span></div>
             </article>
           ))}
         </div>
-        {!filtered.length ? <div className="admin-empty">没有符合筛选条件的合同</div> : null}
+        {!filtered.length ? <div className="admin-empty">{t("admin.noContracts")}</div> : null}
         <AdminPagination
           totalItems={filtered.length}
           page={contractPagination.currentPage}
@@ -1069,6 +1130,7 @@ export function AdminContractsPage() {
 }
 
 export function AdminInvoicesPage() {
+  const { t } = useTranslation();
   const data = useAdminBusinessData();
   const [query, setQuery] = useState("");
   const [creatorId, setCreatorId] = useState("ALL");
@@ -1126,36 +1188,36 @@ export function AdminInvoicesPage() {
     `${normalizedQuery}|${creatorId}|${status}`,
   );
 
-  if (!data) return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> 正在加载 Invoice</div></div>;
+  if (!data) return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> {t("admin.loadingInvoices")}</div></div>;
 
   return (
     <div className="admin-page-stack admin-business-page">
-      <PageHeader title="Invoice" description="查看本系统所有创作者的 Invoice 与付款状态。" />
+      <PageHeader title="Invoice" description={t("admin.invoicesDescription")} />
       <section
         className="admin-business-summary admin-business-summary-card admin-invoice-summary"
-        aria-label="Invoice 数据总览"
+        aria-label={t("admin.invoiceOverview")}
       >
-        <article><span>Invoice 总数</span><strong>{rows.length}</strong><small>本系统全部 Invoice</small></article>
-        <article><span>待签署</span><strong>{statusCounts.DRAFT_SIGNATURE}</strong><small>等待创作者签署</small></article>
-        <article><span>待审核</span><strong>{statusCounts.PENDING_REVIEW}</strong><small>正在进行资料审核</small></article>
-        <article><span>已通过审核</span><strong>{statusCounts.APPROVED}</strong><small>审核完成，等待付款</small></article>
-        <article><span>付款异常</span><strong>{statusCounts.PAYMENT_FAILED}</strong><small>付款流程需要处理</small></article>
-        <article><span>已打款</span><strong>{statusCounts.PAID}</strong><small>款项已完成支付</small></article>
+        <article><span>{t("admin.totalInvoices")}</span><strong>{rows.length}</strong><small>{t("admin.allInvoicesDescription")}</small></article>
+        <article><span>{t("status.awaitingSignature")}</span><strong>{statusCounts.DRAFT_SIGNATURE}</strong><small>{t("admin.pendingInvoiceSignature")}</small></article>
+        <article><span>{t("status.awaitingReview")}</span><strong>{statusCounts.PENDING_REVIEW}</strong><small>{t("admin.reviewingDocuments")}</small></article>
+        <article><span>{t("status.approved")}</span><strong>{statusCounts.APPROVED}</strong><small>{t("admin.approvedAwaitingPayment")}</small></article>
+        <article><span>{t("status.paymentIssue")}</span><strong>{statusCounts.PAYMENT_FAILED}</strong><small>{t("admin.paymentNeedsAction")}</small></article>
+        <article><span>{t("admin.paidAmount")}</span><strong>{statusCounts.PAID}</strong><small>{t("admin.paymentCompleteDescription")}</small></article>
       </section>
       <section className="admin-panel admin-table-panel">
-        <header className="admin-panel-heading"><div><h2>全部 Invoice</h2><p>业务数据由外部系统同步，仅供查看与下载</p></div><ReceiptText size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.allInvoices")}</h2><p>{t("admin.invoicesExternalNotice")}</p></div><ReceiptText size={18} /></header>
         <div className="admin-business-toolbar">
           <div className="admin-business-filter-fields">
             <AdminSearchControl value={query} onChange={setQuery} placeholder="搜索 Invoice、项目、达人或 Creator ID" />
             <AdminSelectControl value={creatorId} onChange={setCreatorId} label="筛选创作者" icon={<Users size={15} />}>
-              <option value="ALL">全部创作者</option>
+              <option value="ALL">{t("admin.allCreatorsOption")}</option>
               {creators.map((creator) => <option key={creator.id} value={creator.id}>{creator.name} · {creator.id}</option>)}
             </AdminSelectControl>
           </div>
-          <div className="admin-status-tabs" role="tablist" aria-label="Invoice 状态筛选">
+          <div className="admin-status-tabs" role="tablist" aria-label={t("admin.filterInvoiceStatus")}>
             {(["ALL", ...adminInvoiceOrder] as const).map((value) => (
               <button type="button" role="tab" aria-selected={status === value} className={status === value ? "active" : ""} key={value} onClick={() => setStatus(value)}>
-                {value === "ALL" ? "全部" : adminInvoiceStatus[value].label}
+                {value === "ALL" ? t("common.all") : displayCopy(adminInvoiceStatus[value].label, t)}
                 <span>{rows.filter((item) => value === "ALL" || item.record.status === value).length}</span>
               </button>
             ))}
@@ -1163,7 +1225,7 @@ export function AdminInvoicesPage() {
         </div>
         <div className="admin-table-scroll">
           <table className="admin-data-table admin-invoice-table">
-            <thead><tr><th>Invoice</th><th>关联项目</th><th>达人</th><th>渠道</th><th>金额</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+            <thead><tr><th>Invoice</th><th>{t("admin.relatedProject")}</th><th>{t("admin.creatorColumn")}</th><th>{t("admin.channel")}</th><th>{t("admin.amountColumn")}</th><th>{t("admin.statusColumn")}</th><th>{t("admin.updatedColumn")}</th><th>{t("admin.actions")}</th></tr></thead>
             <tbody>
               {invoicePagination.items.map(({ creator, record }) => {
                 const meta = adminInvoiceStatus[record.status];
@@ -1176,7 +1238,7 @@ export function AdminInvoicesPage() {
                     <td><strong>{record.amount}</strong></td>
                     <td><AdminBadge label={meta.label} tone={meta.tone} /></td>
                     <td><span className="admin-table-secondary">{record.updatedAt}</span></td>
-                    <td><div className="admin-inline-actions"><Link className="admin-icon-link" to={`/admin/invoices/${creator.id}/${record.id}`} title="查看 Invoice 详情"><Eye size={15} /><span>查看</span></Link><a className="admin-icon-link" href="/INV-20260723-001-Alex-Ruiz.pdf" download={`${record.id}.pdf`} title="下载 Invoice"><Download size={15} /><span>下载</span></a></div></td>
+                    <td><div className="admin-inline-actions"><Link className="admin-icon-link" to={`/admin/invoices/${creator.id}/${record.id}`} title={t("admin.viewInvoiceDetails")}><Eye size={15} /><span>{t("common.view")}</span></Link><span title={t("admin.originalNotRedacted")}>{t("admin.originalNotAvailable")}</span></div></td>
                   </tr>
                 );
               })}
@@ -1190,13 +1252,13 @@ export function AdminInvoicesPage() {
               <article key={`${creator.id}-${record.id}`}>
                 <header><strong>{record.id}</strong><AdminBadge label={meta.label} tone={meta.tone} /></header>
                 <small className="admin-mobile-record-id">{record.projectName} · {record.brand}</small>
-                <dl><div><dt>达人</dt><dd>{creator.name} · {creator.id}</dd></div><div><dt>渠道</dt><dd>{record.channel}</dd></div><div><dt>金额</dt><dd>{record.amount}</dd></div><div><dt>更新时间</dt><dd>{record.updatedAt}</dd></div></dl>
-                <div className="admin-business-mobile-actions"><Link to={`/admin/invoices/${creator.id}/${record.id}`}><Eye size={14} /> 查看</Link><a href="/INV-20260723-001-Alex-Ruiz.pdf" download={`${record.id}.pdf`}><Download size={14} /> 下载</a></div>
+                <dl><div><dt>{t("admin.creatorColumn")}</dt><dd>{creator.name} · {creator.id}</dd></div><div><dt>{t("admin.channel")}</dt><dd>{record.channel}</dd></div><div><dt>{t("admin.amountColumn")}</dt><dd>{record.amount}</dd></div><div><dt>{t("admin.updatedColumn")}</dt><dd>{record.updatedAt}</dd></div></dl>
+                <div className="admin-business-mobile-actions"><Link to={`/admin/invoices/${creator.id}/${record.id}`}><Eye size={14} /> {t("common.view")}</Link><span>{t("admin.originalNotAvailable")}</span></div>
               </article>
             );
           })}
         </div>
-        {!filtered.length ? <div className="admin-empty">没有符合筛选条件的 Invoice</div> : null}
+        {!filtered.length ? <div className="admin-empty">{t("admin.noInvoices")}</div> : null}
         <AdminPagination
           totalItems={filtered.length}
           page={invoicePagination.currentPage}
@@ -1214,6 +1276,7 @@ export function AdminInvoicesPage() {
 }
 
 export function AdminDashboardPage() {
+  const { t } = useTranslation();
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [audits, setAudits] = useState<AuditEvent[]>([]);
   const [syncIssueCount, setSyncIssueCount] = useState(0);
@@ -1237,12 +1300,9 @@ export function AdminDashboardPage() {
   const pendingVerification = users.filter(
     (user) => user.role === "CREATOR" && user.verificationStatus === "PENDING",
   );
-  const pendingInvitations = users.filter(
-    (user) => user.invitationStatus === "PENDING",
-  );
   const actionUsers = [
     ...new Map(
-      [...pendingVerification, ...correctionUsers, ...pendingInvitations].map(
+      [...pendingVerification, ...correctionUsers].map(
         (user) => [user.id, user],
       ),
     ).values(),
@@ -1251,26 +1311,25 @@ export function AdminDashboardPage() {
   return (
     <div className="admin-page-stack">
       <PageHeader
-        title="用户运营概览"
-        description="集中查看账号可用性、认证进度、资料修正和外部数据关联状态。"
+        title={t("admin.dashboardTitle")}
+        description={t("admin.dashboardDescription")}
         actions={
           <Link className="admin-primary-button" to="/admin/settings/users">
-            <Users size={16} /> 管理用户
+            <Users size={16} /> {t("admin.manageUsers")}
           </Link>
         }
       />
-      <section className="admin-metric-strip" aria-label="用户指标">
+      <section className="admin-metric-strip" aria-label={t("admin.userMetrics")}>
         {[
-          ["用户总数", users.length, "所有管理员与创作者"],
+          [t("admin.totalUsers"), users.length, t("admin.allUsersDescription")],
           [
-            "启用 / 停用",
+            t("admin.enabledDisabled"),
             `${users.filter((user) => user.status === "ACTIVE").length} / ${users.filter((user) => user.status === "DISABLED").length}`,
-            "账号访问状态",
+            t("admin.accountAccessDescription"),
           ],
-          ["待认证", pendingVerification.length, "认证前不可签署 Invoice"],
-          ["待修正", correctionCount, "需要用户补充资料"],
-          ["待接受邀请", pendingInvitations.length, "尚未完成账号激活"],
-          ["同步异常", syncIssueCount, "未知 Creator ID 或数据版本"],
+          [t("status.pendingVerification"), pendingVerification.length, t("admin.cannotSignPending")],
+          [t("status.needsCorrection"), correctionCount, t("admin.needsMoreInformation")],
+          [t("admin.syncIssues"), syncIssueCount, t("admin.unknownCreatorOrVersion")],
         ].map(([label, value, copy]) => (
           <article key={label}>
             <span>{label}</span>
@@ -1283,8 +1342,8 @@ export function AdminDashboardPage() {
       <div className="admin-dashboard-grid">
         <section className="admin-panel">
           <header className="admin-panel-heading">
-            <div><h2>需要处理</h2><p>认证、资料修正与邀请事项</p></div>
-            <Link to="/admin/settings/users">查看全部 <ChevronRight size={14} /></Link>
+            <div><h2>{t("admin.needsAttention")}</h2><p>{t("admin.attentionDescription")}</p></div>
+            <Link to="/admin/settings/users">{t("admin.viewAll")} <ChevronRight size={14} /></Link>
           </header>
           <div className="admin-action-queue">
             {actionUsers
@@ -1295,11 +1354,9 @@ export function AdminDashboardPage() {
                   <span><strong>{user.name}</strong><small>{user.id} · {user.email}</small></span>
                   <AdminBadge
                     label={
-                      user.invitationStatus === "PENDING"
-                        ? "待接受邀请"
-                        : user.hasOpenCorrection
+                      user.hasOpenCorrection
                           ? "待修正"
-                        : verificationLabel[user.verificationStatus]
+                          : verificationLabel[user.verificationStatus]
                     }
                     tone={
                       user.hasOpenCorrection ||
@@ -1313,21 +1370,21 @@ export function AdminDashboardPage() {
               ))}
             {!loading &&
             actionUsers.length === 0 ? (
-              <div className="admin-empty">当前没有需要处理的用户事项</div>
+              <div className="admin-empty">{t("admin.noAttention")}</div>
             ) : null}
           </div>
         </section>
 
         <section className="admin-panel">
           <header className="admin-panel-heading">
-            <div><h2>最近操作</h2><p>关键账号和安全操作</p></div>
-            <Link to="/admin/settings/audit-logs">操作日志 <ChevronRight size={14} /></Link>
+            <div><h2>{t("admin.recentActions")}</h2><p>{t("admin.recentActionsDescription")}</p></div>
+            <Link to="/admin/settings/audit-logs">{t("menu.auditLogs")} <ChevronRight size={14} /></Link>
           </header>
           <div className="admin-activity-list">
             {audits.slice(0, 6).map((event) => (
               <article key={event.id}>
                 <span className="admin-activity-icon"><History size={15} /></span>
-                <div><strong>{event.summary}</strong><small>{event.actorName} · {event.occurredAt}</small></div>
+                <div><strong>{displayCopy(event.summary, t)}</strong><small>{event.actorName} · {event.occurredAt}</small></div>
                 <AdminBadge label={auditActionLabel[event.action]} />
               </article>
             ))}
@@ -1349,6 +1406,7 @@ function downloadTextFile(fileName: string, content: string, type = "text/csv;ch
 }
 
 export function AdminUsersPage() {
+  const { t } = useTranslation();
   const { session } = useAdminSession();
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [filters, setFilters] = useState<AdminUserFilters>({
@@ -1356,13 +1414,10 @@ export function AdminUsersPage() {
     role: "ALL",
     status: "ALL",
     verificationStatus: "ALL",
-    invitationStatus: "ALL",
     correctionStatus: "ALL",
   });
   const [selected, setSelected] = useState<string[]>([]);
-  const [createOpen, setCreateOpen] = useState(false);
   const [statusAction, setStatusAction] = useState<AccountStatus | null>(null);
-  const [statusReason, setStatusReason] = useState("");
   const [toast, setToast] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -1386,11 +1441,9 @@ export function AdminUsersPage() {
         selected,
         statusAction,
         session.userId,
-        statusReason,
       );
       setToast(result.message || "账号状态已更新");
       setStatusAction(null);
-      setStatusReason("");
       setSelected([]);
       await load();
     } catch (error) {
@@ -1419,14 +1472,9 @@ export function AdminUsersPage() {
         title="用户管理"
         description="管理管理员与创作者账号、认证状态和访问权限。"
         actions={
-          <>
-            <button type="button" className="admin-secondary-button" onClick={exportUsers}>
-              <Download size={16} /> 导出脱敏清单
-            </button>
-            <button type="button" className="admin-primary-button" onClick={() => setCreateOpen(true)}>
-              <UserPlus size={16} /> 创建或邀请用户
-            </button>
-          </>
+          <button type="button" className="admin-secondary-button" onClick={exportUsers}>
+            <Download size={16} /> {t("admin.exportMasked")}
+          </button>
         }
       />
 
@@ -1437,49 +1485,42 @@ export function AdminUsersPage() {
           placeholder="搜索姓名、邮箱或 Creator ID"
         />
         <AdminSelectControl value={filters.role || "ALL"} onChange={(value) => setFilter("role", value as AdminUserFilters["role"])} label="筛选账号角色" icon={<CircleUserRound size={15} />}>
-          <option value="ALL">全部角色</option>
-          <option value="ADMIN">管理员</option>
-          <option value="CREATOR">创作者</option>
+          <option value="ALL">{t("admin.allRoles")}</option>
+          <option value="ADMIN">{t("admin.roleAdministrator")}</option>
+          <option value="CREATOR">{t("admin.roleCreator")}</option>
         </AdminSelectControl>
         <AdminSelectControl value={filters.status || "ALL"} onChange={(value) => setFilter("status", value as AdminUserFilters["status"])} label="筛选账号状态" icon={<UserCheck size={15} />}>
-          <option value="ALL">全部账号状态</option>
-          <option value="ACTIVE">已启用</option>
-          <option value="DISABLED">已停用</option>
+          <option value="ALL">{t("admin.allAccountStatuses")}</option>
+          <option value="ACTIVE">{t("admin.enabled")}</option>
+          <option value="DISABLED">{t("admin.disabled")}</option>
         </AdminSelectControl>
         <AdminSelectControl value={filters.verificationStatus || "ALL"} onChange={(value) => setFilter("verificationStatus", value as AdminUserFilters["verificationStatus"])} label="筛选认证状态" icon={<ShieldCheck size={15} />}>
-          <option value="ALL">全部认证状态</option>
-          <option value="PENDING">待认证</option>
-          <option value="VERIFIED">已认证</option>
-          <option value="CHANGES_REQUESTED">待修正</option>
-        </AdminSelectControl>
-        <AdminSelectControl value={filters.invitationStatus || "ALL"} onChange={(value) => setFilter("invitationStatus", value as AdminUserFilters["invitationStatus"])} label="筛选邀请状态" icon={<Mail size={15} />}>
-          <option value="ALL">全部邀请状态</option>
-          <option value="PENDING">待接受</option>
-          <option value="ACCEPTED">已接受</option>
-          <option value="NOT_REQUIRED">自主注册</option>
-          <option value="EXPIRED">已过期</option>
+          <option value="ALL">{t("admin.allVerificationStatuses")}</option>
+          <option value="PENDING">{t("admin.pendingVerification")}</option>
+          <option value="VERIFIED">{t("admin.verified")}</option>
+          <option value="CHANGES_REQUESTED">{t("admin.needsCorrection")}</option>
         </AdminSelectControl>
         <AdminSelectControl value={filters.correctionStatus || "ALL"} onChange={(value) => setFilter("correctionStatus", value as AdminUserFilters["correctionStatus"])} label="筛选资料修正状态" icon={<AlertCircle size={15} />}>
-          <option value="ALL">全部修正状态</option>
-          <option value="OPEN">有待修正字段</option>
-          <option value="CLEAR">无待修正字段</option>
+          <option value="ALL">{t("admin.allCorrectionStatuses")}</option>
+          <option value="OPEN">{t("admin.withCorrections")}</option>
+          <option value="CLEAR">{t("admin.withoutCorrections")}</option>
         </AdminSelectControl>
       </section>
 
       {selected.length ? (
         <section className="admin-bulk-bar">
-          <span>已选择 <strong>{selected.length}</strong> 个账号</span>
+          <span>{t("admin.selectedAccounts", { count: selected.length })}</span>
           <div>
-            <button type="button" onClick={() => setStatusAction("ACTIVE")}><UserCheck size={15} /> 批量启用</button>
-            <button type="button" onClick={() => setStatusAction("DISABLED")}><UserX size={15} /> 批量停用</button>
-            <button type="button" onClick={() => setSelected([])}>取消选择</button>
+            <button type="button" onClick={() => setStatusAction("ACTIVE")}><UserCheck size={15} /> {t("admin.bulkEnable")}</button>
+            <button type="button" onClick={() => setStatusAction("DISABLED")}><UserX size={15} /> {t("admin.bulkDisable")}</button>
+            <button type="button" onClick={() => setSelected([])}>{t("admin.cancelSelection")}</button>
           </div>
         </section>
       ) : null}
 
       <section className="admin-panel admin-table-panel">
         <header className="admin-panel-heading">
-          <div><h2>账号列表</h2><p>{loading ? "正在加载" : `共 ${users.length} 个账号`}</p></div>
+          <div><h2>{t("admin.accountList")}</h2><p>{loading ? t("common.loading") : t("admin.accountCount", { count: users.length })}</p></div>
           <SlidersHorizontal size={17} />
         </header>
         <div className="admin-table-scroll">
@@ -1489,7 +1530,7 @@ export function AdminUsersPage() {
                 <th className="admin-check-cell">
                   <input
                     type="checkbox"
-                    aria-label="全选当前页用户"
+                    aria-label={t("admin.selectAllCurrent")}
                     checked={
                       selectableUsers.length > 0 &&
                       selectableUsers.every((user) =>
@@ -1513,13 +1554,12 @@ export function AdminUsersPage() {
                     }
                   />
                 </th>
-                <th>账号信息</th>
-                <th>角色</th>
-                <th>认证</th>
-                <th>邀请</th>
-                <th>账号状态</th>
-                <th>最后登录</th>
-                <th>操作</th>
+                <th>{t("admin.accountInformation")}</th>
+                <th>{t("admin.role")}</th>
+                <th>{t("admin.verification")}</th>
+                <th>{t("admin.accountStatus")}</th>
+                <th>{t("admin.lastLogin")}</th>
+                <th>{t("admin.actions")}</th>
               </tr>
             </thead>
             <tbody>
@@ -1528,7 +1568,7 @@ export function AdminUsersPage() {
                   <td className="admin-check-cell">
                     <input
                       type="checkbox"
-                      aria-label={`选择 ${user.name}`}
+                      aria-label={t("admin.selectUser", { name: user.name })}
                       checked={selected.includes(user.id)}
                       disabled={user.id === session.userId}
                       onChange={(event) =>
@@ -1548,12 +1588,11 @@ export function AdminUsersPage() {
                   </td>
                   <td><AdminBadge label={roleLabel[user.role]} tone={user.role === "ADMIN" ? "purple" : "info"} /></td>
                   <td><AdminBadge label={verificationLabel[user.verificationStatus]} tone={verificationTone(user.verificationStatus)} /></td>
-                  <td><span className="admin-table-secondary">{invitationLabel[user.invitationStatus]}</span></td>
                   <td><AdminBadge label={accountStatusLabel[user.status]} tone={accountStatusTone(user.status)} /></td>
                   <td><span className="admin-table-secondary">{user.lastLoginAt}</span></td>
                   <td>
-                    <Link className="admin-icon-link" to={`/admin/settings/users/${user.id}`} title="查看用户详情">
-                      <Eye size={15} /><span>查看</span>
+                    <Link className="admin-icon-link" to={`/admin/settings/users/${user.id}`} title={t("admin.viewUser")}>
+                      <Eye size={15} /><span>{t("common.view")}</span>
                     </Link>
                   </td>
                 </tr>
@@ -1561,14 +1600,14 @@ export function AdminUsersPage() {
             </tbody>
           </table>
         </div>
-        {!loading && !users.length ? <div className="admin-empty">没有符合筛选条件的用户</div> : null}
+        {!loading && !users.length ? <div className="admin-empty">{t("admin.noMatchingUsers")}</div> : null}
         <div className="admin-user-mobile-list">
           {userPagination.items.map((user) => (
             <article key={user.id}>
               <header>
                 <input
                   type="checkbox"
-                  aria-label={`选择 ${user.name}`}
+                  aria-label={t("admin.selectUser", { name: user.name })}
                   checked={selected.includes(user.id)}
                   disabled={user.id === session.userId}
                   onChange={(event) =>
@@ -1584,12 +1623,12 @@ export function AdminUsersPage() {
                 <AdminBadge label={accountStatusLabel[user.status]} tone={accountStatusTone(user.status)} />
               </header>
               <dl>
-                <div><dt>邮箱</dt><dd>{user.email}</dd></div>
-                <div><dt>角色</dt><dd>{roleLabel[user.role]}</dd></div>
-                <div><dt>认证</dt><dd>{verificationLabel[user.verificationStatus]}</dd></div>
-                <div><dt>最后登录</dt><dd>{user.lastLoginAt}</dd></div>
+                <div><dt>{t("admin.email")}</dt><dd>{user.email}</dd></div>
+                <div><dt>{t("admin.role")}</dt><dd>{displayCopy(roleLabel[user.role], t)}</dd></div>
+                <div><dt>{t("admin.verification")}</dt><dd>{displayCopy(verificationLabel[user.verificationStatus], t)}</dd></div>
+                <div><dt>{t("admin.lastLogin")}</dt><dd>{user.lastLoginAt}</dd></div>
               </dl>
-              <Link to={`/admin/settings/users/${user.id}`}>查看用户详情 <ChevronRight size={15} /></Link>
+              <Link to={`/admin/settings/users/${user.id}`}>{t("admin.viewUser")} <ChevronRight size={15} /></Link>
             </article>
           ))}
         </div>
@@ -1606,121 +1645,17 @@ export function AdminUsersPage() {
         />
       </section>
 
-      {createOpen ? (
-        <CreateUserModal
-          actorId={session.userId}
-          onClose={() => setCreateOpen(false)}
-          onCreated={async (message) => {
-            setCreateOpen(false);
-            setToast(message);
-            await load();
-          }}
-        />
-      ) : null}
       {statusAction ? (
-        <AdminModal
-          title={statusAction === "ACTIVE" ? "启用所选账号" : "停用所选账号"}
-          description={`将变更 ${selected.length} 个账号的访问状态，并逐条写入审计日志。`}
+        <AdminStatusConfirmModal
+          status={statusAction}
+          count={selected.length}
+          bulk
           onClose={() => setStatusAction(null)}
-          footer={
-            <>
-              <button type="button" className="admin-ghost-button" onClick={() => setStatusAction(null)}>取消</button>
-              <button type="button" className={statusAction === "DISABLED" ? "admin-danger-button" : "admin-primary-button"} onClick={applyBulkStatus}>
-                确认{statusAction === "ACTIVE" ? "启用" : "停用"}
-              </button>
-            </>
-          }
-        >
-          <label className="admin-form-field">
-            <span>操作原因</span>
-            <textarea
-              value={statusReason}
-              onChange={(event) => setStatusReason(event.target.value)}
-              placeholder="说明本次账号状态变更原因"
-            />
-          </label>
-        </AdminModal>
+          onConfirm={applyBulkStatus}
+        />
       ) : null}
       {toast ? <Toast message={toast} onClose={() => setToast("")} /> : null}
     </div>
-  );
-}
-
-function CreateUserModal({
-  actorId,
-  onClose,
-  onCreated,
-}: {
-  actorId: string;
-  onClose(): void;
-  onCreated(message: string): void;
-}) {
-  const [form, setForm] = useState<CreateManagedUserInput>({
-    name: "",
-    email: "",
-    role: "CREATOR",
-    mode: "INVITE",
-  });
-  const [error, setError] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!form.name.trim() || !form.email.includes("@")) {
-      setError("请填写用户姓名和有效邮箱");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const result = await services.adminUsers.create(form, actorId);
-      onCreated(result.message || "用户已创建");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "创建失败");
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <AdminModal
-      title="创建或邀请用户"
-      description="公开注册只能创建创作者；管理员账号必须由现有管理员创建。"
-      onClose={onClose}
-      footer={
-        <>
-          <button type="button" className="admin-ghost-button" onClick={onClose}>取消</button>
-          <button type="submit" form="create-admin-user" className="admin-primary-button" disabled={submitting}>
-            {submitting ? <RefreshCcw className="spin" size={15} /> : <Mail size={15} />}
-            {form.mode === "INVITE" ? "发送邀请" : "创建账号"}
-          </button>
-        </>
-      }
-    >
-      <form id="create-admin-user" className="admin-form-grid" onSubmit={submit}>
-        {error ? <div className="admin-inline-alert admin-form-wide">{error}</div> : null}
-        <label className="admin-form-field">
-          <span>姓名 *</span>
-          <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="输入用户姓名" />
-        </label>
-        <label className="admin-form-field">
-          <span>邮箱 *</span>
-          <input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="name@example.com" />
-        </label>
-        <div className="admin-form-field">
-          <span>账号角色</span>
-          <AdminSelectControl value={form.role} onChange={(value) => setForm({ ...form, role: value as UserRole })} label="账号角色" icon={<CircleUserRound size={15} />}>
-            <option value="CREATOR">创作者</option>
-            <option value="ADMIN">管理员</option>
-          </AdminSelectControl>
-        </div>
-        <div className="admin-form-field">
-          <span>创建方式</span>
-          <AdminSelectControl value={form.mode} onChange={(value) => setForm({ ...form, mode: value as CreateManagedUserInput["mode"] })} label="创建方式" icon={<Mail size={15} />}>
-            <option value="INVITE">发送邀请邮件</option>
-            <option value="CREATE">立即创建账号</option>
-          </AdminSelectControl>
-        </div>
-      </form>
-    </AdminModal>
   );
 }
 
@@ -1739,11 +1674,11 @@ const userDetailTabs: Array<{ key: UserDetailTab; label: string }> = [
   { key: "payout", label: "收款账户" },
   { key: "contracts", label: "合同" },
   { key: "invoices", label: "Invoice" },
-  { key: "requests", label: "请款项目" },
   { key: "activity", label: "记录" },
 ];
 
 export function AdminUserDetailPage() {
+  const { t } = useTranslation();
   const { id = "" } = useParams();
   const { session } = useAdminSession();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1755,8 +1690,8 @@ export function AdminUserDetailPage() {
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [revealField, setRevealField] = useState<SensitiveFieldKey | null>(null);
   const [revealed, setRevealed] = useState<Record<string, string>>({});
+  const [revealedUserId, setRevealedUserId] = useState("");
   const [statusModal, setStatusModal] = useState(false);
-  const [statusReason, setStatusReason] = useState("");
 
   const load = async () => {
     const [userResult, auditResult] = await Promise.all([
@@ -1775,8 +1710,14 @@ export function AdminUserDetailPage() {
     load();
   }, [id]);
 
-  if (!detail) {
-    return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> 正在加载用户详情</div></div>;
+  useEffect(() => {
+    setRevealed({});
+    setRevealedUserId("");
+    setRevealField(null);
+  }, [id, tab]);
+
+  if (!detail || detail.account.id !== id) {
+    return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> {t("admin.userDetailLoading")}</div></div>;
   }
 
   const account = detail.account;
@@ -1789,11 +1730,9 @@ export function AdminUserDetailPage() {
         [account.id],
         next,
         session.userId,
-        statusReason,
       );
       setToast(result.message || "账号状态已更新");
       setStatusModal(false);
-      setStatusReason("");
       await load();
     } catch (error) {
       setToast(error instanceof Error ? error.message : "操作失败");
@@ -1818,7 +1757,7 @@ export function AdminUserDetailPage() {
 
   return (
     <div className="admin-page-stack">
-      <Link className="admin-back-link" to="/admin/settings/users"><ArrowLeft size={15} /> 返回用户列表</Link>
+      <Link className="admin-back-link" to="/admin/settings/users"><ArrowLeft size={15} /> {t("admin.backToUsers")}</Link>
       <section className="admin-user-hero">
         <span className="admin-user-hero-avatar">{account.name.slice(0, 1)}</span>
         <div className="admin-user-hero-copy">
@@ -1832,7 +1771,7 @@ export function AdminUserDetailPage() {
           <AdminBadge label={verificationLabel[account.verificationStatus]} tone={verificationTone(account.verificationStatus)} />
         </div>
         <div className="admin-user-hero-actions">
-          <button type="button" className="admin-secondary-button" onClick={resetPassword}><KeyRound size={15} /> 重置密码</button>
+          <button type="button" className="admin-secondary-button" onClick={resetPassword}><KeyRound size={15} /> {t("admin.resetPassword")}</button>
           <button
             type="button"
             className={account.status === "ACTIVE" ? "admin-danger-button" : "admin-primary-button"}
@@ -1840,12 +1779,12 @@ export function AdminUserDetailPage() {
             disabled={account.id === session.userId}
           >
             {account.status === "ACTIVE" ? <UserX size={15} /> : <UserCheck size={15} />}
-            {account.status === "ACTIVE" ? "停用账号" : "启用账号"}
+            {t(account.status === "ACTIVE" ? "admin.disableAccount" : "admin.enableAccount")}
           </button>
         </div>
       </section>
 
-      <nav className="admin-detail-tabs" aria-label="用户详情">
+      <nav className="admin-detail-tabs" aria-label={t("admin.userDetails")}>
         {userDetailTabs.map((item) => (
           <button
             type="button"
@@ -1853,10 +1792,9 @@ export function AdminUserDetailPage() {
             className={tab === item.key ? "active" : ""}
             onClick={() => setSearchParams({ tab: item.key })}
           >
-            {item.label}
+            {t(`admin.${({ overview: "tabOverview", profile: "tabProfile", payout: "tabPayout", contracts: "tabContracts", invoices: "tabInvoices", requests: "tabRequests", activity: "tabActivity" } as Record<UserDetailTab, string>)[item.key]}`)}
             {item.key === "contracts" && detail.contracts.length ? <span>{detail.contracts.length}</span> : null}
             {item.key === "invoices" && detail.invoices.length ? <span>{detail.invoices.length}</span> : null}
-            {item.key === "requests" && detail.requests.length ? <span>{detail.requests.length}</span> : null}
           </button>
         ))}
       </nav>
@@ -1885,7 +1823,7 @@ export function AdminUserDetailPage() {
       {tab === "payout" && profile ? (
         <PayoutReadOnlyPanel
           detail={detail}
-          revealed={revealed}
+          revealed={revealedUserId === id ? revealed : {}}
           onReveal={setRevealField}
           onCorrection={() => setCorrectionOpen(true)}
         />
@@ -1922,32 +1860,21 @@ export function AdminUserDetailPage() {
           field={revealField}
           onClose={() => setRevealField(null)}
           onRevealed={(value, message) => {
-            setRevealed((current) => ({ ...current, [revealField]: value }));
+            setRevealed((current) => ({ ...(revealedUserId === id ? current : {}), [revealField]: value }));
+            setRevealedUserId(id);
             setRevealField(null);
-            setToast(message);
+            setToast(value ? message : t("admin.emptyFieldAudited"));
             load();
           }}
         />
       ) : null}
       {statusModal ? (
-        <AdminModal
-          title={account.status === "ACTIVE" ? "停用账号" : "启用账号"}
-          description="账号数据会保留；停用后该用户将无法继续访问系统。"
+        <AdminStatusConfirmModal
+          status={account.status === "ACTIVE" ? "DISABLED" : "ACTIVE"}
+          count={1}
           onClose={() => setStatusModal(false)}
-          footer={
-            <>
-              <button type="button" className="admin-ghost-button" onClick={() => setStatusModal(false)}>取消</button>
-              <button type="button" className={account.status === "ACTIVE" ? "admin-danger-button" : "admin-primary-button"} onClick={changeStatus}>
-                确认{account.status === "ACTIVE" ? "停用" : "启用"}
-              </button>
-            </>
-          }
-        >
-          <label className="admin-form-field">
-            <span>操作原因</span>
-            <textarea value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="填写账号状态变更原因" />
-          </label>
-        </AdminModal>
+          onConfirm={changeStatus}
+        />
       ) : null}
       {toast ? <Toast message={toast} onClose={() => setToast("")} /> : null}
     </div>
@@ -1963,44 +1890,43 @@ function UserOverview({
   onVerification(status: VerificationStatus): void;
   onCorrection(): void;
 }) {
+  const { t } = useTranslation();
   const { account, profile } = detail;
   const openCorrections = detail.corrections.filter((item) => item.status === "OPEN");
   return (
     <div className="admin-detail-grid">
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>账号状态</h2><p>访问、邀请和认证状态相互独立</p></div><CircleUserRound size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.accountStatus")}</h2><p>{t("admin.accountStatusIndependent")}</p></div><CircleUserRound size={18} /></header>
         <dl className="admin-description-list">
-          <div><dt>账号角色</dt><dd>{roleLabel[account.role]}</dd></div>
-          <div><dt>访问状态</dt><dd><AdminBadge label={accountStatusLabel[account.status]} tone={accountStatusTone(account.status)} /></dd></div>
-          <div><dt>邀请状态</dt><dd>{invitationLabel[account.invitationStatus]}</dd></div>
-          <div><dt>注册时间</dt><dd>{account.createdAt}</dd></div>
-          <div><dt>最后登录</dt><dd>{account.lastLoginAt}</dd></div>
-          <div><dt>资料修正</dt><dd>{openCorrections.length ? `${openCorrections.length} 项待处理` : "无待处理事项"}</dd></div>
+          <div><dt>{t("admin.role")}</dt><dd>{displayCopy(roleLabel[account.role], t)}</dd></div>
+          <div><dt>{t("admin.accessStatus")}</dt><dd><AdminBadge label={accountStatusLabel[account.status]} tone={accountStatusTone(account.status)} /></dd></div>
+          <div><dt>{t("admin.registeredAt")}</dt><dd>{account.createdAt}</dd></div>
+          <div><dt>{t("admin.lastLogin")}</dt><dd>{account.lastLoginAt}</dd></div>
+          <div><dt>{t("admin.profileCorrections")}</dt><dd>{openCorrections.length ? t("admin.pendingItems", { count: openCorrections.length }) : t("admin.noPendingItems")}</dd></div>
         </dl>
       </section>
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>社媒认证</h2><p>认证通过前创作者不能签署 Invoice</p></div><ShieldCheck size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.socialVerification")}</h2><p>{t("admin.signingRestricted")}</p></div><ShieldCheck size={18} /></header>
         {profile ? (
           <div className="admin-verification-summary">
             <span className="admin-social-mark">{profile.social.platform.slice(0, 1)}</span>
-            <div><strong>{profile.social.platform} · {profile.social.handle}</strong><small>{profile.social.profileUrls.length} 条主页链接 · {profile.social.screenshots.length} 张认证截图</small></div>
+            <div><strong>{profile.social.platform} · {profile.social.handle}</strong><small>{t("admin.socialEvidenceCounts", { links: profile.social.profileUrls.length, screenshots: profile.social.screenshots.length })}</small></div>
             <AdminBadge label={verificationLabel[account.verificationStatus]} tone={verificationTone(account.verificationStatus)} />
           </div>
-        ) : <div className="admin-empty">管理员账号不需要社媒认证</div>}
+        ) : <div className="admin-empty">{t("admin.adminNoSocialVerification")}</div>}
         {account.role === "CREATOR" && account.verificationStatus !== "VERIFIED" ? (
           <div className="admin-verification-actions">
-            <button type="button" className="admin-primary-button" onClick={() => onVerification("VERIFIED")}><UserCheck size={15} /> 通过认证</button>
-            <button type="button" className="admin-secondary-button" onClick={onCorrection}><AlertCircle size={15} /> 退回具体字段</button>
+            <button type="button" className="admin-primary-button" onClick={() => onVerification("VERIFIED")}><UserCheck size={15} /> {t("admin.approveVerification")}</button>
+            <button type="button" className="admin-secondary-button" onClick={onCorrection}><AlertCircle size={15} /> {t("admin.returnSpecificFields")}</button>
           </div>
         ) : null}
       </section>
       <section className="admin-panel admin-detail-wide">
-        <header className="admin-panel-heading"><div><h2>关联业务数据</h2><p>来自外部系统，只读展示</p></div><FileText size={18} /></header>
-        <div className="admin-business-summary">
-          <article><span>合同</span><strong>{detail.contracts.length}</strong><small>外部系统同步</small></article>
-          <article><span>Invoice</span><strong>{detail.invoices.length}</strong><small>外部系统同步</small></article>
-          <article><span>请款项目</span><strong>{detail.requests.length}</strong><small>按稳定 Creator ID 关联</small></article>
-          <article><span>最近同步</span><strong className="admin-sync-time">{detail.lastSyncedAt || "-"}</strong><small>{detail.lastSyncedAt ? "数据已关联" : "暂无业务数据"}</small></article>
+        <header className="admin-panel-heading"><div><h2>{t("admin.relatedBusiness")}</h2><p>{t("admin.externalReadOnly")}</p></div><FileText size={18} /></header>
+        <div className="admin-business-summary admin-user-business-summary">
+          <article><span>{t("menu.contracts")}</span><strong>{detail.contracts.length}</strong><small>{t("admin.externalSync")}</small></article>
+          <article><span>Invoice</span><strong>{detail.invoices.length}</strong><small>{t("admin.externalSync")}</small></article>
+          <article><span>{t("admin.recentSync")}</span><strong className="admin-sync-time">{detail.lastSyncedAt || "-"}</strong><small>{t(detail.lastSyncedAt ? "admin.dataLinked" : "admin.noBusinessData")}</small></article>
         </div>
       </section>
     </div>
@@ -2022,6 +1948,7 @@ function AdminProfilePanel({
   onSaved(detail: AdminUserDetail, message: string): void;
   onCorrection(): void;
 }) {
+  const { t } = useTranslation();
   const profile = detail.profile!;
   const [form, setForm] = useState<AdminProfilePatch>({
     displayName: profile.displayName,
@@ -2065,20 +1992,20 @@ function AdminProfilePanel({
   return (
     <section className="admin-panel">
       <header className="admin-panel-heading">
-        <div><h2>基本与社媒资料</h2><p>管理员可直接修改非收款资料，所有变更写入审计日志。</p></div>
+        <div><h2>{t("admin.tabProfile")}</h2><p>{t("admin.profileAdminDescription")}</p></div>
         <div className="admin-inline-actions">
-          <button type="button" className="admin-secondary-button" onClick={onCorrection}><AlertCircle size={15} /> 退回字段</button>
+          <button type="button" className="admin-secondary-button" onClick={onCorrection}><AlertCircle size={15} /> {t("admin.returnField")}</button>
           {editing ? (
             <>
-              <button type="button" className="admin-ghost-button" onClick={() => onEditingChange(false)}>取消</button>
-              <button type="button" className="admin-primary-button" onClick={save}><Check size={15} /> 保存修改</button>
+              <button type="button" className="admin-ghost-button" onClick={() => onEditingChange(false)}>{t("common.cancel")}</button>
+              <button type="button" className="admin-primary-button" onClick={save}><Check size={15} /> {t("common.saveChanges")}</button>
             </>
           ) : (
-            <button type="button" className="admin-primary-button" onClick={() => onEditingChange(true)}>编辑资料</button>
+            <button type="button" className="admin-primary-button" onClick={() => onEditingChange(true)}>{t("admin.editProfile")}</button>
           )}
         </div>
       </header>
-      {error ? <div className="admin-inline-alert">{error}</div> : null}
+      {error ? <div className="admin-inline-alert">{displayCopy(error, t)}</div> : null}
       <div className="admin-profile-form">
         {[
           ["displayName", "显示名称", form.displayName],
@@ -2090,7 +2017,7 @@ function AdminProfilePanel({
           ["handle", "社媒账号", form.handle],
         ].map(([key, label, value]) => (
           <label className={key === "address" ? "admin-form-wide" : ""} key={key}>
-            <span>{label}</span>
+            <span>{t(`admin.${({ displayName: "displayName", legalName: "realName", email: "contactEmail", phone: "phone", address: "contactAddress", platform: "socialPlatform", handle: "socialAccount" } as Record<string, string>)[key]}`)}</span>
             {editing ? (
               <input
                 value={value}
@@ -2100,7 +2027,7 @@ function AdminProfilePanel({
           </label>
         ))}
         <div className="admin-form-wide admin-profile-links">
-          <span>主页链接</span>
+          <span>{t("admin.profileLinks")}</span>
           {form.profileUrls.map((url, index) => (
             editing ? (
               <input
@@ -2134,6 +2061,7 @@ function PayoutReadOnlyPanel({
   onReveal(field: SensitiveFieldKey): void;
   onCorrection(): void;
 }) {
+  const { t } = useTranslation();
   const payout = detail.profile!.payout;
   const sensitive = [
     {
@@ -2165,30 +2093,33 @@ function PayoutReadOnlyPanel({
       value: payout.schemaValues.business_registration_number || "",
     },
   ];
+  const hasStoredValue = (value: string) => Boolean(value && value !== "—" && value !== "-");
   return (
     <section className="admin-panel">
       <header className="admin-panel-heading">
-        <div><h2>收款账户</h2><p>管理员只能核对和退回字段，不能代替创作者修改。</p></div>
-        <button type="button" className="admin-secondary-button" onClick={onCorrection}><AlertCircle size={15} /> 退回字段</button>
+        <div><h2>{t("profile.payoutAccount")}</h2><p>{t("admin.payoutReadOnly")}</p></div>
+        <button type="button" className="admin-secondary-button" onClick={onCorrection}><AlertCircle size={15} /> {t("admin.returnField")}</button>
       </header>
       <aside className="admin-security-notice">
         <LockKeyhole size={17} />
-        <div><strong>敏感信息默认脱敏</strong><span>查看完整值必须填写业务原因，操作会写入审计日志。</span></div>
+        <div><strong>{t("admin.maskedByDefault")}</strong><span>{t("admin.revealRequiresReason")}</span></div>
       </aside>
       <dl className="admin-payout-grid">
-        <div><dt>付款渠道</dt><dd>{payout.provider}</dd></div>
-        <div><dt>账户状态</dt><dd><AdminBadge label={payout.status === "VALIDATED" ? "校验通过" : "待完善"} tone={payout.status === "VALIDATED" ? "success" : "warning"} /></dd></div>
-        <div><dt>账户名称</dt><dd>{payout.accountHolder || "-"}</dd></div>
-        <div><dt>银行</dt><dd>{payout.bankName || "-"}</dd></div>
-        <div><dt>国家与币种</dt><dd>{payout.bankCountry} · {payout.currency}</dd></div>
-        <div><dt>收款人类型</dt><dd>{payout.beneficiaryType === "PERSONAL" ? "个人" : "公司"}</dd></div>
+        <div><dt>{t("contracts.paymentChannel")}</dt><dd>{payout.provider}</dd></div>
+        <div><dt>{t("admin.accountState")}</dt><dd><AdminBadge label={payout.status === "VALIDATED" ? "校验通过" : "待完善"} tone={payout.status === "VALIDATED" ? "success" : "warning"} /></dd></div>
+        <div><dt>{t("admin.accountHolder")}</dt><dd>{payout.accountHolder || "-"}</dd></div>
+        <div><dt>{t("admin.bank")}</dt><dd>{payout.bankName || "-"}</dd></div>
+        <div><dt>{t("admin.countryCurrency")}</dt><dd>{displayCopy(payout.bankCountry, t)} · {payout.currency}</dd></div>
+        <div><dt>{t("admin.beneficiaryType")}</dt><dd>{t(payout.beneficiaryType === "PERSONAL" ? "admin.personal" : "admin.company")}</dd></div>
         {sensitive.map((field) => (
           <div key={field.key}>
-            <dt>{field.label}</dt>
+            <dt>{displayCopy(field.label, t)}</dt>
             <dd className="admin-sensitive-value">
-              <span>{revealed[field.key] || maskSensitiveValue(field.value)}</span>
-              {field.value && !revealed[field.key] ? (
-                <button type="button" onClick={() => onReveal(field.key)}><Eye size={14} /> 查看完整值</button>
+              <span>{Object.hasOwn(revealed, field.key)
+                ? (revealed[field.key] || t("admin.unfilled"))
+                : (hasStoredValue(field.value) ? maskSensitiveValue(field.value) : t("admin.unfilled"))}</span>
+              {hasStoredValue(field.value) && !Object.hasOwn(revealed, field.key) ? (
+                <button type="button" onClick={() => onReveal(field.key)}><Eye size={14} /> {t("admin.viewFullValue")}</button>
               ) : null}
             </dd>
           </div>
@@ -2205,8 +2136,14 @@ function BusinessTable({
   type: "contracts" | "invoices" | "requests";
   detail: AdminUserDetail;
 }) {
+  const { t } = useTranslation();
   const data: Array<Contract | Invoice | RequestProject> = detail[type];
-  const title = type === "contracts" ? "合同" : type === "invoices" ? "Invoice" : "请款项目";
+  const title = type === "contracts" ? t("menu.contracts") : type === "invoices" ? "Invoice" : t("admin.requestProjects");
+  const contractTypeLabel: Record<ContractType, string> = {
+    INDEPENDENT: t("admin.contractTypeIndependent"),
+    FRAMEWORK: t("admin.contractTypeFramework"),
+    IO: t("admin.contractTypeIo"),
+  };
   const pagination = useAdminPagination(
     data,
     `${detail.account.id}|${type}`,
@@ -2214,22 +2151,28 @@ function BusinessTable({
   return (
     <section className="admin-panel admin-table-panel">
       <header className="admin-panel-heading">
-        <div><h2>{title}</h2><p>来自外部系统，管理员仅可查看和下载。</p></div>
-        <AdminBadge label="只读数据" tone="info" />
+        <div><h2>{title}</h2><p>{t("admin.businessReadOnlyDescription")}</p></div>
+        <AdminBadge label={t("admin.readOnlyData")} tone="info" />
       </header>
       {!data.length ? (
-        <div className="admin-empty">该用户暂无已关联的{title}数据</div>
+        <div className="admin-empty">{t("admin.noRelatedBusiness", { type: title })}</div>
       ) : (
         <div className="admin-table-scroll">
           <table className="admin-data-table">
             <thead>
               <tr>
-                <th>编号</th>
-                <th>项目</th>
-                <th>品牌</th>
-                <th>金额</th>
-                <th>状态</th>
-                <th>操作</th>
+                <th>{t("admin.recordNumber")}</th>
+                {type === "contracts" ? (
+                  <th>{t("admin.contractType")}</th>
+                ) : type === "requests" ? (
+                  <>
+                    <th>{t("admin.project")}</th>
+                    <th>{t("admin.brand")}</th>
+                  </>
+                ) : null}
+                <th>{t("admin.amountColumn")}</th>
+                <th>{t("admin.statusColumn")}</th>
+                <th>{t("admin.actionsColumn")}</th>
               </tr>
             </thead>
             <tbody>
@@ -2237,14 +2180,12 @@ function BusinessTable({
                 ? (pagination.items as Contract[]).map((item) => (
                     <tr key={item.id}>
                       <td><strong>{item.id}</strong></td>
-                      <td>{item.projectName}</td>
-                      <td>{item.brand}</td>
+                      <td>{contractTypeLabel[item.contractType]}</td>
                       <td>{item.amount}</td>
-                      <td><AdminBadge label={contractStatusLabel[item.status]} tone={item.status === "已付款" ? "success" : "info"} /></td>
+                      <td><AdminBadge label={contractStatusLabel[item.status]} tone={adminContractStatusTone[item.status]} /></td>
                       <td>
                         <div className="admin-inline-actions">
-                          <a className="admin-icon-link" href={item.documentUrl} target="_blank" rel="noreferrer"><Eye size={15} /><span>查看</span></a>
-                          <a className="admin-icon-link" href={item.documentUrl} download={item.fileName}><Download size={15} /><span>下载</span></a>
+                          <Link className="admin-icon-link" to={`/admin/contracts/${detail.account.id}/${item.id}`}><Eye size={15} /><span>{t("admin.viewSummary")}</span></Link><span>{t("admin.originalNotAvailable")}</span>
                         </div>
                       </td>
                     </tr>
@@ -2253,14 +2194,11 @@ function BusinessTable({
                   ? (pagination.items as Invoice[]).map((item) => (
                       <tr key={item.id}>
                         <td><strong>{item.id}</strong></td>
-                        <td>{item.projectName}</td>
-                        <td>{item.brand}</td>
                         <td>{item.amount}</td>
-                        <td><AdminBadge label={item.status} tone={item.status === "PAID" ? "success" : item.status === "PAYMENT_FAILED" ? "danger" : "info"} /></td>
+                        <td><AdminBadge label={displayCopy(item.status, t)} tone={item.status === "PAID" ? "success" : item.status === "PAYMENT_FAILED" ? "danger" : "info"} /></td>
                         <td>
                           <div className="admin-inline-actions">
-                            <a className="admin-icon-link" href="/INV-20260723-001-Alex-Ruiz.pdf" target="_blank" rel="noreferrer"><Eye size={15} /><span>查看</span></a>
-                            <a className="admin-icon-link" href="/INV-20260723-001-Alex-Ruiz.pdf" download={`${item.id}.pdf`}><Download size={15} /><span>下载</span></a>
+                            <Link className="admin-icon-link" to={`/admin/invoices/${detail.account.id}/${item.id}`}><Eye size={15} /><span>{t("admin.viewSummary")}</span></Link><span>{t("admin.originalNotAvailable")}</span>
                           </div>
                         </td>
                       </tr>
@@ -2271,8 +2209,8 @@ function BusinessTable({
                         <td>{item.projectName}</td>
                         <td>{item.brand}</td>
                         <td>{item.amount}</td>
-                        <td><AdminBadge label={item.invoiceStatus} tone={item.status === "PAID" ? "success" : item.status === "PAYMENT_FAILED" ? "danger" : "info"} /></td>
-                        <td><span className="admin-table-secondary">外部系统同步</span></td>
+                        <td><AdminBadge label={displayCopy(item.invoiceStatus, t)} tone={item.status === "PAID" ? "success" : item.status === "PAYMENT_FAILED" ? "danger" : "info"} /></td>
+                        <td><span className="admin-table-secondary">{t("admin.externalSync")}</span></td>
                       </tr>
                     ))}
             </tbody>
@@ -2288,7 +2226,7 @@ function BusinessTable({
                 <AdminBadge
                   label={
                     type === "contracts"
-                      ? detail.contracts.find((entry) => entry.id === item.id)?.status || "-"
+                      ? contractStatusLabel[detail.contracts.find((entry) => entry.id === item.id)?.status || "PENDING_SIGNATURE"]
                       : type === "invoices"
                         ? detail.invoices.find((entry) => entry.id === item.id)?.status || "-"
                         : detail.requests.find((entry) => entry.id === item.id)?.invoiceStatus || "-"
@@ -2303,30 +2241,26 @@ function BusinessTable({
                 />
               </header>
               <dl>
-                <div><dt>项目</dt><dd>{item.projectName}</dd></div>
-                <div><dt>品牌</dt><dd>{item.brand}</dd></div>
-                <div><dt>金额</dt><dd>{item.amount}</dd></div>
+                {type === "contracts" ? (
+                  <div><dt>{t("admin.contractType")}</dt><dd>{contractTypeLabel[(item as Contract).contractType]}</dd></div>
+                ) : type === "requests" ? (
+                  <>
+                    <div><dt>{t("admin.project")}</dt><dd>{item.projectName}</dd></div>
+                    <div><dt>{t("admin.brand")}</dt><dd>{item.brand}</dd></div>
+                  </>
+                ) : null}
+                <div><dt>{t("admin.amountColumn")}</dt><dd>{item.amount}</dd></div>
               </dl>
               {type === "contracts" ? (
                 <div className="admin-business-mobile-actions">
-                  <a href={detail.contracts.find((entry) => entry.id === item.id)?.documentUrl} target="_blank" rel="noreferrer">
-                    <Eye size={14} /> 查看合同
-                  </a>
-                  <a href={detail.contracts.find((entry) => entry.id === item.id)?.documentUrl} download={detail.contracts.find((entry) => entry.id === item.id)?.fileName}>
-                    <Download size={14} /> 下载
-                  </a>
+                  <Link to={`/admin/contracts/${detail.account.id}/${item.id}`}><Eye size={14} /> {t("admin.viewContractSummary")}</Link><span>{t("admin.originalNotAvailable")}</span>
                 </div>
               ) : type === "invoices" ? (
                 <div className="admin-business-mobile-actions">
-                  <a href="/INV-20260723-001-Alex-Ruiz.pdf" target="_blank" rel="noreferrer">
-                    <Eye size={14} /> 查看 Invoice
-                  </a>
-                  <a href="/INV-20260723-001-Alex-Ruiz.pdf" download={`${item.id}.pdf`}>
-                    <Download size={14} /> 下载
-                  </a>
+                  <Link to={`/admin/invoices/${detail.account.id}/${item.id}`}><Eye size={14} /> {t("admin.viewInvoiceSummary")}</Link><span>{t("admin.originalNotAvailable")}</span>
                 </div>
               ) : (
-                <span className="admin-table-secondary">外部系统同步，只读展示</span>
+                <span className="admin-table-secondary">{t("admin.externalSyncReadOnly")}</span>
               )}
             </article>
           ))}
@@ -2360,6 +2294,7 @@ function UserActivityPanel({
   detail: AdminUserDetail;
   audits: AuditEvent[];
 }) {
+  const { t } = useTranslation();
   const loginPagination = useAdminPagination(
     detail.loginHistory,
     `${detail.account.id}|login-history`,
@@ -2375,16 +2310,16 @@ function UserActivityPanel({
   return (
     <div className="admin-detail-grid">
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>登录历史</h2><p>账号最近的访问记录</p></div><History size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.loginHistory")}</h2><p>{t("admin.recentAccess")}</p></div><History size={18} /></header>
         <div className="admin-activity-list">
           {loginPagination.items.map((record) => (
             <article key={record.id}>
               <span className="admin-activity-icon"><CircleUserRound size={15} /></span>
               <div><strong>{record.device}</strong><small>{record.location} · {record.occurredAt}</small></div>
-              <AdminBadge label={record.result === "SUCCESS" ? "成功" : "失败"} tone={record.result === "SUCCESS" ? "success" : "danger"} />
+              <AdminBadge label={t(record.result === "SUCCESS" ? "admin.loginSuccess" : "admin.loginFailure")} tone={record.result === "SUCCESS" ? "success" : "danger"} />
             </article>
           ))}
-          {!detail.loginHistory.length ? <div className="admin-empty">暂无登录记录</div> : null}
+          {!detail.loginHistory.length ? <div className="admin-empty">{t("admin.noLoginHistory")}</div> : null}
         </div>
         <AdminPagination
           totalItems={detail.loginHistory.length}
@@ -2399,15 +2334,15 @@ function UserActivityPanel({
         />
       </section>
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>通知记录</h2><p>站内通知与模拟邮件状态</p></div><Bell size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.notificationHistory")}</h2><p>{t("admin.notificationHistoryDescription")}</p></div><Bell size={18} /></header>
         <div className="admin-activity-list">
           {notificationPagination.items.map((item) => (
             <article key={item.id}>
               <span className="admin-activity-icon"><Mail size={15} /></span>
-              <div><strong>{item.title}</strong><small>{item.createdAt} · 邮件{item.emailStatus === "DELIVERED" ? "已送达" : "排队中"}</small></div>
+              <div><strong>{displayCopy(item.title, t)}</strong><small>{item.createdAt} · {t(item.emailStatus === "DELIVERED" ? "admin.emailDelivered" : "admin.emailQueued")}</small></div>
             </article>
           ))}
-          {!detail.notifications.length ? <div className="admin-empty">暂无通知记录</div> : null}
+          {!detail.notifications.length ? <div className="admin-empty">{t("admin.noNotificationHistory")}</div> : null}
         </div>
         <AdminPagination
           totalItems={detail.notifications.length}
@@ -2422,17 +2357,17 @@ function UserActivityPanel({
         />
       </section>
       <section className="admin-panel admin-detail-wide">
-        <header className="admin-panel-heading"><div><h2>操作记录</h2><p>与该账号相关的审计事件</p></div><Activity size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.activityRecords")}</h2><p>{t("admin.activityDescription")}</p></div><Activity size={18} /></header>
         <div className="admin-audit-compact">
           {auditPagination.items.map((event) => (
             <article key={event.id}>
               <span>{event.occurredAt}</span>
-              <strong>{event.summary}</strong>
-              <small>{event.actorName}</small>
+              <strong>{displayCopy(event.summary, t)}</strong>
+              <small>{event.actorName} · {t(event.module === "CONTRACT" ? "menu.contracts" : event.module === "INVOICE" ? "menu.invoices" : event.module === "PAYMENT" ? "admin.paymentModule" : event.module === "PROFILE" ? "admin.profileModule" : "admin.moduleUser")}</small>
               <AdminBadge label={auditActionLabel[event.action]} />
             </article>
           ))}
-          {!audits.length ? <div className="admin-empty">暂无操作记录</div> : null}
+          {!audits.length ? <div className="admin-empty">{t("admin.noActivityHistory")}</div> : null}
         </div>
         <AdminPagination
           totalItems={audits.length}
@@ -2461,6 +2396,7 @@ function CorrectionModal({
   onClose(): void;
   onSaved(detail: AdminUserDetail, message: string): void;
 }) {
+  const { t } = useTranslation();
   const fields = [
     ["social.profileUrls", "主页链接"],
     ["social.screenshots", "社媒认证截图"],
@@ -2505,38 +2441,38 @@ function CorrectionModal({
 
   return (
     <AdminModal
-      title="退回指定字段"
-      description="用户会收到站内通知和模拟邮件；字段通过对应校验后自动关闭。"
+      title={t("admin.returnSelectedField")}
+      description={t("admin.correctionNotice")}
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="admin-ghost-button" onClick={onClose}>取消</button>
-          <button type="button" className="admin-primary-button" onClick={save}><Mail size={15} /> 发送修改要求</button>
+          <button type="button" className="admin-ghost-button" onClick={onClose}>{t("common.cancel")}</button>
+          <button type="button" className="admin-primary-button" onClick={save}><Mail size={15} /> {t("admin.sendCorrection")}</button>
         </>
       }
     >
-      {error ? <div className="admin-inline-alert">{error}</div> : null}
+      {error ? <div className="admin-inline-alert">{displayCopy(error, t)}</div> : null}
       <div className="admin-form-field">
-        <span>需要修改的字段</span>
-        <AdminSelectControl value={fieldKey} onChange={setFieldKey} label="需要修改的字段" icon={<FileText size={15} />}>
-          {fields.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+        <span>{t("admin.fieldToCorrect")}</span>
+        <AdminSelectControl value={fieldKey} onChange={setFieldKey} label={t("admin.fieldToCorrect")} icon={<FileText size={15} />}>
+          {fields.map(([key, label]) => <option key={key} value={key}>{displayCopy(label, t)}</option>)}
         </AdminSelectControl>
       </div>
       <div className="admin-form-field">
-        <span>退回原因 *</span>
+        <span>{t("admin.correctionReasonRequired")}</span>
         <AdminSelectControl
           value={template}
           onChange={(value) => {
             setTemplate(value);
             if (value) setReason(value);
           }}
-          label="选择退回原因模板"
+          label={t("admin.chooseReasonTemplate")}
           icon={<AlertCircle size={15} />}
         >
-          <option value="">选择原因模板</option>
-          {templates.map((item) => <option key={item} value={item}>{item}</option>)}
+          <option value="">{t("admin.reasonTemplate")}</option>
+          {templates.map((item) => <option key={item} value={item}>{displayCopy(item, t)}</option>)}
         </AdminSelectControl>
-        <textarea value={reason} onChange={(event) => setReason(event.target.value)} placeholder="清楚说明问题和需要用户完成的修改" />
+        <textarea value={reason} onChange={(event) => setReason(event.target.value)} placeholder={t("admin.correctionReasonHint")} />
       </div>
     </AdminModal>
   );
@@ -2555,9 +2491,14 @@ function RevealSensitiveModal({
   onClose(): void;
   onRevealed(value: string, message: string): void;
 }) {
+  const { t } = useTranslation();
   const [reason, setReason] = useState("");
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const reveal = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    setError("");
     try {
       const result = await services.adminUsers.revealSensitive(
         userId,
@@ -2568,30 +2509,33 @@ function RevealSensitiveModal({
       onRevealed(result.data, result.message || "查看已记录");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "无法查看");
+    } finally {
+      setSubmitting(false);
     }
   };
   return (
     <AdminModal
-      title="查看完整敏感信息"
-      description="仅限处理当前用户资料问题，查看行为会记录到审计日志。"
+      title={t("admin.revealSensitive")}
+      description={t("admin.revealNotice")}
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="admin-ghost-button" onClick={onClose}>取消</button>
-          <button type="button" className="admin-primary-button" onClick={reveal}><Eye size={15} /> 查看完整值</button>
+          <button type="button" className="admin-ghost-button" onClick={onClose}>{t("common.cancel")}</button>
+          <button type="button" className="admin-primary-button" onClick={reveal} disabled={submitting}><Eye size={15} /> {t(submitting ? "admin.revealing" : "admin.viewFullValue")}</button>
         </>
       }
     >
-      {error ? <div className="admin-inline-alert">{error}</div> : null}
+      {error ? <div className="admin-inline-alert" role="alert">{displayCopy(error, t)}</div> : null}
       <label className="admin-form-field">
-        <span>查看原因 *</span>
-        <textarea value={reason} onChange={(event) => setReason(event.target.value)} placeholder="填写与当前业务处理直接相关的查看原因" />
+        <span>{t("admin.revealReasonRequired")}</span>
+        <textarea value={reason} onChange={(event) => setReason(event.target.value)} placeholder={t("admin.revealReasonHint")} />
       </label>
     </AdminModal>
   );
 }
 
 export function AdminAuditPage() {
+  const { t } = useTranslation();
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [query, setQuery] = useState("");
   const [action, setAction] = useState<AuditEvent["action"] | "ALL">("ALL");
@@ -2647,61 +2591,43 @@ export function AdminAuditPage() {
     ).entries(),
   ];
 
-  const exportAudit = () => {
-    const csv = [
-      ["时间", "操作者", "对象", "动作", "摘要", "原因"],
-      ...filtered.map((event) => [
-        event.occurredAt,
-        event.actorName,
-        event.subjectName || "-",
-        auditActionLabel[event.action],
-        event.summary,
-        event.reason || "-",
-      ]),
-    ]
-      .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(","))
-      .join("\n");
-    downloadTextFile("comets-audit-logs.csv", csv);
-  };
-
   return (
     <div className="admin-page-stack">
       <PageHeader
         title="操作日志"
-        description="追踪账号、资料、敏感信息和系统配置的关键操作。"
-        actions={<button type="button" className="admin-secondary-button" onClick={exportAudit}><Download size={16} /> 导出日志</button>}
+        description={t("admin.auditDescription")}
       />
       <section className="admin-filter-panel admin-audit-filters">
         <AdminSearchControl value={query} onChange={setQuery} placeholder="搜索操作者、用户、摘要或原因" />
         <AdminSelectControl value={action} onChange={(value) => setAction(value as AuditEvent["action"] | "ALL")} label="筛选操作类型" icon={<Activity size={15} />}>
-          <option value="ALL">全部操作</option>
-          {Object.entries(auditActionLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          <option value="ALL">{t("admin.allActions")}</option>
+          {Object.entries(auditActionLabel).map(([value, label]) => <option key={value} value={value}>{displayCopy(label, t)}</option>)}
         </AdminSelectControl>
         <AdminSelectControl value={actorId} onChange={setActorId} label="筛选操作者" icon={<CircleUserRound size={15} />}>
-          <option value="ALL">全部操作者</option>
+          <option value="ALL">{t("admin.allActors")}</option>
           {actors.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
         </AdminSelectControl>
         <AdminSelectControl value={subjectUserId} onChange={setSubjectUserId} label="筛选用户对象" icon={<Users size={15} />}>
-          <option value="ALL">全部用户对象</option>
+          <option value="ALL">{t("admin.allSubjects")}</option>
           {subjects.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
         </AdminSelectControl>
         <AdminSelectControl value={module} onChange={(value) => setModule(value as AuditEvent["module"] | "ALL")} label="筛选操作模块" icon={<FolderKanban size={15} />}>
-          <option value="ALL">全部模块</option>
-          <option value="AUTH">登录认证</option>
-          <option value="USER">账号管理</option>
-          <option value="PROFILE">用户档案</option>
-          <option value="SECURITY">安全操作</option>
-          <option value="SETTINGS">系统设置</option>
-          <option value="SYNC">外部同步</option>
+          <option value="ALL">{t("admin.allModules")}</option>
+          <option value="AUTH">{t("admin.moduleAuth")}</option>
+          <option value="USER">{t("admin.moduleUser")}</option>
+          <option value="PROFILE">{t("admin.moduleProfile")}</option>
+          <option value="SECURITY">{t("admin.moduleSecurity")}</option>
+          <option value="SETTINGS">{t("admin.moduleSettings")}</option>
+          <option value="SYNC">{t("admin.moduleSync")}</option>
         </AdminSelectControl>
         <AdminDateControl value={dateFrom} onChange={setDateFrom} label="开始日期" />
         <AdminDateControl value={dateTo} onChange={setDateTo} label="结束日期" />
       </section>
       <section className="admin-panel admin-table-panel">
-        <header className="admin-panel-heading"><div><h2>操作记录</h2><p>共 {filtered.length} 条</p></div><History size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.activityRecords")}</h2><p>{t("admin.recordCount", { count: filtered.length })}</p></div><History size={18} /></header>
         <div className="admin-table-scroll">
           <table className="admin-data-table">
-            <thead><tr><th>时间</th><th>操作者</th><th>对象</th><th>动作</th><th>摘要</th><th>原因</th></tr></thead>
+            <thead><tr><th>{t("admin.time")}</th><th>{t("admin.actor")}</th><th>{t("admin.subject")}</th><th>{t("admin.action")}</th><th>{t("admin.summary")}</th><th>{t("admin.reason")}</th></tr></thead>
             <tbody>
               {auditPagination.items.map((event) => (
                 <tr key={event.id}>
@@ -2709,7 +2635,7 @@ export function AdminAuditPage() {
                   <td><strong>{event.actorName}</strong><small className="admin-table-block">{event.actorId}</small></td>
                   <td>{event.subjectName || "-"}</td>
                   <td><AdminBadge label={auditActionLabel[event.action]} /></td>
-                  <td>{event.summary}</td>
+                  <td>{displayCopy(event.summary, t)}</td>
                   <td><span className="admin-table-secondary">{event.reason || "-"}</span></td>
                 </tr>
               ))}
@@ -2719,16 +2645,16 @@ export function AdminAuditPage() {
         <div className="admin-audit-mobile-list">
           {auditPagination.items.map((event) => (
             <article key={event.id}>
-              <header><strong>{event.summary}</strong><AdminBadge label={auditActionLabel[event.action]} /></header>
+              <header><strong>{displayCopy(event.summary, t)}</strong><AdminBadge label={auditActionLabel[event.action]} /></header>
               <dl>
-                <div><dt>时间</dt><dd>{event.occurredAt}</dd></div>
-                <div><dt>操作者</dt><dd>{event.actorName}</dd></div>
-                <div><dt>用户对象</dt><dd>{event.subjectName || "-"}</dd></div>
-                <div><dt>原因</dt><dd>{event.reason || "-"}</dd></div>
+                <div><dt>{t("admin.time")}</dt><dd>{event.occurredAt}</dd></div>
+                <div><dt>{t("admin.actor")}</dt><dd>{event.actorName}</dd></div>
+                <div><dt>{t("admin.subjectUser")}</dt><dd>{event.subjectName || "-"}</dd></div>
+                <div><dt>{t("admin.reason")}</dt><dd>{event.reason || "-"}</dd></div>
               </dl>
             </article>
           ))}
-          {!filtered.length ? <div className="admin-empty">没有符合筛选条件的审计记录</div> : null}
+          {!filtered.length ? <div className="admin-empty">{t("admin.noAuditRecords")}</div> : null}
         </div>
         <AdminPagination
           totalItems={filtered.length}
@@ -2747,6 +2673,7 @@ export function AdminAuditPage() {
 }
 
 export function AdminSettingsPage() {
+  const { t } = useTranslation();
   const { session } = useAdminSession();
   const [settings, setSettings] = useState<AdminSettings | null>(null);
   const [toast, setToast] = useState("");
@@ -2757,7 +2684,7 @@ export function AdminSettingsPage() {
   }, []);
 
   if (!settings) {
-    return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> 正在加载系统设置</div></div>;
+    return <div className="admin-page-stack"><div className="admin-loading"><RefreshCcw className="spin" size={20} /> {t("admin.settingsLoading")}</div></div>;
   }
 
   const save = async () => {
@@ -2784,51 +2711,47 @@ export function AdminSettingsPage() {
   return (
     <div className="admin-page-stack">
       <PageHeader
-        title="系统设置"
-        description="仅配置用户注册、邀请、安全规则与资料退回模板。"
+        title={t("admin.settingsTitle")}
+        description={t("admin.settingsDescription")}
         actions={
           <button type="button" className="admin-primary-button" onClick={save} disabled={saving}>
-            {saving ? <RefreshCcw className="spin" size={15} /> : <Check size={15} />} 保存设置
+            {saving ? <RefreshCcw className="spin" size={15} /> : <Check size={15} />} {t("admin.saveSettings")}
           </button>
         }
       />
       <aside className="admin-scope-notice">
         <ShieldCheck size={18} />
-        <div><strong>支付业务不在此配置</strong><span>付款渠道、合同、Invoice、审核和付款由外部系统负责。</span></div>
+        <div><strong>{t("admin.paymentSettingsNotice")}</strong><span>{t("admin.paymentExternalNotice")}</span></div>
       </aside>
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>注册与邀请</h2><p>控制公开注册和邀请链接的有效期</p></div><UserPlus size={18} /></header>
-        <div className="admin-settings-grid">
+        <header className="admin-panel-heading"><div><h2>{t("admin.registrationSettings")}</h2><p>{t("admin.registrationSettingsDescription")}</p></div><CircleUserRound size={18} /></header>
+        <div className="admin-settings-grid admin-settings-grid-single">
           <label className="admin-setting-toggle">
-            <span><strong>开放创作者自主注册</strong><small>公开注册始终创建 CREATOR 账号</small></span>
+            <span><strong>{t("admin.allowCreatorRegistration")}</strong><small>{t("admin.creatorRegistrationOnly")}</small></span>
             <input type="checkbox" checked={settings.registrationEnabled} onChange={(event) => setSettings({ ...settings, registrationEnabled: event.target.checked })} />
           </label>
-          <label className="admin-form-field">
-            <span>邀请有效期（天）</span>
-            <input type="number" min={1} max={30} value={settings.invitationValidDays} onChange={(event) => setSettings({ ...settings, invitationValidDays: Number(event.target.value) })} />
-          </label>
         </div>
       </section>
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>密码规则</h2><p>适用于管理员创建和用户注册</p></div><KeyRound size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.passwordRules")}</h2><p>{t("admin.passwordRulesDescription")}</p></div><KeyRound size={18} /></header>
         <div className="admin-settings-grid">
-          <label className="admin-form-field"><span>最少字符</span><input type="number" min={6} max={20} value={settings.passwordMinLength} onChange={(event) => setSettings({ ...settings, passwordMinLength: Number(event.target.value) })} /></label>
-          <label className="admin-form-field"><span>最多字符</span><input type="number" min={8} max={64} value={settings.passwordMaxLength} onChange={(event) => setSettings({ ...settings, passwordMaxLength: Number(event.target.value) })} /></label>
-          <label className="admin-setting-check"><input type="checkbox" checked={settings.requireUppercase} onChange={(event) => setSettings({ ...settings, requireUppercase: event.target.checked })} /><span>必须包含大写字母</span></label>
-          <label className="admin-setting-check"><input type="checkbox" checked={settings.requireLowercase} onChange={(event) => setSettings({ ...settings, requireLowercase: event.target.checked })} /><span>必须包含小写字母</span></label>
-          <label className="admin-setting-check"><input type="checkbox" checked={settings.requireNumber} onChange={(event) => setSettings({ ...settings, requireNumber: event.target.checked })} /><span>必须包含数字</span></label>
+          <label className="admin-form-field"><span>{t("admin.minCharacters")}</span><input type="number" min={6} max={20} value={settings.passwordMinLength} onChange={(event) => setSettings({ ...settings, passwordMinLength: Number(event.target.value) })} /></label>
+          <label className="admin-form-field"><span>{t("admin.maxCharacters")}</span><input type="number" min={8} max={64} value={settings.passwordMaxLength} onChange={(event) => setSettings({ ...settings, passwordMaxLength: Number(event.target.value) })} /></label>
+          <label className="admin-setting-check"><input type="checkbox" checked={settings.requireUppercase} onChange={(event) => setSettings({ ...settings, requireUppercase: event.target.checked })} /><span>{t("admin.requireUppercase")}</span></label>
+          <label className="admin-setting-check"><input type="checkbox" checked={settings.requireLowercase} onChange={(event) => setSettings({ ...settings, requireLowercase: event.target.checked })} /><span>{t("admin.requireLowercase")}</span></label>
+          <label className="admin-setting-check"><input type="checkbox" checked={settings.requireNumber} onChange={(event) => setSettings({ ...settings, requireNumber: event.target.checked })} /><span>{t("admin.requireNumber")}</span></label>
         </div>
       </section>
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>协议链接</h2><p>注册页面展示的法律协议地址</p></div><FileText size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.agreementLinks")}</h2><p>{t("admin.agreementLinksDescription")}</p></div><FileText size={18} /></header>
         <div className="admin-settings-links">
-          <label className="admin-form-field"><span>服务协议</span><input value={settings.serviceAgreementUrl} onChange={(event) => setSettings({ ...settings, serviceAgreementUrl: event.target.value })} /></label>
-          <label className="admin-form-field"><span>隐私政策</span><input value={settings.privacyPolicyUrl} onChange={(event) => setSettings({ ...settings, privacyPolicyUrl: event.target.value })} /></label>
-          <label className="admin-form-field"><span>数据处理协议</span><input value={settings.dataProcessingUrl} onChange={(event) => setSettings({ ...settings, dataProcessingUrl: event.target.value })} /></label>
+          <label className="admin-form-field"><span>{t("auth.terms")}</span><input value={settings.serviceAgreementUrl} onChange={(event) => setSettings({ ...settings, serviceAgreementUrl: event.target.value })} /></label>
+          <label className="admin-form-field"><span>{t("auth.privacy")}</span><input value={settings.privacyPolicyUrl} onChange={(event) => setSettings({ ...settings, privacyPolicyUrl: event.target.value })} /></label>
+          <label className="admin-form-field"><span>{t("auth.dataProcessing")}</span><input value={settings.dataProcessingUrl} onChange={(event) => setSettings({ ...settings, dataProcessingUrl: event.target.value })} /></label>
         </div>
       </section>
       <section className="admin-panel">
-        <header className="admin-panel-heading"><div><h2>资料退回原因模板</h2><p>管理员仍可在退回时补充具体说明</p></div><SlidersHorizontal size={18} /></header>
+        <header className="admin-panel-heading"><div><h2>{t("admin.correctionTemplates")}</h2><p>{t("admin.correctionTemplatesDescription")}</p></div><SlidersHorizontal size={18} /></header>
         <div className="admin-reason-list">
           {settings.correctionReasonTemplates.map((reason, index) => (
             <label key={index}><span>{index + 1}</span><input value={reason} onChange={(event) => updateReason(index, event.target.value)} /></label>

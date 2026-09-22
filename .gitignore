@@ -8,6 +8,9 @@ dist/
 qa/
 output/
 tmp/
+docs/competitive-analysis-images/
+feishu_search_auth.png
+lark-requirements-append.xml
 
 # Logs and runtime files
 *.log

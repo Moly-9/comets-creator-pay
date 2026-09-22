@@ -4,6 +4,10 @@ import {
   invoices as seedInvoices,
   requests as seedRequests,
 } from "./data";
+import { linkInvoicesToContracts, sumInvoiceAmounts } from "./payment-relations";
+import { sortInvoicesByUpdatedAtDescending } from "./creator-home";
+import { DEMO_INVITATION_CODE } from "./registration-demo";
+import { validateAccountPassword } from "./auth-validation";
 import type {
   AccountStatus,
   AdminBusinessData,
@@ -13,6 +17,7 @@ import type {
   AuditAction,
   AuditEvent,
   Contract,
+  ContractType,
   CorrectionRequest,
   ExternalBusinessEvent,
   ExternalSyncIssue,
@@ -99,8 +104,18 @@ interface ExternalRecordState {
   payload: Record<string, unknown>;
 }
 
+interface PasswordResetRecord {
+  id: string;
+  userId: string;
+  token: string;
+  requestedAt: number;
+  expiresAt: number;
+  requestedBy: string;
+  usedAt?: number;
+}
+
 interface AdminStoreState {
-  version: 2;
+  version: 5;
   users: UserAccount[];
   credentials: Record<string, string>;
   profiles: Record<string, UserProfile>;
@@ -114,6 +129,8 @@ interface AdminStoreState {
   syncIssues: ExternalSyncIssue[];
   processedEventIds: string[];
   externalRecords: ExternalRecordState[];
+  archivedExternalRecords: ExternalRecordState[];
+  passwordResets: PasswordResetRecord[];
 }
 
 const clone = <T,>(value: T): T => structuredClone(value);
@@ -136,6 +153,12 @@ const daysFromNow = (days: number) =>
 const idSuffix = () =>
   `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
+const maskEmail = (email: string) => {
+  const [local = "", domain = ""] = email.trim().toLowerCase().split("@");
+  if (!domain) return "***";
+  return `${local.slice(0, 1) || "*"}***@${domain}`;
+};
+
 const invoiceStatusLabel: Record<Invoice["status"], string> = {
   PENDING_CONFIRMATION: "待确认",
   DRAFT_SIGNATURE: "待确认",
@@ -146,10 +169,32 @@ const invoiceStatusLabel: Record<Invoice["status"], string> = {
   PAID: "已付款",
 };
 
-const deriveExternalContractStatus = (
-  status: Invoice["status"],
-): Contract["status"] =>
-  status === "PAID" ? "已付款" : "请款中";
+const CONTRACT_LIFECYCLE_STATUSES: Contract["status"][] = [
+  "PENDING_SIGNATURE",
+  "ACTIVE",
+  "EXPIRED",
+];
+
+const CONTRACT_TYPES: ContractType[] = ["INDEPENDENT", "FRAMEWORK", "IO"];
+
+const isContractType = (value: unknown): value is ContractType =>
+  typeof value === "string" && CONTRACT_TYPES.includes(value as ContractType);
+
+const migrateContractType = (value: unknown): ContractType =>
+  isContractType(value) ? value : "INDEPENDENT";
+
+const isContractLifecycleStatus = (
+  value: unknown,
+): value is Contract["status"] =>
+  typeof value === "string" &&
+  CONTRACT_LIFECYCLE_STATUSES.includes(value as Contract["status"]);
+
+const migrateContractLifecycleStatus = (value: unknown): Contract["status"] => {
+  if (isContractLifecycleStatus(value)) return value;
+  if (value === "未请款") return "PENDING_SIGNATURE";
+  if (value === "请款中" || value === "已付款") return "ACTIVE";
+  return "PENDING_SIGNATURE";
+};
 
 const createCreatorProfile = ({
   id,
@@ -344,6 +389,7 @@ const createSeedExternalContract = ({
   amount,
   effectiveDate,
   servicePeriod,
+  status,
   updatedAt,
 }: {
   creatorId: string;
@@ -355,6 +401,7 @@ const createSeedExternalContract = ({
   amount: string;
   effectiveDate: string;
   servicePeriod: string;
+  status: Contract["status"];
   updatedAt: string;
 }): ExternalRecordState => ({
   creatorId,
@@ -363,6 +410,7 @@ const createSeedExternalContract = ({
   version: 1,
   occurredAt: `${updatedAt} 10:00`,
   payload: {
+    contractType: "INDEPENDENT",
     orderId,
     projectId,
     projectName,
@@ -371,7 +419,7 @@ const createSeedExternalContract = ({
     amount,
     effectiveDate,
     servicePeriod,
-    status: "未请款",
+    status,
     updatedAt,
   },
 });
@@ -386,7 +434,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Lumière Paris",
     amount: "EUR 3,600",
     effectiveDate: "2026-07-03",
-    servicePeriod: "2026-07-03 至 2026-08-15",
+    servicePeriod: "2026-07-03 至 2026-10-15",
+    status: "ACTIVE",
     updatedAt: "2026-07-03",
   }),
   createSeedExternalContract({
@@ -398,7 +447,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Maison Élan",
     amount: "EUR 2,400",
     effectiveDate: "2026-07-12",
-    servicePeriod: "2026-07-12 至 2026-08-20",
+    servicePeriod: "2026-07-12 至 2026-10-20",
+    status: "ACTIVE",
     updatedAt: "2026-07-12",
   }),
   createSeedExternalContract({
@@ -409,8 +459,9 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     projectName: "Veloce 城市出行体验",
     brand: "Veloce",
     amount: "EUR 1,800",
-    effectiveDate: "2026-07-26",
-    servicePeriod: "2026-07-26 至 2026-08-31",
+    effectiveDate: "2026-09-24",
+    servicePeriod: "2026-09-24 至 2026-10-31",
+    status: "PENDING_SIGNATURE",
     updatedAt: "2026-07-26",
   }),
   createSeedExternalContract({
@@ -422,7 +473,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Northpeak",
     amount: "GBP 3,200",
     effectiveDate: "2026-06-29",
-    servicePeriod: "2026-06-29 至 2026-08-05",
+    servicePeriod: "2026-06-29 至 2026-10-05",
+    status: "ACTIVE",
     updatedAt: "2026-06-29",
   }),
   createSeedExternalContract({
@@ -435,6 +487,7 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     amount: "GBP 2,750",
     effectiveDate: "2026-07-10",
     servicePeriod: "2026-07-10 至 2026-08-18",
+    status: "EXPIRED",
     updatedAt: "2026-07-10",
   }),
   createSeedExternalContract({
@@ -445,8 +498,9 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     projectName: "SoundWave 无线耳机开箱",
     brand: "SoundWave",
     amount: "GBP 1,950",
-    effectiveDate: "2026-07-21",
-    servicePeriod: "2026-07-21 至 2026-08-28",
+    effectiveDate: "2026-09-21",
+    servicePeriod: "2026-09-21 至 2026-10-28",
+    status: "PENDING_SIGNATURE",
     updatedAt: "2026-07-21",
   }),
   createSeedExternalContract({
@@ -459,6 +513,7 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     amount: "JPY 620,000",
     effectiveDate: "2026-07-05",
     servicePeriod: "2026-07-05 至 2026-08-25",
+    status: "EXPIRED",
     updatedAt: "2026-07-05",
   }),
   createSeedExternalContract({
@@ -470,7 +525,8 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     brand: "Kumo Travel",
     amount: "JPY 480,000",
     effectiveDate: "2026-07-19",
-    servicePeriod: "2026-07-19 至 2026-09-05",
+    servicePeriod: "2026-07-19 至 2026-10-05",
+    status: "ACTIVE",
     updatedAt: "2026-07-19",
   }),
   createSeedExternalContract({
@@ -483,6 +539,7 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     amount: "EUR 3,100",
     effectiveDate: "2026-07-14",
     servicePeriod: "2026-07-14 至 2026-08-30",
+    status: "EXPIRED",
     updatedAt: "2026-07-14",
   }),
   createSeedExternalContract({
@@ -493,8 +550,9 @@ const seedExternalContractRecords: ExternalRecordState[] = [
     projectName: "Casa Verde 智能家居体验",
     brand: "Casa Verde",
     amount: "EUR 2,250",
-    effectiveDate: "2026-07-28",
-    servicePeriod: "2026-07-28 至 2026-09-10",
+    effectiveDate: "2026-09-26",
+    servicePeriod: "2026-09-26 至 2026-11-10",
+    status: "PENDING_SIGNATURE",
     updatedAt: "2026-07-28",
   }),
 ];
@@ -638,22 +696,67 @@ const seedExternalBusinessRecords = [
   ...seedExternalInvoiceRecords,
 ];
 
-const mergeSeedExternalRecords = (
-  storedRecords?: ExternalRecordState[],
-): ExternalRecordState[] => {
-  const records = new Map<string, ExternalRecordState>();
-  const keyFor = (record: ExternalRecordState) =>
-    `${record.creatorId}:${record.resourceType}:${record.externalRecordId}`;
+const externalRecordKey = (record: ExternalRecordState) =>
+  `${record.creatorId}:${record.resourceType}:${record.externalRecordId}`;
 
-  seedExternalBusinessRecords.forEach((record) => {
-    records.set(keyFor(record), clone(record));
+const mergeSeedExternalRecords = (
+  users: UserAccount[],
+  storedRecords?: ExternalRecordState[],
+  storedArchive?: ExternalRecordState[],
+  enforceCanonicalSeedContracts = false,
+): Pick<AdminStoreState, "externalRecords" | "archivedExternalRecords"> => {
+  const pendingIds = new Set(users.filter((user) => user.role === "CREATOR" && user.verificationStatus === "PENDING").map((user) => user.id));
+  const archived = new Map<string, ExternalRecordState>();
+  seedExternalBusinessRecords.filter((record) => pendingIds.has(record.creatorId)).forEach((record) => {
+    archived.set(externalRecordKey(record), clone(record));
   });
-  if (Array.isArray(storedRecords)) {
-    storedRecords.forEach((record) => {
-      records.set(keyFor(record), clone(record));
-    });
-  }
-  return [...records.values()];
+  storedArchive?.forEach((record) => archived.set(externalRecordKey(record), clone(record)));
+  const records = new Map<string, ExternalRecordState>();
+  seedExternalBusinessRecords.filter((record) => !archived.has(externalRecordKey(record))).forEach((record) => {
+    records.set(externalRecordKey(record), clone(record));
+  });
+  storedRecords?.forEach((record) => {
+    const key = externalRecordKey(record);
+    if (pendingIds.has(record.creatorId)) {
+      archived.set(key, clone(record));
+    } else if (!archived.has(key) || record.version > archived.get(key)!.version) {
+      records.set(key, clone(record));
+    }
+  });
+  const canonicalSeedContracts = new Map(
+    seedExternalContractRecords.map((record) => [
+      externalRecordKey(record),
+      record.payload,
+    ]),
+  );
+  const migrateContractRecord = (record: ExternalRecordState, key: string) => {
+    if (record.resourceType !== "CONTRACT") return;
+    const canonical = canonicalSeedContracts.get(key);
+    if (canonical && enforceCanonicalSeedContracts) {
+      record.payload = {
+        ...record.payload,
+        contractType: migrateContractType(canonical.contractType),
+        effectiveDate: canonical.effectiveDate,
+        servicePeriod: canonical.servicePeriod,
+        status: canonical.status,
+      };
+      return;
+    }
+    record.payload = {
+      ...record.payload,
+      contractType: migrateContractType(record.payload.contractType),
+      status: migrateContractLifecycleStatus(record.payload.status),
+    };
+  };
+  records.forEach(migrateContractRecord);
+  archived.forEach((record) => {
+    if (record.resourceType !== "CONTRACT") return;
+    record.payload = {
+      ...record.payload,
+      contractType: migrateContractType(record.payload.contractType),
+    };
+  });
+  return { externalRecords: [...records.values()], archivedExternalRecords: [...archived.values()] };
 };
 
 const defaultSettings: AdminSettings = {
@@ -676,7 +779,7 @@ const defaultSettings: AdminSettings = {
 };
 
 const createSeedState = (): AdminStoreState => ({
-  version: 2,
+  version: 5,
   users: clone(seedUsers),
   credentials: {
     "ADMIN-001": ADMIN_DEMO_CREDENTIALS.password,
@@ -799,7 +902,8 @@ const createSeedState = (): AdminStoreState => ({
     },
   ],
   processedEventIds: [],
-  externalRecords: clone(seedExternalBusinessRecords),
+  passwordResets: [],
+  ...mergeSeedExternalRecords(seedUsers),
 });
 
 export class MockAdminStore {
@@ -825,14 +929,28 @@ export class MockAdminStore {
       > & {
         version?: number;
       };
-      if (parsed.version === 2) {
+      if (parsed.version === 5 || parsed.version === 4 || parsed.version === 3) {
+        const users = Array.isArray(parsed.users) ? parsed.users : clone(seedUsers);
         return {
           ...createSeedState(),
           ...parsed,
-          version: 2,
+          version: 5,
+          users,
           sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
           invitations: Array.isArray(parsed.invitations) ? parsed.invitations : [],
-          externalRecords: mergeSeedExternalRecords(parsed.externalRecords),
+          ...mergeSeedExternalRecords(users, parsed.externalRecords, parsed.archivedExternalRecords),
+        };
+      }
+      if (parsed.version === 2) {
+        const users = Array.isArray(parsed.users) ? parsed.users : clone(seedUsers);
+        return {
+          ...createSeedState(),
+          ...parsed,
+          version: 5,
+          users,
+          sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+          invitations: Array.isArray(parsed.invitations) ? parsed.invitations : [],
+          ...mergeSeedExternalRecords(users, parsed.externalRecords, undefined, true),
         };
       }
       if (parsed.version === 1) {
@@ -840,10 +958,10 @@ export class MockAdminStore {
         return {
           ...createSeedState(),
           ...parsed,
-          version: 2,
+          version: 5,
           users,
           sessions: [],
-          externalRecords: mergeSeedExternalRecords(parsed.externalRecords),
+          ...mergeSeedExternalRecords(users, parsed.externalRecords, undefined, true),
           invitations: users
             .filter((user) => user.invitationStatus === "PENDING")
             .map((user) => ({
@@ -1046,9 +1164,120 @@ export class MockAdminStore {
     return session;
   }
 
-  register(name: string, email: string, password: string): Session {
+  private issuePasswordReset(account: UserAccount, requestedBy: string) {
+    const now = Date.now();
+    const latest = [...this.state.passwordResets]
+      .filter((item) => item.userId === account.id && !item.usedAt)
+      .sort((a, b) => b.requestedAt - a.requestedAt)[0];
+    if (latest && latest.requestedBy === account.id && now - latest.requestedAt < 60_000) {
+      return {
+        token: latest.token,
+        retryAfterSeconds: Math.max(1, Math.ceil((60_000 - (now - latest.requestedAt)) / 1000)),
+      };
+    }
+    this.state.passwordResets.forEach((item) => {
+      if (item.userId === account.id && !item.usedAt) item.usedAt = now;
+    });
+    const reset: PasswordResetRecord = {
+      id: `RESET-${idSuffix()}`,
+      userId: account.id,
+      token: `reset_${idSuffix()}_${Math.random().toString(36).slice(2, 10)}`,
+      requestedAt: now,
+      expiresAt: now + 30 * 60_000,
+      requestedBy,
+    };
+    this.state.passwordResets.unshift(reset);
+    this.notify(
+      account.id,
+      "PASSWORD_RESET",
+      "密码重置邮件已发送",
+      "请在 30 分钟内通过邮件中的一次性安全链接重新设置登录密码。",
+    );
+    this.audit(
+      requestedBy,
+      "PASSWORD_RESET_SENT",
+      "SECURITY",
+      "发送模拟密码重置邮件",
+      { subjectUserId: account.id },
+    );
+    this.save();
+    return { token: reset.token, retryAfterSeconds: 60 };
+  }
+
+  requestPasswordReset(email: string) {
+    const normalized = email.trim().toLowerCase();
+    const account = this.state.users.find((item) => item.email.toLowerCase() === normalized);
+    const eligible = account
+      && account.status === "ACTIVE"
+      && account.invitationStatus !== "PENDING"
+      && account.invitationStatus !== "EXPIRED";
+    if (!eligible) {
+      return {
+        accepted: true as const,
+        retryAfterSeconds: 60,
+        maskedEmail: maskEmail(normalized),
+      };
+    }
+    const issued = this.issuePasswordReset(account, account.id);
+    return {
+      accepted: true as const,
+      retryAfterSeconds: issued.retryAfterSeconds,
+      maskedEmail: maskEmail(account.email),
+      demoToken: issued.token,
+    };
+  }
+
+  verifyPasswordReset(token: string): {
+    valid: boolean;
+    maskedEmail?: string;
+    reason?: "EXPIRED" | "USED" | "INVALID";
+  } {
+    const reset = this.state.passwordResets.find((item) => item.token === token);
+    if (!reset) return { valid: false, reason: "INVALID" };
+    if (reset.usedAt) return { valid: false, reason: "USED" };
+    if (reset.expiresAt <= Date.now()) return { valid: false, reason: "EXPIRED" };
+    const account = this.state.users.find((item) => item.id === reset.userId);
+    if (!account || account.status !== "ACTIVE") return { valid: false, reason: "INVALID" };
+    return { valid: true, maskedEmail: maskEmail(account.email) };
+  }
+
+  completePasswordReset(token: string, newPassword: string) {
+    const reset = this.state.passwordResets.find((item) => item.token === token);
+    const verification = this.verifyPasswordReset(token);
+    if (!reset || !verification.valid) throw new Error("密码重置链接已失效，请重新申请");
+    if (this.state.credentials[reset.userId] === newPassword) {
+      throw new Error("新密码不能与当前密码相同");
+    }
+    const validation = validateAccountPassword(newPassword);
+    if (validation) throw new Error(validation);
+    const now = Date.now();
+    this.state.credentials[reset.userId] = newPassword;
+    this.state.sessions = this.state.sessions.filter((item) => item.userId !== reset.userId);
+    this.state.passwordResets.forEach((item) => {
+      if (item.userId === reset.userId && !item.usedAt) item.usedAt = now;
+    });
+    this.notify(
+      reset.userId,
+      "PASSWORD_RESET",
+      "登录密码已更新",
+      "账号密码已成功修改，其他设备上的登录状态已失效。",
+    );
+    this.audit(
+      reset.userId,
+      "PASSWORD_RESET_COMPLETED",
+      "SECURITY",
+      "通过一次性链接完成密码重置并撤销全部会话",
+      { subjectUserId: reset.userId },
+    );
+    this.save();
+  }
+
+  register(name: string, email: string, password: string, invitationCode: string): Session {
     if (!this.state.settings.registrationEnabled) {
       throw new Error("当前暂未开放自主注册");
+    }
+    if (invitationCode.trim() !== DEMO_INVITATION_CODE) {
+      throw new Error("邀请码无效，请使用页面提示的演示邀请码");
     }
     if (
       this.state.users.some(
@@ -1205,20 +1434,28 @@ export class MockAdminStore {
     );
   }
 
-  getUserDetail(userId: string): AdminUserDetail {
+  getUserDetail(userId: string, currentBusiness?: {
+    contracts: Contract[];
+    invoices: Invoice[];
+    profile: UserProfile;
+  }): AdminUserDetail {
     const account = this.requireUser(userId);
     const isPrimaryCreator = userId === PRIMARY_CREATOR_ID;
     const records = this.state.externalRecords.filter(
       (record) => record.creatorId === userId,
     );
     const contractMap = new Map(
-      (isPrimaryCreator ? clone(seedContracts) : []).map((contract) => [
+      (isPrimaryCreator ? clone(currentBusiness?.contracts || seedContracts) : []).map((contract) => [
         contract.id,
-        contract,
+        {
+          ...contract,
+          creatorId: userId,
+          contractType: migrateContractType(contract.contractType),
+        },
       ]),
     );
     const invoiceMap = new Map(
-      (isPrimaryCreator ? clone(seedInvoices) : []).map((invoice) => [
+      (isPrimaryCreator ? clone(currentBusiness?.invoices || seedInvoices) : []).map((invoice) => [
         invoice.id,
         invoice,
       ]),
@@ -1233,12 +1470,14 @@ export class MockAdminStore {
           ...fallback,
           ...(payload as Partial<Contract>),
           id: record.externalRecordId,
+          creatorId: userId,
           projectId: String(payload.projectId || record.externalRecordId),
           projectName: String(payload.projectName),
           campaignName: String(payload.campaignName || payload.projectName),
           brand: String(payload.brand),
           creatorName: account.name,
           amount: String(payload.amount),
+          contractType: migrateContractType(payload.contractType),
           updatedAt: String(payload.updatedAt || record.occurredAt),
         });
       });
@@ -1252,11 +1491,16 @@ export class MockAdminStore {
           ...fallback,
           ...(payload as Partial<Invoice>),
           id: record.externalRecordId,
+          invoiceId: `invoice:${userId}:${record.externalRecordId}`,
+          invoiceNumber: record.externalRecordId,
+          creatorId: userId,
+          contractId: typeof payload.contractId === "string" ? payload.contractId : undefined,
           projectId: String(payload.projectId || record.externalRecordId),
           projectName: String(payload.projectName),
           brand: String(payload.brand),
           amount: String(payload.amount),
           channel: "Airwallex",
+          invoiceFrom: String(payload.invoiceFrom || account.name),
           updatedAt: String(payload.updatedAt || record.occurredAt),
         });
       });
@@ -1279,49 +1523,39 @@ export class MockAdminStore {
           );
         }
       });
-    const invoices = [...invoiceMap.values()];
-    const contracts = [...contractMap.values()].map((contract) => {
-      const invoice = invoices.find(
-        (item) =>
-          item.projectId === contract.projectId ||
-          item.projectName.normalize("NFKC").trim() ===
-            contract.projectName.normalize("NFKC").trim(),
-      );
-      return invoice
-        ? { ...contract, status: deriveExternalContractStatus(invoice.status) }
-        : contract;
-    });
+    // Pending verification has no active business data, including on legacy deep links.
+    if (account.verificationStatus === "PENDING") {
+      contractMap.clear();
+      invoiceMap.clear();
+    }
+    const contracts = [...contractMap.values()];
+    const invoices = linkInvoicesToContracts([...invoiceMap.values()], contracts, userId);
     const requestMap = new Map(
-      (isPrimaryCreator ? clone(seedRequests) : []).map((request) => [
+      (isPrimaryCreator ? clone(seedRequests) : []).filter((request) =>
+        invoices.some((invoice) => invoice.contractId && request.contractIds.includes(invoice.contractId)),
+      ).map((request) => [
         request.id,
         request,
       ]),
     );
     invoices.forEach((invoice) => {
-      const contract = contracts.find(
-        (item) =>
-          item.projectId === invoice.projectId ||
-          item.projectName.normalize("NFKC").trim() ===
-            invoice.projectName.normalize("NFKC").trim(),
-      );
+      const contract = contracts.find((item) => item.id === invoice.contractId);
       if (!contract) return;
-      const existing = [...requestMap.values()].find(
-        (request) =>
-          request.invoiceIds.includes(invoice.id) ||
-          request.projectName.normalize("NFKC").trim() ===
-            invoice.projectName.normalize("NFKC").trim(),
-      );
+      const existing = [...requestMap.values()].find((request) => request.contractIds.includes(contract.id));
+      const projectInvoices = invoices.filter((item) => item.contractId === contract.id);
+      const invoiceIds = projectInvoices.map((item) => item.id);
+      const latest = projectInvoices.find((item) => item.status === "PAYMENT_FAILED") || sortInvoicesByUpdatedAtDescending(projectInvoices)[0];
       const request: RequestProject = {
         id: existing?.id || `REQ-${invoice.projectId}`,
         projectName: invoice.projectName,
         brand: invoice.brand,
-        amount: invoice.amount,
-        status: invoice.status,
+        amount: sumInvoiceAmounts(projectInvoices),
+        status: latest.status,
         contractIds: [contract.id],
-        invoiceIds: [invoice.id],
-        contractStatus: deriveExternalContractStatus(invoice.status),
-        invoiceStatus: invoiceStatusLabel[invoice.status],
-        updatedAt: invoice.updatedAt,
+        invoiceIds,
+        contractStatus: contract.status,
+        invoiceStatus: invoiceStatusLabel[latest.status],
+        updatedAt: latest.updatedAt,
         progress: existing?.progress || [],
         issues: existing?.issues || [],
       };
@@ -1333,7 +1567,7 @@ export class MockAdminStore {
       .at(-1);
     return {
       account: clone(account),
-      profile: this.getProfile(userId),
+      profile: isPrimaryCreator && currentBusiness ? clone(currentBusiness.profile) : this.getProfile(userId),
       corrections: clone(
         this.state.corrections.filter((item) => item.userId === userId),
       ),
@@ -1351,12 +1585,16 @@ export class MockAdminStore {
     };
   }
 
-  listAllBusinessData(): AdminBusinessData {
+  listAllBusinessData(currentBusiness?: {
+    contracts: Contract[];
+    invoices: Invoice[];
+    profile: UserProfile;
+  }): AdminBusinessData {
     return this.state.users
       .filter((user) => user.role === "CREATOR")
       .reduce<AdminBusinessData>(
         (result, creator) => {
-          const detail = this.getUserDetail(creator.id);
+          const detail = this.getUserDetail(creator.id, creator.id === PRIMARY_CREATOR_ID ? currentBusiness : undefined);
           const creatorSummary = {
             id: creator.id,
             name: creator.name,
@@ -1457,7 +1695,7 @@ export class MockAdminStore {
     userIds: string[],
     status: AccountStatus,
     actorId: string,
-    reason: string,
+    reason = "",
   ) {
     this.requirePermission(actorId, "USER_MANAGE");
     if (status === "DISABLED" && userIds.includes(actorId)) {
@@ -1601,6 +1839,13 @@ export class MockAdminStore {
     const account = this.requireUser(userId);
     const before = account.verificationStatus;
     account.verificationStatus = status;
+    if (status === "PENDING") {
+      const moved = this.state.externalRecords.filter((record) => record.creatorId === userId);
+      const archive = new Map(this.state.archivedExternalRecords.map((record) => [externalRecordKey(record), record]));
+      moved.forEach((record) => archive.set(externalRecordKey(record), record));
+      this.state.archivedExternalRecords = [...archive.values()];
+      this.state.externalRecords = this.state.externalRecords.filter((record) => record.creatorId !== userId);
+    }
     const profile = this.state.profiles[userId];
     if (profile) profile.social.verificationStatus = status;
     this.refreshSessions(account);
@@ -1623,22 +1868,8 @@ export class MockAdminStore {
   resetPassword(userId: string, actorId: string) {
     this.requirePermission(actorId, "USER_MANAGE");
     const account = this.requireUser(userId);
-    this.state.credentials[userId] =
-      account.role === "ADMIN" ? "Admin2026" : "Creator2026";
-    this.notify(
-      userId,
-      "PASSWORD_RESET",
-      "密码重置邮件已发送",
-      "请通过邮件中的安全链接重新设置登录密码。",
-    );
-    this.audit(
-      actorId,
-      "PASSWORD_RESET_SENT",
-      "SECURITY",
-      "发送模拟密码重置邮件",
-      { subjectUserId: userId },
-    );
-    this.save();
+    if (account.status !== "ACTIVE") throw new Error("账号已停用，启用后才能发送重置邮件");
+    this.issuePasswordReset(account, actorId);
   }
 
   createCorrection(
@@ -1731,6 +1962,18 @@ export class MockAdminStore {
     );
     this.save();
     return values[fieldKey];
+  }
+
+  recordCreatorAction(
+    creatorId: string,
+    module: "PROFILE" | "CONTRACT" | "INVOICE" | "PAYMENT",
+    summary: string,
+  ) {
+    const account = this.requireUser(creatorId);
+    if (account.role !== "CREATOR") throw new Error("操作记录的用户不是达人");
+    // The service passes only fixed descriptions and public Invoice numbers.
+    this.audit(creatorId, "CREATOR_BUSINESS_ACTION", module, summary, { subjectUserId: creatorId });
+    this.save();
   }
 
   exportMasked(filters: AdminUserFilters, actorId: string) {
@@ -1842,6 +2085,67 @@ export class MockAdminStore {
     if (this.state.processedEventIds.includes(event.eventId)) {
       return { accepted: true, duplicate: true };
     }
+    if (
+      event.resourceType === "CONTRACT" &&
+      !isContractLifecycleStatus(event.payload.status)
+    ) {
+      this.state.syncIssues.unshift({
+        id: `SYNC-ISSUE-${idSuffix()}`,
+        eventId: event.eventId,
+        creatorId: event.creatorId,
+        resourceType: event.resourceType,
+        message: "外部合同事件的生命周期状态无效，本次同步已拒绝。",
+        occurredAt: event.occurredAt,
+      });
+      this.audit(
+        "SYSTEM",
+        "EXTERNAL_DATA_REJECTED",
+        "SYNC",
+        "拒绝合同生命周期状态无效的外部事件",
+        {
+          subjectUserId: event.creatorId,
+          reason: String(event.payload.status || "MISSING_STATUS"),
+        },
+      );
+      this.state.processedEventIds.push(event.eventId);
+      this.save();
+      return {
+        accepted: false,
+        duplicate: false,
+        reason: "INVALID_CONTRACT_STATUS",
+      };
+    }
+    if (
+      event.resourceType === "CONTRACT" &&
+      event.payload.contractType !== undefined &&
+      !isContractType(event.payload.contractType)
+    ) {
+      this.state.syncIssues.unshift({
+        id: `SYNC-ISSUE-${idSuffix()}`,
+        eventId: event.eventId,
+        creatorId: event.creatorId,
+        resourceType: event.resourceType,
+        message: "外部合同事件的合同类型无效，本次同步已拒绝。",
+        occurredAt: event.occurredAt,
+      });
+      this.audit(
+        "SYSTEM",
+        "EXTERNAL_DATA_REJECTED",
+        "SYNC",
+        "拒绝合同类型无效的外部事件",
+        {
+          subjectUserId: event.creatorId,
+          reason: String(event.payload.contractType),
+        },
+      );
+      this.state.processedEventIds.push(event.eventId);
+      this.save();
+      return {
+        accepted: false,
+        duplicate: false,
+        reason: "INVALID_CONTRACT_TYPE",
+      };
+    }
     const creator = this.state.users.find(
       (user) => user.id === event.creatorId && user.role === "CREATOR",
     );
@@ -1861,19 +2165,35 @@ export class MockAdminStore {
       this.save();
       return { accepted: false, duplicate: false, reason: "UNKNOWN_CREATOR_ID" };
     }
+    if (creator.verificationStatus === "PENDING") {
+      this.state.syncIssues.unshift({
+        id: `SYNC-ISSUE-${idSuffix()}`,
+        eventId: event.eventId,
+        creatorId: event.creatorId,
+        resourceType: event.resourceType,
+        message: "达人尚未完成认证，外部业务记录未进入有效数据。",
+        occurredAt: event.occurredAt,
+      });
+      this.audit("SYSTEM", "EXTERNAL_DATA_REJECTED", "SYNC", "拒绝待认证达人的外部业务事件", { subjectUserId: event.creatorId, reason: event.externalRecordId });
+      this.state.processedEventIds.push(event.eventId);
+      this.save();
+      return { accepted: false, duplicate: false, reason: "UNVERIFIED_CREATOR" };
+    }
     const existing = this.state.externalRecords.find(
       (item) =>
         item.creatorId === event.creatorId &&
         item.externalRecordId === event.externalRecordId &&
         item.resourceType === event.resourceType,
     );
-    if (existing && existing.version >= event.version) {
+    const archived = this.state.archivedExternalRecords.find((item) => externalRecordKey(item) === `${event.creatorId}:${event.resourceType}:${event.externalRecordId}`);
+    const currentVersion = Math.max(existing?.version || 0, archived?.version || 0);
+    if (currentVersion >= event.version) {
       this.state.syncIssues.unshift({
         id: `SYNC-ISSUE-${idSuffix()}`,
         eventId: event.eventId,
         creatorId: event.creatorId,
         resourceType: event.resourceType,
-        message: `收到版本 ${event.version}，当前已保存版本 ${existing.version}，旧版本事件已忽略。`,
+        message: `收到版本 ${event.version}，当前已保存版本 ${currentVersion}，旧版本事件已忽略。`,
         occurredAt: event.occurredAt,
       });
       this.audit(
@@ -1883,7 +2203,7 @@ export class MockAdminStore {
         "忽略版本过旧的外部事件",
         {
           subjectUserId: event.creatorId,
-          reason: `${event.externalRecordId}: ${event.version} <= ${existing.version}`,
+          reason: `${event.externalRecordId}: ${event.version} <= ${currentVersion}`,
         },
       );
       this.state.processedEventIds.push(event.eventId);
@@ -1896,7 +2216,9 @@ export class MockAdminStore {
       resourceType: event.resourceType,
       version: event.version,
       occurredAt: event.occurredAt,
-      payload: clone(event.payload),
+      payload: event.resourceType === "CONTRACT"
+        ? { ...clone(event.payload), contractType: migrateContractType(event.payload.contractType) }
+        : clone(event.payload),
     };
     if (existing) Object.assign(existing, next);
     else this.state.externalRecords.push(next);
